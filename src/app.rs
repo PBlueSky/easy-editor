@@ -1,0 +1,3121 @@
+//! 应用主体：布局、快捷键、文件打开 / 保存、全局搜索、查找替换、日志块、终端。
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use eframe::egui::{self, Color32, Key, Modifiers, RichText, Ui};
+use egui_extras::{Column, TableBuilder};
+
+use crate::config::{self, ConfigStore};
+use crate::editor::{self, OpenFile, PendingEdit};
+use crate::filetree::{self, FileTree, TreeAction};
+use crate::find::FindState;
+use crate::format;
+use crate::journal;
+use crate::keymap::{self, Keymap};
+use crate::nav::{CaretHistory, NavPoint};
+use crate::pane::{self, Axis, Dir, PaneId, PaneTree, TreeLayout};
+use crate::search::SearchState;
+use crate::syntax::Highlighter;
+use crate::terminal::TerminalPanel;
+use crate::theme;
+
+#[derive(PartialEq, Clone, Copy)]
+enum SideTab {
+    Files,
+    Search,
+    Journal,
+}
+
+impl SideTab {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Files => "files",
+            Self::Search => "search",
+            Self::Journal => "journal",
+        }
+    }
+
+    fn from_key(key: &str) -> Self {
+        match key {
+            "search" => Self::Search,
+            "journal" => Self::Journal,
+            _ => Self::Files,
+        }
+    }
+}
+
+/// 中央区域的一块面板：要么在看文件，要么在跑 shell。
+///
+/// 编辑器面板存的是 `tabs` 的下标而不是路径：同一个文件允许同时出现在两块面板里
+/// （对比、边看边写），用下标才表达得出「两块面板共用一份 buffer」。
+#[derive(Clone, Copy, Debug)]
+enum PaneKind {
+    Editor(Option<usize>),
+    Terminal(u64),
+}
+
+impl PaneKind {
+    fn tab(self) -> Option<usize> {
+        match self {
+            Self::Editor(idx) => idx,
+            Self::Terminal(_) => None,
+        }
+    }
+
+    fn is_editor(self) -> bool {
+        matches!(self, Self::Editor(_))
+    }
+
+    fn terminal_id(self) -> Option<u64> {
+        match self {
+            Self::Terminal(id) => Some(id),
+            Self::Editor(_) => None,
+        }
+    }
+
+    /// 标签关掉之后下标可能越界，退回空白面板而不是 panic。
+    fn sanitize(self, tabs_len: usize) -> Self {
+        match self {
+            Self::Editor(Some(i)) if i >= tabs_len => Self::Editor(None),
+            other => other,
+        }
+    }
+}
+
+struct QuickOpen {
+    query: String,
+    matches: Vec<PathBuf>,
+    sel: usize,
+}
+
+pub struct EasyEditorApp {
+    root: Option<PathBuf>,
+    tree: Option<FileTree>,
+    index: Vec<PathBuf>,
+    tabs: Vec<OpenFile>,
+    active: Option<usize>,
+    side: SideTab,
+    show_side: bool,
+    terminal: TerminalPanel,
+    search: SearchState,
+    find: FindState,
+    hl: Highlighter,
+    font_size: f32,
+    dark: bool,
+    status: String,
+    quick_open: Option<QuickOpen>,
+    pending_close: Option<usize>,
+    show_help: bool,
+    want_open_folder: bool,
+    focus_search: bool,
+    frame_count: u32,
+    /// 新日志块使用的标题；留空则自动编号
+    journal_title: String,
+    /// 用户配置（字号 / 主题 / 上次工作目录 / 快捷键），带防抖落盘
+    config: ConfigStore,
+    /// 光标位置历史（Ctrl+Alt+← / →）
+    nav: CaretHistory,
+    /// 可配置快捷键
+    keymap: Keymap,
+    /// 正在录制新快捷键的动作 id
+    recording: Option<String>,
+    /// 中央区域的面板树（tmux 式：一块块面板递归切分，编辑器与终端共用一棵树）
+    panes: PaneTree<PaneKind>,
+    /// 上一帧算出的面板矩形，方位键找邻居时要用
+    pane_layout: TreeLayout,
+    /// 最后一次聚焦过的编辑面板。焦点切到终端时，文本类操作还是落在这块上
+    last_editor_pane: Option<PaneId>,
+    /// 调试脚本的计时起点
+    boot: std::time::Instant,
+    /// 调试脚本走到第几步
+    verify_stage: usize,
+}
+
+impl EasyEditorApp {
+    pub fn new(cc: &eframe::CreationContext<'_>, target: Option<PathBuf>) -> Self {
+        let config = ConfigStore::load();
+        let font_size = config.data.font_size;
+        let dark = config.data.dark;
+        let show_side = config.data.show_side;
+        let side = SideTab::from_key(&config.data.side_tab);
+
+        theme::install_fonts(&cc.egui_ctx);
+        theme::apply_style(&cc.egui_ctx, dark);
+
+        let keymap = Keymap::from_config(&config.data.keymap);
+
+        let mut app = Self {
+            root: None,
+            tree: None,
+            index: Vec::new(),
+            tabs: Vec::new(),
+            active: None,
+            side,
+            show_side,
+            terminal: TerminalPanel::new(std::env::current_dir().unwrap_or_default()),
+            search: SearchState::default(),
+            find: FindState::default(),
+            hl: Highlighter::new(dark),
+            font_size,
+            dark,
+            status: "Ctrl+O 打开文件夹 · Ctrl+P 快速打开 · Ctrl+` 终端".into(),
+            quick_open: None,
+            pending_close: None,
+            show_help: false,
+            want_open_folder: false,
+            focus_search: false,
+            frame_count: 0,
+            journal_title: String::new(),
+            config,
+            nav: CaretHistory::new(),
+            keymap,
+            recording: None,
+            panes: PaneTree::new(),
+            pane_layout: TreeLayout::default(),
+            last_editor_pane: None,
+            boot: std::time::Instant::now(),
+            verify_stage: 0,
+        };
+        // 中央区域始终至少有一块面板；空工作区时它显示欢迎页
+        let root = app.panes.set_root(PaneKind::Editor(None));
+        app.last_editor_pane = Some(root);
+
+        // 命令行参数优先
+        if let Some(path) = target {
+            let path = if path.is_absolute() {
+                path
+            } else {
+                std::env::current_dir().unwrap_or_default().join(path)
+            };
+            if path.is_dir() {
+                app.open_workspace(path);
+            } else if path.is_file() {
+                let parent = path.parent().map(|p| p.to_path_buf());
+                if let Some(parent) = parent {
+                    app.open_workspace(parent);
+                }
+                app.open_file(path, None);
+            }
+            app.apply_verify_flags();
+            return app;
+        }
+
+        // 没有参数时：当前目录像个工程就用它，否则恢复上次打开的工作目录
+        let cwd = std::env::current_dir().ok();
+        let cwd_is_project = cwd
+            .as_ref()
+            .is_some_and(|c| c.join("Cargo.toml").exists() || c.join(".git").exists());
+        if cwd_is_project {
+            if let Some(cwd) = cwd {
+                app.open_workspace(cwd);
+            }
+        } else if let Some(last) = app.config.data.last_workspace.clone() {
+            let path = PathBuf::from(&last);
+            if path.is_dir() {
+                app.open_workspace(path);
+                app.status = format!("已恢复上次的工作目录 {}", last);
+            } else {
+                // 目录被删了或移走了，清掉记录免得下次还提示
+                app.config.data.last_workspace = None;
+                app.config.touch();
+            }
+        }
+        app.apply_verify_flags();
+        app
+    }
+
+    /// 每帧末尾把 UI 状态同步回配置，有变化才标记，攒够时间自动落盘。
+    fn sync_config(&mut self) {
+        let mut changed = false;
+        if self.config.data.font_size != self.font_size {
+            self.config.data.font_size = self.font_size;
+            changed = true;
+        }
+        if self.config.data.dark != self.dark {
+            self.config.data.dark = self.dark;
+            changed = true;
+        }
+        if self.config.data.show_side != self.show_side {
+            self.config.data.show_side = self.show_side;
+            changed = true;
+        }
+        let tab = self.side.key();
+        if self.config.data.side_tab != tab {
+            self.config.data.side_tab = tab.to_string();
+            changed = true;
+        }
+        if let Some(tree) = &self.tree {
+            if self.config.data.show_hidden != tree.show_hidden {
+                self.config.data.show_hidden = tree.show_hidden;
+                changed = true;
+            }
+        }
+        // 只把跟默认值不一样的绑定写进配置，配置文件才不会一堆噪音。
+        // 空串要保留——它表示用户主动解绑了这个动作。
+        let mut km = self.keymap.to_config();
+        km.retain(|id, binding| binding != keymap::default_binding(id));
+        if self.config.data.keymap != km {
+            self.config.data.keymap = km;
+            changed = true;
+        }
+        if changed {
+            self.config.touch();
+        }
+        self.config.maybe_save();
+    }
+
+    /// 调试用：EASY_EDITOR_VERIFY 让启动后自动展开某个面板，便于截图核对。
+    /// 必须在文件/工作区打开之后调用，否则会被 open_file 里的状态重置覆盖。
+    fn apply_verify_flags(&mut self) {
+        match crate::config::env_var("VERIFY").as_deref() {
+            Some("terminal") => {
+                self.new_terminal_pane();
+                // 自检：让终端自动获得焦点，截图里能看到光标即说明焦点机制生效
+                if let Some(id) = self.first_terminal_id() {
+                    self.terminal.request_focus(id);
+                }
+            }
+            Some("find") => {
+                self.find.open_find(false);
+                self.find.query = "一段".into();
+                self.find.stale = true;
+            }
+            Some("replace") => {
+                self.find.open_find(true);
+                self.find.query = "一段".into();
+                self.find.replace = "内容".into();
+                self.find.stale = true;
+            }
+            Some("journal") => {
+                self.side = SideTab::Journal;
+                self.show_side = true;
+            }
+            Some("search") => {
+                self.side = SideTab::Search;
+                self.show_side = true;
+                self.search.query = "fn ".into();
+                if let Some(root) = self.root.clone() {
+                    self.search.start(&root);
+                }
+            }
+            Some("newfile") => {
+                if let Some(tree) = &mut self.tree {
+                    tree.request_new(false);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ---------- 工作区 / 文件 ----------
+
+    fn open_workspace(&mut self, path: PathBuf) {
+        self.root = Some(path.clone());
+        let mut tree = FileTree::new(path.clone());
+        tree.show_hidden = self.config.data.show_hidden;
+        self.tree = Some(tree);
+        self.index = filetree::collect_files(&path, 50_000);
+        self.terminal.set_cwd(path.clone());
+        self.tabs.clear();
+        self.active = None;
+        // 标签表清空了，面板里存的下标全部作废；终端面板原样保留
+        self.panes
+            .foreach_payload_mut(|_, kind| {
+                if let PaneKind::Editor(slot) = kind {
+                    *slot = None;
+                }
+            });
+        self.close_find_bar();
+        // 记住工作目录，下次启动自动恢复
+        let text = path.to_string_lossy().to_string();
+        if self.config.data.last_workspace.as_deref() != Some(text.as_str()) {
+            self.config.data.last_workspace = Some(text);
+            self.config.touch();
+        }
+        self.status = format!("已打开 {}（{} 个文件）", path.display(), self.index.len());
+    }
+
+    fn open_folder_dialog(&mut self) {
+        let mut dialog = rfd::FileDialog::new().set_title("打开文件夹");
+        if let Some(root) = &self.root {
+            dialog = dialog.set_directory(root);
+        }
+        if let Some(dir) = dialog.pick_folder() {
+            self.open_workspace(dir);
+        }
+    }
+
+    fn open_file(&mut self, path: PathBuf, line: Option<usize>) {
+        // 文件已在某个标签中打开？把对应面板切到前台
+        if let Some(idx) = self.tabs.iter().position(|t| t.path == path) {
+            self.activate_tab(idx);
+            if let Some(line) = line {
+                let byte = line_start_offset(&self.tabs[idx].text, line);
+                self.tabs[idx].pending_jump = Some(byte);
+            }
+            return;
+        }
+
+        if self.tabs.len() >= editor::MAX_TABS {
+            self.status = format!("最多同时打开 {} 个文件，请先关闭一些标签", editor::MAX_TABS);
+            return;
+        }
+
+        let meta = std::fs::metadata(&path).ok();
+        if let Some(meta) = &meta {
+            if meta.len() as usize > editor::MAX_FILE_BYTES {
+                self.status = format!(
+                    "{} 有 {}，超过 {} 上限，未打开",
+                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    editor::human_size(meta.len() as usize),
+                    editor::human_size(editor::MAX_FILE_BYTES)
+                );
+                return;
+            }
+        }
+
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.status = format!("打开失败：{e}");
+                return;
+            }
+        };
+        if bytes.iter().take(4096).any(|b| *b == 0) {
+            self.status = format!("{} 看起来是二进制文件，已跳过", path.display());
+            return;
+        }
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        let mut file = OpenFile::new(path.clone(), text);
+        file.mtime = meta.and_then(|m| m.modified().ok());
+        if let Some(line) = line {
+            file.pending_jump = Some(line_start_offset(&file.text, line));
+        }
+        self.status = if file.large {
+            format!(
+                "已打开 {}（{}，只读预览）",
+                path.display(),
+                editor::human_size(file.bytes_len)
+            )
+        } else {
+            format!("已打开 {}", path.display())
+        };
+        self.tabs.push(file);
+        let new_idx = self.tabs.len() - 1;
+        self.show_in_focused_pane(new_idx);
+        // 查找栏不关，但匹配要按新文件重算（旧偏移属于上一个文件）
+        self.revalidate_find();
+    }
+
+    fn save_active(&mut self) {
+        let Some(idx) = self.focused_tab() else { return };
+        let Some(file) = self.tabs.get_mut(idx) else { return };
+        if file.large {
+            self.status = "大文件为只读预览，未保存".into();
+            return;
+        }
+        match std::fs::write(&file.path, file.text.as_bytes()) {
+            Ok(_) => {
+                file.dirty = false;
+                file.mtime = std::fs::metadata(&file.path)
+                    .ok()
+                    .and_then(|m| m.modified().ok());
+                self.status = format!("已保存 {}", file.path.display());
+            }
+            Err(e) => self.status = format!("保存失败：{e}"),
+        }
+    }
+
+    fn save_all(&mut self) {
+        let mut saved = 0;
+        let mut error = None;
+        for file in &mut self.tabs {
+            if !file.dirty || file.large {
+                continue;
+            }
+            match std::fs::write(&file.path, file.text.as_bytes()) {
+                Ok(_) => {
+                    file.dirty = false;
+                    file.mtime = std::fs::metadata(&file.path)
+                        .ok()
+                        .and_then(|m| m.modified().ok());
+                    saved += 1;
+                }
+                Err(e) => error = Some(format!("{} 保存失败：{e}", file.path.display())),
+            }
+        }
+        self.status = match (saved, error) {
+            (_, Some(e)) => e,
+            (0, None) => "没有需要保存的文件".into(),
+            (n, None) => format!("已保存 {n} 个文件"),
+        };
+    }
+
+    fn close_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        if self.tabs[idx].dirty {
+            self.pending_close = Some(idx);
+            return;
+        }
+        self.force_close_tab(idx);
+    }
+
+    fn force_close_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        self.tabs.remove(idx);
+        // 标签表短了一格，每块面板存的下标都要跟着挪，否则会指向隔壁的文件
+        let remaining = self.tabs.len();
+        let was_focused = self.focused_tab() == Some(idx);
+        self.panes
+            .foreach_payload_mut(|_, kind| {
+                if let PaneKind::Editor(slot) = kind {
+                    *slot = remap_tab(*slot, idx, remaining);
+                }
+            });
+        if was_focused && remaining > 0 {
+            // 焦点面板空了的话接着显示隔壁的标签，和大多数编辑器一致
+            let next = idx.min(remaining - 1);
+            if let Some(p) = self.editor_pane_for_write() {
+                if let Some(PaneKind::Editor(slot)) = self.panes.payload_of_mut(p) {
+                    if slot.is_none() {
+                        *slot = Some(next);
+                    }
+                }
+            }
+        }
+        self.sync_active();
+        // 关掉一个标签后当前文件可能变了，匹配要重算
+        self.revalidate_find();
+    }
+
+    // ---------- 日志块 ----------
+
+    fn insert_journal_block(&mut self) {
+        let title_base = self.journal_title.trim().to_string();
+        let Some(idx) = self.focused_tab() else {
+            self.status = "日志块写在文本文件里，请先打开一个文件".into();
+            return;
+        };
+        let file = &mut self.tabs[idx];
+        if file.large {
+            self.status = "大文件为只读预览，无法插入日志块".into();
+            return;
+        }
+        let blocks = journal::scan(&file.text);
+        let n = blocks.len() + 1;
+        let title = if title_base.is_empty() {
+            format!("工作日志{n}")
+        } else {
+            title_base
+        };
+        let (new_text, caret) = journal::insert_block(&file.text, file.caret_byte, &title, n);
+        let total = new_text.len();
+        file.pending_edit = Some(PendingEdit {
+            range: Some((0, total.min(file.text.len()))),
+            insert: new_text,
+            caret: Some(caret),
+        });
+        self.status = format!("已插入「{title}」，直接输入内容即可");
+    }
+
+    fn journal_goto(&mut self, forward: bool) {
+        let Some(idx) = self.focused_tab() else { return };
+        let file = &mut self.tabs[idx];
+        let blocks = journal::scan(&file.text);
+        if blocks.is_empty() {
+            self.status = "当前文件没有日志块，Ctrl+J 插入一个".into();
+            return;
+        }
+        let line = file.line.saturating_sub(1);
+        let target = if forward {
+            journal::next_block(&blocks, line)
+        } else {
+            journal::prev_block(&blocks, line)
+        };
+        match target {
+            Some(b) => {
+                file.pending_jump = Some(b.head_start);
+                self.status = journal::describe(&blocks, b.line);
+            }
+            None => {
+                self.status = if forward {
+                    "已经是最后一个日志块"
+                } else {
+                    "已经是第一个日志块"
+                }
+                .into();
+            }
+        }
+    }
+
+    fn journal_toggle(&mut self) {
+        let Some(idx) = self.focused_tab() else { return };
+        let file = &mut self.tabs[idx];
+        let blocks = journal::scan(&file.text);
+        let line = file.line.saturating_sub(1);
+        let Some(block) = journal::block_at(&blocks, line) else {
+            self.status = "光标不在日志块内".into();
+            return;
+        };
+        let (a, b, head) = journal::toggle_edit(block);
+        let caret = a + head.len();
+        let next = if block.is_done() {
+            journal::STATUS_TODO
+        } else {
+            journal::STATUS_DONE
+        };
+        file.pending_edit = Some(PendingEdit {
+            range: Some((a, b)),
+            insert: head,
+            caret: Some(caret),
+        });
+        self.status = format!("标记为 [{next}]");
+    }
+
+    fn journal_jump_to(&mut self, byte: usize) {
+        if let Some(idx) = self.active {
+            self.tabs[idx].pending_jump = Some(byte);
+        }
+    }
+
+    // ---------- 查找替换 ----------
+
+    fn sync_find_to_file(&mut self) {
+        let Some(idx) = self.focused_tab() else { return };
+        let matches = Arc::new(self.find.matches.clone());
+        let current = if self.find.matches.is_empty() {
+            None
+        } else {
+            Some(self.find.current)
+        };
+        let file = &mut self.tabs[idx];
+        file.matches = matches;
+        file.current_match = current;
+    }
+
+    fn find_recompute(&mut self) {
+        let Some(idx) = self.focused_tab() else { return };
+        self.find.recompute(&self.tabs[idx].text);
+        self.sync_find_to_file();
+        if let Some((a, _)) = self.find.current_range() {
+            self.tabs[idx].pending_jump = Some(a);
+            self.tabs[idx].jump_without_focus = true;
+        }
+    }
+
+    fn find_step(&mut self, forward: bool) {
+        if self.find.matches.is_empty() {
+            return;
+        }
+        if forward {
+            self.find.next_match();
+        } else {
+            self.find.prev_match();
+        }
+        self.sync_find_to_file();
+        if let Some(idx) = self.focused_tab() {
+            if let Some((a, _)) = self.find.current_range() {
+                self.tabs[idx].pending_jump = Some(a);
+                self.tabs[idx].jump_without_focus = true;
+            }
+        }
+    }
+
+    fn find_replace_current(&mut self) {
+        let Some(idx) = self.focused_tab() else { return };
+        if self.tabs[idx].large {
+            self.status = "大文件为只读预览，无法替换".into();
+            return;
+        }
+        let mut text = std::mem::take(&mut self.tabs[idx].text);
+        let caret = self.find.replace_current(&mut text);
+        self.tabs[idx].text = text;
+        self.tabs[idx].reindex();
+        self.tabs[idx].dirty = true;
+        if let Some(c) = caret {
+            self.tabs[idx].pending_jump = Some(c);
+            self.tabs[idx].jump_without_focus = true;
+        }
+        self.sync_find_to_file();
+        self.status = format!("已替换，剩余 {} 处", self.find.count());
+    }
+
+    fn find_replace_all(&mut self) {
+        let Some(idx) = self.focused_tab() else { return };
+        if self.tabs[idx].large {
+            self.status = "大文件为只读预览，无法替换".into();
+            return;
+        }
+        let mut text = std::mem::take(&mut self.tabs[idx].text);
+        let n = self.find.replace_all(&mut text);
+        self.tabs[idx].text = text;
+        self.tabs[idx].reindex();
+        self.tabs[idx].dirty = true;
+        self.sync_find_to_file();
+        self.status = format!("已替换 {n} 处");
+    }
+
+    // ---------- 快捷键 ----------
+
+    /// 全部走 `keymap`，用户改过的绑定立刻生效。
+    ///
+    /// 检查顺序有意义：带 Shift 的组合要先于不带 Shift 的检查，
+    /// 否则 `Ctrl+Shift+S` 会被 `Ctrl+S` 抢先消费掉。
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // 录制新快捷键时把所有快捷键都屏蔽掉，否则按键会顺手触发一堆动作
+        if self.recording.is_some() {
+            return;
+        }
+
+        if self.keymap.consume(ctx, "open_folder") {
+            self.want_open_folder = true;
+        }
+        if self.keymap.consume(ctx, "save_all") {
+            self.save_all();
+        }
+        if self.keymap.consume(ctx, "save") {
+            self.save_active();
+        }
+        if self.keymap.consume(ctx, "quick_open") {
+            self.open_quick_open();
+        }
+        if self.keymap.consume(ctx, "global_search") {
+            self.side = SideTab::Search;
+            self.show_side = true;
+            self.focus_search = true;
+        }
+        if self.keymap.consume(ctx, "find") {
+            self.prefill_find_query();
+            self.find.open_find(false);
+            self.find_recompute();
+        }
+        if self.keymap.consume(ctx, "replace") {
+            self.prefill_find_query();
+            self.find.open_find(true);
+            self.find_recompute();
+        }
+        if self.keymap.consume(ctx, "journal_insert") {
+            self.insert_journal_block();
+        }
+        if self.keymap.consume(ctx, "journal_next") {
+            self.journal_goto(true);
+        }
+        if self.keymap.consume(ctx, "journal_prev") {
+            self.journal_goto(false);
+        }
+        if self.keymap.consume(ctx, "journal_toggle") {
+            self.journal_toggle();
+        }
+        if self.keymap.consume(ctx, "nav_back") {
+            self.nav_goto(false);
+        }
+        if self.keymap.consume(ctx, "nav_forward") {
+            self.nav_goto(true);
+        }
+        if self.keymap.consume(ctx, "new_folder") {
+            if let Some(tree) = &mut self.tree {
+                tree.request_new(true);
+            }
+        }
+        if self.keymap.consume(ctx, "new_file") {
+            if let Some(tree) = &mut self.tree {
+                tree.request_new(false);
+            }
+        }
+        if self.keymap.consume(ctx, "side_toggle") {
+            self.show_side = !self.show_side;
+        }
+        if self.keymap.consume(ctx, "terminal_new") {
+            self.new_terminal_pane();
+        }
+        if self.keymap.consume(ctx, "terminal_toggle") {
+            self.focus_or_new_terminal();
+        }
+        if self.keymap.consume(ctx, "tab_close") {
+            self.close_focused();
+        }
+        if self.keymap.consume(ctx, "font_inc") {
+            self.set_font_size(self.font_size + 1.0, ctx);
+        }
+        if self.keymap.consume(ctx, "font_dec") {
+            self.set_font_size(self.font_size - 1.0, ctx);
+        }
+        if self.keymap.consume(ctx, "help") {
+            self.show_help = !self.show_help;
+        }
+        if self.keymap.consume(ctx, "screenshot") {
+            self.take_screenshot(ctx);
+        }
+        if self.keymap.consume(ctx, "split_col") {
+            self.split_focused(Axis::Horizontal);
+        }
+        if self.keymap.consume(ctx, "split_row") {
+            self.split_focused(Axis::Vertical);
+        }
+        if self.keymap.consume(ctx, "split_auto") {
+            self.split_auto();
+        }
+        if self.keymap.consume(ctx, "pane_close") {
+            if let Some(id) = self.panes.focus() {
+                self.close_pane(id);
+            }
+        }
+        if self.keymap.consume(ctx, "pane_next") {
+            self.panes.focus_cycle(1);
+            self.after_focus_change();
+        }
+        if self.keymap.consume(ctx, "pane_prev") {
+            self.panes.focus_cycle(-1);
+            self.after_focus_change();
+        }
+        for (action, dir) in [
+            ("focus_pane_left", Dir::Left),
+            ("focus_pane_right", Dir::Right),
+            ("focus_pane_up", Dir::Up),
+            ("focus_pane_down", Dir::Down),
+        ] {
+            if self.keymap.consume(ctx, action) {
+                self.panes.focus_dir(&self.pane_layout, dir);
+                self.after_focus_change();
+            }
+        }
+        if self.keymap.consume(ctx, "format") {
+            self.format_active();
+        }
+
+        // Esc 关查找栏：这个不绑定，属于「按了就管用」的习惯键。
+        // 快速打开窗口自己也要用 Esc，所以它在前面时让路。
+        if self.find.open
+            && self.quick_open.is_none()
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+        {
+            self.close_find_bar();
+        }
+    }
+
+    // ---------- 面板树 ----------
+
+    /// 焦点所在编辑器面板的标签；焦点在终端时退回最后一次聚焦的编辑面板，
+    /// 这样 Ctrl+S / Ctrl+F 在终端里按下去也不会变成空操作。
+    fn focused_tab(&self) -> Option<usize> {
+        let focused = self.panes.focus().and_then(|p| self.panes.payload_of(p).copied());
+        if focused.map(PaneKind::is_editor) == Some(true) {
+            return focused.and_then(PaneKind::tab);
+        }
+        let last = self
+            .last_editor_pane
+            .filter(|p| self.panes.contains(*p))?;
+        self.panes.payload_of(last).copied().and_then(PaneKind::tab)
+    }
+
+    /// 本次要写入标签的面板：焦点在编辑器上就是它，否则用最后一次聚焦的编辑面板。
+    fn editor_pane_for_write(&self) -> Option<PaneId> {
+        let focused = self.panes.focus()?;
+        if self.panes.payload_of(focused).copied().is_some_and(|k| k.is_editor()) {
+            return Some(focused);
+        }
+        let last = self.last_editor_pane.filter(|p| self.panes.contains(*p))?;
+        self.panes
+            .payload_of(last)
+            .copied()
+            .filter(|k| k.is_editor())
+            .map(|_| last)
+    }
+
+    /// 把标签交给「当前该显示它的地方」：焦点是编辑器面板就换掉它的内容，
+    /// 焦点是终端则另开一块编辑面板——绝不覆盖正在跑的 shell。
+    fn show_in_focused_pane(&mut self, idx: usize) {
+        let write = self.editor_pane_for_write();
+        match write {
+            Some(p) => {
+                if let Some(PaneKind::Editor(slot)) = self.panes.payload_of_mut(p) {
+                    *slot = Some(idx);
+                }
+                self.panes.set_focus(p);
+            }
+            None => {
+                self.split_with(Axis::Horizontal, PaneKind::Editor(Some(idx)));
+            }
+        }
+        self.after_focus_change();
+    }
+
+    /// 设置当前焦点面板的激活标签。
+    fn set_focused_tab(&mut self, idx: Option<usize>) {
+        let Some(p) = self.editor_pane_for_write() else { return };
+        if let Some(PaneKind::Editor(slot)) = self.panes.payload_of_mut(p) {
+            *slot = idx;
+        }
+        self.after_focus_change();
+    }
+
+    /// 把 `self.active` 这个镜像刷成焦点面板的真实内容。
+    ///
+    /// `active` 被状态栏、侧栏、工具栏等三十来处读，留着它比逐个改调用点稳。
+    fn sync_active(&mut self) {
+        self.active = self.focused_tab();
+    }
+
+    /// 焦点变了之后要做的事：记住最后一个编辑面板、把键盘焦点交给终端、刷新镜像。
+    fn after_focus_change(&mut self) {
+        if let Some(id) = self.panes.focus() {
+            let kind = self.panes.payload_of(id).copied();
+            if kind.is_some_and(|k| k.is_editor()) {
+                self.last_editor_pane = Some(id);
+            }
+            if let Some(t) = kind.and_then(PaneKind::terminal_id) {
+                self.terminal.request_focus(t);
+            }
+        }
+        self.sync_active();
+    }
+
+    /// 在 `target` 旁边切出一块新面板。
+    fn split_with(&mut self, axis: Axis, payload: PaneKind) -> Option<PaneId> {
+        let target = self.panes.focus()?;
+        let id = self.panes.split(target, axis, payload)?;
+        if let Some(t) = payload.terminal_id() {
+            self.terminal.request_focus(t);
+        }
+        self.status = if payload.terminal_id().is_some() {
+            "已新建终端面板".into()
+        } else {
+            "已拆分面板".into()
+        };
+        self.after_focus_change();
+        Some(id)
+    }
+
+    /// 沿某个方向再切一刀。编辑器面板复制当前文件（对比 / 边看边写），
+    /// 终端面板起一个新 shell。
+    fn split_focused(&mut self, axis: Axis) {
+        let Some(target) = self.panes.focus() else { return };
+        let payload = match self.panes.payload_of(target).copied() {
+            Some(PaneKind::Editor(idx)) => PaneKind::Editor(idx),
+            Some(PaneKind::Terminal(_)) => match self.terminal.create() {
+                Ok(id) => PaneKind::Terminal(id),
+                Err(e) => {
+                    self.status = e;
+                    return;
+                }
+            },
+            None => return,
+        };
+        if self.split_with(axis, payload).is_none() && payload.terminal_id().is_some() {
+            // split 失败（面板已经不在树里）时别留下一个没人看的 shell
+            if let Some(t) = payload.terminal_id() {
+                self.terminal.remove(t);
+            }
+        }
+    }
+
+    /// 自动挑方向再切一刀，和 Windows Terminal 的 `Alt+Shift+D` 一个思路：
+    /// 当前面板宽就左右拆、高就上下拆，拆完两块都更接近方形。
+    fn split_auto(&mut self) {
+        let axis = self
+            .panes
+            .focus()
+            .and_then(|id| self.pane_layout.pane_rect(id))
+            .map(|r| {
+                if r.width() >= r.height() {
+                    Axis::Horizontal
+                } else {
+                    Axis::Vertical
+                }
+            })
+            .unwrap_or(Axis::Horizontal);
+        self.split_focused(axis);
+    }
+
+    /// 新建一块终端面板，默认切在焦点面板下方。
+    fn new_terminal_pane(&mut self) {
+        let id = match self.terminal.create() {
+            Ok(id) => id,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+        if self
+            .split_with(Axis::Vertical, PaneKind::Terminal(id))
+            .is_none()
+        {
+            self.terminal.remove(id);
+            self.status = "没有可拆分的面板".into();
+        }
+    }
+
+    /// 已经在某块终端面板上就不动，否则聚焦第一块 / 新建一块。
+    fn focus_or_new_terminal(&mut self) {
+        let already_terminal = self
+            .panes
+            .focus()
+            .and_then(|id| self.panes.payload_of(id).copied())
+            .is_some_and(|k| k.terminal_id().is_some());
+        if already_terminal {
+            return;
+        }
+        for id in self.panes.pane_ids() {
+            if let Some(t) = self.panes.payload_of(id).copied().and_then(PaneKind::terminal_id) {
+                if self.panes.set_focus(id) {
+                    self.terminal.request_focus(t);
+                    self.after_focus_change();
+                }
+                return;
+            }
+        }
+        self.new_terminal_pane();
+    }
+
+    /// 第一块终端面板的 id，自检脚本往里敲命令用。
+    fn first_terminal_id(&self) -> Option<u64> {
+        self.panes
+            .pane_ids()
+            .into_iter()
+            .find_map(|id| self.panes.payload_of(id).copied().and_then(PaneKind::terminal_id))
+    }
+
+    /// 关掉一块面板。只剩一块时不销毁，退回空白编辑面板。
+    fn close_pane(&mut self, id: PaneId) {
+        let Some(kind) = self.panes.payload_of(id).copied() else {
+            return;
+        };
+        if self.panes.count() <= 1 {
+            if let Some(t) = kind.terminal_id() {
+                self.terminal.remove(t);
+            }
+            if let Some(slot) = self.panes.payload_of_mut(id) {
+                // 最后一块面板不销毁，退回空白编辑面板；
+                // 留着 Terminal(已关掉的 id) 会让这块面板变成死格子
+                *slot = PaneKind::Editor(None);
+            }
+            self.after_focus_change();
+            self.status = "已清空面板".into();
+            return;
+        }
+        self.panes.remove(id);
+        if let Some(t) = kind.terminal_id() {
+            self.terminal.remove(t);
+        }
+        self.after_focus_change();
+        self.status = "已关闭面板".into();
+    }
+
+    /// 关闭焦点面板：终端关面板，编辑器关标签。
+    fn close_focused(&mut self) {
+        let Some(id) = self.panes.focus() else { return };
+        match self.panes.payload_of(id).copied() {
+            Some(PaneKind::Terminal(_)) => self.close_pane(id),
+            Some(PaneKind::Editor(idx)) => {
+                if let Some(idx) = idx {
+                    self.close_tab(idx);
+                }
+            }
+            None => {}
+        }
+    }
+
+    // ---------- 格式化 ----------
+
+    /// 格式化焦点面板里的整个文件。
+    ///
+    /// 只改 buffer 并标脏，不写盘、不开新面板——要不要落盘由用户按 Ctrl+S 决定。
+    fn format_active(&mut self) {
+        let Some(idx) = self.focused_tab() else {
+            self.status = "请先打开一个文件".into();
+            return;
+        };
+        let file = &mut self.tabs[idx];
+        if file.large {
+            self.status = "大文件为只读预览，无法格式化".into();
+            return;
+        }
+        match format::auto_format(&file.text, Some(file.path.as_path())) {
+            Ok(formatted) => {
+                if formatted == file.text {
+                    self.status = "已经是格式化后的样子".into();
+                    return;
+                }
+                let caret = file.caret_byte.min(formatted.len());
+                file.text = formatted;
+                file.reindex();
+                file.dirty = true;
+                file.caret_byte = caret;
+                self.status = "已格式化，Ctrl+S 保存".into();
+                self.revalidate_find();
+            }
+            Err(e) => self.status = format!("格式化失败：{e}"),
+        }
+    }
+
+    /// 文件树右键的格式化：已经打开的文件改 buffer（等 Ctrl+S），没打开的原地写盘。
+    fn format_file(&mut self, path: PathBuf) {
+        if let Some(idx) = self.tabs.iter().position(|t| t.path == path) {
+            self.activate_tab(idx);
+            self.format_active();
+            return;
+        }
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = format!("读取 {name} 失败：{e}");
+                return;
+            }
+        };
+        match format::auto_format(&text, Some(path.as_path())) {
+            Ok(formatted) if formatted == text => {
+                self.status = format!("{name} 已经是格式化后的样子");
+            }
+            Ok(formatted) => match std::fs::write(&path, formatted.as_bytes()) {
+                Ok(_) => self.status = format!("已格式化并保存 {name}"),
+                Err(e) => self.status = format!("写入 {name} 失败：{e}"),
+            },
+            Err(e) => self.status = format!("格式化失败：{e}"),
+        }
+    }
+
+    /// `Ctrl+F` 时把选中的文字带进查找框。
+    /// 只带单行、长度合理的片段——多行选区通常是整段代码，塞进查找框没意义。
+    fn prefill_find_query(&mut self) {
+        let Some(idx) = self.focused_tab() else { return };
+        let Some(file) = self.tabs.get(idx) else { return };
+        let sel = file.selection.trim();
+        if sel.is_empty() || sel.contains('\n') || sel.chars().count() > 120 {
+            return;
+        }
+        let sel = sel.to_string();
+        if self.find.query != sel {
+            self.find.query = sel;
+        }
+    }
+
+    fn close_find_bar(&mut self) {
+        self.find.close();
+        self.clear_all_matches();
+    }
+
+    /// 清掉所有标签上的匹配高亮。
+    ///
+    /// 之前只清了当前标签，导致「查找后关闭，再切回另一个标签」时
+    /// 会看到没有查找栏却还亮着的孤儿高亮。
+    fn clear_all_matches(&mut self) {
+        for tab in &mut self.tabs {
+            if !tab.matches.is_empty() || tab.current_match.is_some() {
+                tab.matches = Arc::new(Vec::new());
+                tab.current_match = None;
+            }
+        }
+    }
+
+    /// 换了文件之后匹配偏移全部作废，让查找栏下一帧重算。
+    fn revalidate_find(&mut self) {
+        if self.find.open {
+            self.find.stale = true;
+        }
+    }
+
+    // ---------- 光标位置历史 ----------
+
+    /// 每帧把当前光标喂给历史；停留够久才真正记一个点。
+    fn poll_caret(&mut self, ctx: &egui::Context) {
+        let Some(idx) = self.active else { return };
+        let Some(file) = self.tabs.get(idx) else { return };
+        // 大文件是只读虚拟渲染，没有可编辑光标，不参与历史
+        if file.large {
+            return;
+        }
+        let point = NavPoint {
+            path: file.path.clone(),
+            byte: file.caret_byte,
+            line: file.line,
+        };
+        self.nav.poll(point);
+        if self.nav.waiting() {
+            // 用户停手后还得再跑一帧才能把位置记进历史
+            ctx.request_repaint_after(crate::nav::DWELL + std::time::Duration::from_millis(40));
+        }
+    }
+
+    fn nav_goto(&mut self, forward: bool) {
+        let target = if forward {
+            self.nav.forward()
+        } else {
+            self.nav.back()
+        };
+        let Some(t) = target else {
+            self.status = if forward {
+                "已经是最后一个位置了".into()
+            } else {
+                "没有更早的位置了".into()
+            };
+            return;
+        };
+
+        let name = t
+            .path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| t.path.to_string_lossy().to_string());
+
+        if !self.tabs.iter().any(|f| f.path == t.path) {
+            self.open_file(t.path.clone(), None);
+        }
+        let Some(idx) = self.tabs.iter().position(|f| f.path == t.path) else {
+            self.status = format!("{} 已无法打开", name);
+            return;
+        };
+        self.set_focused_tab(Some(idx));
+        let len = self.tabs[idx].text.len();
+        self.tabs[idx].pending_jump = Some(t.byte.min(len));
+        self.tabs[idx].jump_without_focus = false;
+        self.status = format!("{name} · 行 {}", t.line);
+    }
+
+    /// 调试脚本：`EASY_EDITOR_VERIFY=nav|enter` 用真实时间驱动，验证完打印结果。
+    /// 用绝对时间而不是帧数，因为不同机器帧率差得远。
+    fn verify_script(&mut self, ctx: &egui::Context) {
+        let Some(mode) = crate::config::env_var("VERIFY") else {
+            return;
+        };
+        // 窗口初始化可能要一两秒，第一帧来晚的话所有步骤会挤在同一帧里跑完，
+        // 中间那些「下一帧才生效」的状态就来不及更新。这里重新对一次表。
+        if self.verify_stage == 0 && self.boot.elapsed().as_millis() > 400 {
+            self.boot = std::time::Instant::now();
+            ctx.request_repaint();
+            return;
+        }
+        let ms = self.boot.elapsed().as_millis() as u64;
+        ctx.request_repaint();
+
+        match mode.as_str() {
+            "nav" => {
+                const STAGES: [u64; 6] = [300, 1000, 1700, 2400, 2700, 2900];
+                if self.verify_stage < STAGES.len() && ms >= STAGES[self.verify_stage] {
+                    match self.verify_stage {
+                        // 依次跳到三处，每处之间隔 700ms，远超 DWELL
+                        0 | 1 | 2 => {
+                            let line = [40usize, 120, 200][self.verify_stage];
+                            if let Some(idx) = self.active {
+                                let byte = line_start_offset(&self.tabs[idx].text, line);
+                                self.tabs[idx].pending_jump = Some(byte);
+                                self.tabs[idx].jump_without_focus = true;
+                            }
+                        }
+                        3 => self.nav_goto(false),
+                        4 => {
+                            let line = self.active.map(|i| self.tabs[i].line).unwrap_or(0);
+                            println!(
+                                "[verify] nav 共 {} 个位置，可后退 {} 可前进 {}，后退后落在第 {} 行",
+                                self.nav.len(),
+                                self.nav.back_count(),
+                                self.nav.forward_count(),
+                                line
+                            );
+                        }
+                        _ => self.take_screenshot(ctx),
+                    }
+                    self.verify_stage += 1;
+                }
+            }
+            "enter" => {
+                const STAGES: [u64; 5] = [300, 700, 1100, 1500, 1700];
+                if self.verify_stage < STAGES.len() && ms >= STAGES[self.verify_stage] {
+                    match self.verify_stage {
+                        0 => {
+                            self.find.open_find(false);
+                            self.find.query = "fn ".into();
+                            self.find_recompute();
+                        }
+                        // 往输入队列里塞一个真实的 Enter 事件，走的是和键盘一样的路径
+                        1 | 2 => {
+                            ctx.input_mut(|i| {
+                                i.events.push(egui::Event::Key {
+                                    key: Key::Enter,
+                                    physical_key: None,
+                                    pressed: true,
+                                    repeat: false,
+                                    modifiers: Modifiers::NONE,
+                                })
+                            });
+                        }
+                        3 => {
+                            println!(
+                                "[verify] enter 当前匹配 {}/{}（状态栏 {}）",
+                                self.find.current + 1,
+                                self.find.count(),
+                                self.find.status_text()
+                            );
+                        }
+                        _ => self.take_screenshot(ctx),
+                    }
+                    self.verify_stage += 1;
+                }
+            }
+            "keys" => {
+                const STAGES: [u64; 5] = [300, 700, 1100, 1400, 1700];
+                if self.verify_stage < STAGES.len() && ms >= STAGES[self.verify_stage] {
+                    match self.verify_stage {
+                        0 => self.show_help = true,
+                        // 进入录制状态，同时塞一个 Ctrl+F 事件进去
+                        1 => {
+                            self.recording = Some("nav_back".into());
+                            ctx.input_mut(|i| {
+                                i.events.push(egui::Event::Key {
+                                    key: Key::F,
+                                    physical_key: None,
+                                    pressed: true,
+                                    repeat: false,
+                                    modifiers: Modifiers::CTRL,
+                                })
+                            });
+                        }
+                        2 => {
+                            println!(
+                                "[verify] keys 录制结果 nav_back={} 冲突={:?}",
+                                self.keymap.get("nav_back"),
+                                self.keymap.conflict_of("nav_back")
+                            );
+                        }
+                        3 => self.take_screenshot(ctx),
+                        _ => self.keymap.reset_all(),
+                    }
+                    self.verify_stage += 1;
+                }
+            }
+            "findflow" => {
+                const STAGES: [u64; 6] = [300, 900, 1200, 1800, 2100, 2400];
+                if self.verify_stage < STAGES.len() && ms >= STAGES[self.verify_stage] {
+                    match self.verify_stage {
+                        0 => {
+                            self.find.open_find(false);
+                            self.find.query = "fn ".into();
+                            self.find_recompute();
+                            println!("[verify] findflow A 命中 {}", self.find.count());
+                        }
+                        1 => {
+                            let other = self
+                                .active
+                                .and_then(|i| self.tabs.get(i))
+                                .and_then(|f| f.path.parent().map(|p| p.join("b.rs")));
+                            if let Some(other) = other {
+                                self.open_file(other, None);
+                            }
+                        }
+                        2 => {
+                            println!(
+                                "[verify] findflow 切到 B 后 open={} 命中={}（A 是 5，B 应为 4）",
+                                self.find.open,
+                                self.find.count()
+                            );
+                        }
+                        3 => {
+                            if let Some(idx) = self.active {
+                                self.tabs[idx].selection = "beta_7".into();
+                            }
+                            self.prefill_find_query();
+                            self.find.open_find(false);
+                            self.find_recompute();
+                            println!(
+                                "[verify] findflow 选中带入 query={:?} 命中={}",
+                                self.find.query,
+                                self.find.count()
+                            );
+                        }
+                        4 => {
+                            self.close_find_bar();
+                            let left = self
+                                .tabs
+                                .iter()
+                                .filter(|t| !t.matches.is_empty() || t.current_match.is_some())
+                                .count();
+                            println!(
+                                "[verify] findflow 关闭查找后仍有高亮的标签数={left}（应为 0）"
+                            );
+                        }
+                        _ => self.take_screenshot(ctx),
+                    }
+                    self.verify_stage += 1;
+                }
+            }
+            "split" => {
+                const STAGES: [u64; 11] =
+                    [400, 1200, 2000, 2800, 3400, 3900, 4500, 5100, 5800, 6400, 7000];
+                if self.verify_stage < STAGES.len() && ms >= STAGES[self.verify_stage] {
+                    match self.verify_stage {
+                        0 => {
+                            // 打开第一个文件
+                            let p = std::path::PathBuf::from(
+                                "C:/Users/blues/AppData/Local/Temp/ee-split/data.json",
+                            );
+                            self.open_file(p, None);
+                        }
+                        1 => {
+                            // 左右切一刀，两块面板看同一个文件
+                            self.split_focused(Axis::Horizontal);
+                            println!(
+                                "[verify] split 拆分后面板数={} 焦点={:?}",
+                                self.panes.count(),
+                                self.panes.focus()
+                            );
+                        }
+                        2 => {
+                            // 在新面板里打开第二个文件
+                            let p = std::path::PathBuf::from(
+                                "C:/Users/blues/AppData/Local/Temp/ee-split/data.xml",
+                            );
+                            self.open_file(p, None);
+                            let shown: Vec<Option<usize>> = self
+                                .panes
+                                .pane_ids()
+                                .into_iter()
+                                .filter_map(|id| self.panes.payload_of(id).copied())
+                                .map(|k| k.tab())
+                                .collect();
+                            println!("[verify] split 每块面板的标签={shown:?} active={:?}", self.active);
+                        }
+                        3 => {
+                            // 逐块面板格式化
+                            let ids = self.panes.pane_ids();
+                            for p in ids {
+                                if self.panes.payload_of(p).copied().is_some_and(|k| k.is_editor()) {
+                                    self.panes.set_focus(p);
+                                    self.format_active();
+                                }
+                            }
+                            println!("[verify] split 格式化完成 status={}", self.status);
+                        }
+                        4 => {
+                            // 起两块终端面板，验证 tmux 式终端
+                            self.new_terminal_pane();
+                            self.new_terminal_pane();
+                            println!(
+                                "[verify] split 终端面板数={} 终端数={}",
+                                self.panes.count(),
+                                self.terminal.len()
+                            );
+                        }
+                        5 => {
+                            // 往第一块终端敲一条命令，验证 PTY 写入链路
+                            match self.first_terminal_id() {
+                                Some(id) => {
+                                    self.terminal.send_text(id, "echo EASY_EDITOR_PTY_OK\r");
+                                    println!("[verify] split 已向终端面板 {id:?} 写入命令");
+                                }
+                                None => println!("[verify] split 没有终端面板，跳过 PTY 检查"),
+                            }
+                        }
+                        // 下面三步走真实事件队列：按键由 handle_shortcuts 在下一帧消费，
+                        // 所以每一步之间要留一帧以上的间隔
+                        6 => {
+                            ctx.input_mut(|i| {
+                                i.events.push(egui::Event::Key {
+                                    key: Key::D,
+                                    physical_key: None,
+                                    pressed: true,
+                                    repeat: false,
+                                    modifiers: Modifiers::ALT | Modifiers::SHIFT,
+                                })
+                            });
+                        }
+                        7 => println!(
+                            "[verify] split Alt+Shift+D 后面板数={}（终端面板 2 宽 2 高 → 应左右拆，变 5）",
+                            self.panes.count()
+                        ),
+                        // Alt+Left 落在左边的兄弟终端上，所以「焦点标签=None」是对的，
+                        // 要看的是焦点面板的左边缘坐标有没有变小
+                        8 => {
+                            println!(
+                                "[verify] split Alt+Left 前 焦点={}",
+                                pane_desc(&self.panes, &self.pane_layout)
+                            );
+                            ctx.input_mut(|i| {
+                                i.events.push(egui::Event::Key {
+                                    key: Key::ArrowLeft,
+                                    physical_key: None,
+                                    pressed: true,
+                                    repeat: false,
+                                    modifiers: Modifiers::ALT,
+                                })
+                            });
+                        }
+                        9 => println!(
+                            "[verify] split Alt+Left 后 焦点={}",
+                            pane_desc(&self.panes, &self.pane_layout)
+                        ),
+                        _ => self.take_screenshot(ctx),
+                    }
+                    self.verify_stage += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn take_screenshot(&mut self, ctx: &egui::Context) {
+        let dir = config::app_data_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("screenshot.bmp");
+        let target = path.clone();
+        ctx.request_screenshot(move |image| {
+            let _ = save_bmp(&image, &target);
+        });
+        self.status = format!("已保存截图 {}", path.display());
+    }
+
+    fn set_font_size(&mut self, size: f32, ctx: &egui::Context) {
+        self.font_size = size.clamp(10.0, 28.0);
+        let _ = ctx;
+    }
+
+    fn open_quick_open(&mut self) {
+        let mut matches = self.index.clone();
+        matches.truncate(200);
+        self.quick_open = Some(QuickOpen {
+            query: String::new(),
+            matches,
+            sel: 0,
+        });
+    }
+
+    // ---------- 面板 ----------
+
+    fn toolbar(&mut self, ui: &mut Ui) {
+        // 提示文字跟着用户配置走，避免改了快捷键后按钮还在说老组合。
+        // 先快照一份，闭包里就不用再借 self 了。
+        let keys = self.keymap.to_config();
+        let hint = |action: &str| keys.get(action).cloned().unwrap_or_default();
+
+        ui.horizontal(|ui| {
+            ui.add_space(2.0);
+            let h_open = hint("open_folder");
+            if ui
+                .button(RichText::new("打开文件夹").size(12.5))
+                .on_hover_text(h_open)
+                .clicked()
+            {
+                self.want_open_folder = true;
+            }
+            let h_save = hint("save");
+            if ui
+                .add_enabled(
+                    self.active.is_some(),
+                    egui::Button::new(RichText::new("保存").size(12.5)),
+                )
+                .on_hover_text(h_save)
+                .clicked()
+            {
+                self.save_active();
+            }
+
+            ui.separator();
+
+            // 光标位置前后跳转
+            let h_back = format!("上一个光标位置  {}", hint("nav_back"));
+            let h_fwd = format!("下一个光标位置  {}", hint("nav_forward"));
+            if ui
+                .add_enabled(
+                    self.nav.can_back(),
+                    egui::Button::new(RichText::new("←").size(13.0)),
+                )
+                .on_hover_text(h_back)
+                .clicked()
+            {
+                self.nav_goto(false);
+            }
+            if ui
+                .add_enabled(
+                    self.nav.can_forward(),
+                    egui::Button::new(RichText::new("→").size(13.0)),
+                )
+                .on_hover_text(h_fwd)
+                .clicked()
+            {
+                self.nav_goto(true);
+            }
+
+            ui.separator();
+
+            let h_new_file = hint("new_file");
+            if ui
+                .add_enabled(
+                    self.tree.is_some(),
+                    egui::Button::new(RichText::new("新文件").size(12.5)),
+                )
+                .on_hover_text(h_new_file)
+                .clicked()
+            {
+                if let Some(tree) = &mut self.tree {
+                    tree.request_new(false);
+                }
+            }
+            let h_new_folder = hint("new_folder");
+            if ui
+                .add_enabled(
+                    self.tree.is_some(),
+                    egui::Button::new(RichText::new("新文件夹").size(12.5)),
+                )
+                .on_hover_text(h_new_folder)
+                .clicked()
+            {
+                if let Some(tree) = &mut self.tree {
+                    tree.request_new(true);
+                }
+            }
+
+            ui.separator();
+
+            let h_side = hint("side_toggle");
+            let mut side = self.show_side;
+            if ui
+                .selectable_label(side, RichText::new("侧栏").size(12.5))
+                .on_hover_text(h_side)
+                .clicked()
+            {
+                side = !side;
+            }
+            self.show_side = side;
+
+            let h_term = format!("聚焦终端面板，没有就开一块  {}", hint("terminal_toggle"));
+            if ui
+                .button(RichText::new("终端").size(12.5))
+                .on_hover_text(h_term)
+                .clicked()
+            {
+                self.focus_or_new_terminal();
+            }
+            let h_tnew = hint("terminal_new");
+            if ui
+                .button(RichText::new("+终端").size(12.5))
+                .on_hover_text(h_tnew)
+                .clicked()
+            {
+                self.new_terminal_pane();
+            }
+
+            let h_col = format!("向右拆分当前面板  {}", hint("split_col"));
+            if ui
+                .button(RichText::new("‖ 拆分").size(12.5))
+                .on_hover_text(h_col)
+                .clicked()
+            {
+                self.split_focused(Axis::Horizontal);
+            }
+            let h_row = format!("向下拆分当前面板  {}", hint("split_row"));
+            if ui
+                .button(RichText::new("═ 拆分").size(12.5))
+                .on_hover_text(h_row)
+                .clicked()
+            {
+                self.split_focused(Axis::Vertical);
+            }
+
+            ui.separator();
+
+            let h_quick = hint("quick_open");
+            if ui
+                .button(RichText::new("快速打开").size(12.5))
+                .on_hover_text(h_quick)
+                .clicked()
+            {
+                self.open_quick_open();
+            }
+            let h_search = hint("global_search");
+            if ui
+                .button(RichText::new("全局搜索").size(12.5))
+                .on_hover_text(h_search)
+                .clicked()
+            {
+                self.side = SideTab::Search;
+                self.show_side = true;
+                self.focus_search = true;
+            }
+            let h_find = hint("find");
+            if ui
+                .add_enabled(
+                    self.active.is_some(),
+                    egui::Button::new(RichText::new("查找").size(12.5)),
+                )
+                .on_hover_text(h_find)
+                .clicked()
+            {
+                self.find.open_find(false);
+                self.find_recompute();
+            }
+            let h_journal = format!("{} 在光标处插入日志块", hint("journal_insert"));
+            if ui
+                .add_enabled(
+                    self.active.is_some(),
+                    egui::Button::new(RichText::new("日志块").size(12.5)),
+                )
+                .on_hover_text(h_journal)
+                .clicked()
+            {
+                self.insert_journal_block();
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let h_help = format!("快捷键设置  {}", hint("help"));
+                if ui
+                    .button(RichText::new("?").size(12.5))
+                    .on_hover_text(h_help)
+                    .clicked()
+                {
+                    self.show_help = !self.show_help;
+                }
+                if ui
+                    .button(RichText::new(if self.dark { "浅色" } else { "深色" }).size(12.5))
+                    .on_hover_text("切换主题")
+                    .clicked()
+                {
+                    self.dark = !self.dark;
+                    theme::apply_style(ui.ctx(), self.dark);
+                    self.hl.set_theme(if self.dark {
+                        crate::syntax::DARK_THEME
+                    } else {
+                        crate::syntax::LIGHT_THEME
+                    });
+                }
+                // 新建终端用哪个 shell。原来在终端面板的页签条上，页签条没了就挪到这儿
+                egui::ComboBox::from_id_salt("shell_picker")
+                    .selected_text(RichText::new(format!("shell: {}", self.terminal.shell.label())).size(11.5))
+                    .width(130.0)
+                    .show_ui(ui, |ui| {
+                        for kind in self.terminal.available.clone() {
+                            if ui
+                                .selectable_label(self.terminal.shell == kind, kind.label())
+                                .clicked()
+                            {
+                                self.terminal.shell = kind;
+                            }
+                        }
+                    });
+                let h_dec = hint("font_dec");
+                if ui
+                    .small_button("-")
+                    .on_hover_text(h_dec)
+                    .clicked()
+                {
+                    self.font_size = (self.font_size - 1.0).max(10.0);
+                }
+                ui.label(RichText::new(format!("{:.0}", self.font_size)).size(11.5).weak());
+                let h_inc = hint("font_inc");
+                if ui
+                    .small_button("+")
+                    .on_hover_text(h_inc)
+                    .clicked()
+                {
+                    self.font_size = (self.font_size + 1.0).min(28.0);
+                }
+
+                if let Some(root) = &self.root {
+                    let parent = root.parent().unwrap_or(root.as_path());
+                    ui.label(
+                        RichText::new(filetree::relative(parent, root))
+                            .size(11.5)
+                            .weak(),
+                    );
+                }
+            });
+        });
+    }
+
+    fn side_panel(&mut self, ui: &mut Ui) {
+        if !self.show_side {
+            return;
+        }
+        let mut tree_action = None;
+        let mut journal_jump = None;
+
+        egui::Panel::left("side")
+            .resizable(true)
+            .default_size(300.0)
+            .size_range(180.0..=620.0)
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    for (tab, label) in [
+                        (SideTab::Files, "文件"),
+                        (SideTab::Search, "搜索"),
+                        (SideTab::Journal, "日志"),
+                    ] {
+                        if ui
+                            .selectable_label(self.side == tab, RichText::new(label).size(12.5))
+                            .clicked()
+                        {
+                            self.side = tab;
+                        }
+                    }
+                    if self.side == SideTab::Journal {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let count = self
+                                .active
+                                .and_then(|i| self.tabs.get(i))
+                                .map(|f| journal::scan(&f.text).len())
+                                .unwrap_or(0);
+                            ui.label(RichText::new(format!("{count}")).size(11.0).weak());
+                        });
+                    }
+                });
+                ui.separator();
+
+                match self.side {
+                    SideTab::Files => {
+                        if let Some(tree) = &mut self.tree {
+                            tree_action = tree.ui(ui, self.dark);
+                            if let Some(err) = &tree.error {
+                                ui.colored_label(Color32::from_rgb(200, 90, 90), err);
+                            }
+                        } else {
+                            ui.add_space(20.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(RichText::new("尚未打开文件夹").weak());
+                                if ui.button("打开文件夹").clicked() {
+                                    self.want_open_folder = true;
+                                }
+                            });
+                        }
+                    }
+                    SideTab::Search => {
+                        self.search_panel(ui);
+                    }
+                    SideTab::Journal => {
+                        journal_jump = self.journal_panel(ui);
+                    }
+                }
+            });
+
+        match tree_action {
+            Some(TreeAction::Open(path)) => self.open_file(path, None),
+            Some(TreeAction::Format(path)) => self.format_file(path),
+            Some(TreeAction::Created(path)) => {
+                if let Some(root) = &self.root {
+                    self.index = filetree::collect_files(root, 50_000);
+                }
+                self.open_file(path, None);
+            }
+            None => {}
+        }
+        if let Some(byte) = journal_jump {
+            self.journal_jump_to(byte);
+        }
+    }
+
+    fn search_panel(&mut self, ui: &mut Ui) {
+        ui.add_space(2.0);
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut self.search.query)
+                .hint_text("搜索内容，回车开始")
+                .desired_width(f32::INFINITY),
+        );
+        if self.focus_search {
+            resp.request_focus();
+            self.focus_search = false;
+        }
+        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+        if enter {
+            if let Some(root) = self.root.clone() {
+                self.search.start(&root);
+            }
+        }
+
+        ui.horizontal(|ui| {
+            if ui.button(RichText::new("搜索").size(12.0)).clicked() {
+                if let Some(root) = self.root.clone() {
+                    self.search.start(&root);
+                }
+            }
+            ui.checkbox(&mut self.search.case_sensitive, "Aa");
+            ui.checkbox(&mut self.search.regex, ".*");
+            if !self.search.info.is_empty() {
+                ui.label(RichText::new(&self.search.info).size(11.0).weak());
+            }
+        });
+        ui.separator();
+
+        if self.search.hits.is_empty() {
+            ui.add_space(10.0);
+            ui.vertical_centered(|ui| {
+                if self.search.busy {
+                    ui.spinner();
+                    ui.label(RichText::new("搜索中…").weak().size(12.0));
+                } else {
+                    ui.label(RichText::new("输入关键字后回车").weak().size(12.0));
+                    ui.label(
+                        RichText::new(format!("搜索引擎：{}", self.search.engine))
+                            .weak()
+                            .size(11.0),
+                    );
+                }
+            });
+            return;
+        }
+
+        let root = self.root.clone();
+        let hits = self.search.hits.clone();
+        let mut clicked: Option<usize> = None;
+
+        TableBuilder::new(ui)
+            .id_salt("search_results")
+            .striped(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::auto().at_least(90.0).clip(true))
+            .column(Column::remainder().clip(true))
+            .header(18.0, |mut header| {
+                header.col(|ui| {
+                    ui.label(RichText::new("位置").size(11.0).strong());
+                });
+                header.col(|ui| {
+                    ui.label(RichText::new("内容").size(11.0).strong());
+                });
+            })
+            .body(|body| {
+                body.rows(18.0, hits.len(), |mut row| {
+                    let index = row.index();
+                    let hit = &hits[index];
+                    row.col(|ui| {
+                        let name = root
+                            .as_ref()
+                            .map(|r| filetree::relative(r, &hit.path))
+                            .unwrap_or_else(|| hit.path.to_string_lossy().to_string());
+                        let label = format!("{}:{}", name, hit.line);
+                        if ui
+                            .add(
+                                egui::Label::new(RichText::new(label).size(11.0).monospace())
+                                    .truncate(),
+                            )
+                            .clicked()
+                        {
+                            clicked = Some(index);
+                        }
+                    });
+                    row.col(|ui| {
+                        if ui
+                            .add(
+                                egui::Label::new(
+                                    RichText::new(hit.preview.clone()).size(11.0).monospace(),
+                                )
+                                .truncate(),
+                            )
+                            .clicked()
+                        {
+                            clicked = Some(index);
+                        }
+                    });
+                });
+            });
+
+        if let Some(index) = clicked {
+            if let Some(hit) = hits.get(index) {
+                let path = hit.path.clone();
+                let line = hit.line;
+                self.open_file(path, Some(line));
+            }
+        }
+    }
+
+    /// 侧栏「日志」页签：列出当前文件里的所有日志块。
+    fn journal_panel(&mut self, ui: &mut Ui) -> Option<usize> {
+        let Some(idx) = self.active else {
+            ui.add_space(12.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("先打开一个文本文件").weak().size(12.0));
+                ui.label(
+                    RichText::new("日志块是写在文件里的一种格式，\n不是独立数据")
+                        .weak()
+                        .size(11.0),
+                );
+            });
+            return None;
+        };
+
+        let blocks = journal::scan(&self.tabs[idx].text);
+        let current_line = self.tabs[idx].line.saturating_sub(1);
+
+        ui.horizontal(|ui| {
+            if ui
+                .button(RichText::new("插入块").size(11.5))
+                .on_hover_text("Ctrl+J")
+                .clicked()
+            {
+                self.insert_journal_block();
+            }
+            if ui
+                .button(RichText::new("上一个").size(11.5))
+                .on_hover_text("Ctrl+Alt+↑")
+                .clicked()
+            {
+                self.journal_goto(false);
+            }
+            if ui
+                .button(RichText::new("下一个").size(11.5))
+                .on_hover_text("Ctrl+Alt+↓")
+                .clicked()
+            {
+                self.journal_goto(true);
+            }
+            if ui
+                .button(RichText::new("标记完成").size(11.5))
+                .on_hover_text("Ctrl+Alt+D")
+                .clicked()
+            {
+                self.journal_toggle();
+            }
+        });
+        ui.add_space(2.0);
+
+        if blocks.is_empty() {
+            ui.label(RichText::new("这个文件里还没有日志块").weak().size(11.5));
+            return None;
+        }
+
+        let mut jump = None;
+        egui::ScrollArea::vertical()
+            .id_salt("journal_list")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for block in &blocks {
+                    let active = block.line == current_line;
+                    let mark = if block.is_done() { "[已完成]" } else { "[待处理]" };
+                    let label = format!("{} {}", mark, block.title);
+                    let resp = ui.add(
+                        egui::Label::new(
+                            RichText::new(label)
+                                .size(12.0)
+                                .color(if block.is_done() {
+                                    Color32::from_rgb(120, 150, 120)
+                                } else {
+                                    ui.visuals().text_color()
+                                }),
+                        )
+                        .sense(egui::Sense::click())
+                        .truncate(),
+                    );
+                    if active {
+                        ui.painter().rect_filled(
+                            resp.rect.expand2(egui::vec2(2.0, 1.0)),
+                            3.0,
+                            ui.visuals().selection.bg_fill.gamma_multiply(0.28),
+                        );
+                    }
+                    if resp.clicked() {
+                        jump = Some(block.head_start);
+                    }
+                    resp.on_hover_text(format!("{} {} {}", block.date, block.time, block.status));
+                }
+            });
+        jump
+    }
+
+    /// 底部查找替换条。
+    fn find_bar(&mut self, ui: &mut Ui) {
+        if !self.find.open {
+            return;
+        }
+        let mut request_close = false;
+        let mut do_find = false;
+        let mut do_replace = false;
+        let mut do_replace_all = false;
+        let mut step: Option<bool> = None;
+        let mut query_changed = false;
+        // Some(true) -> 回到查找框，Some(false) -> 去替换框
+        let mut move_focus: Option<bool> = None;
+
+        let query_id = egui::Id::unique("find_query_input");
+        let replace_id = egui::Id::unique("find_replace_input");
+
+        egui::Panel::bottom("find_bar")
+            .frame(
+                egui::Frame::new()
+                    .fill(ui.ctx().global_style().visuals.faint_bg_color)
+                    .inner_margin(egui::Margin::symmetric(8, 5)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("查找").size(11.5).weak());
+
+                    // 关键点：按键必须在 TextEdit 之前摘走。
+                    // 单行 TextEdit 收到 Enter 会主动 `surrender_focus`，等 add 返回后再判断
+                    // `has_focus()` 永远是 false —— 之前 Enter 不生效就是这个原因。
+                    let focused = ui.memory(|m| m.has_focus(query_id));
+                    let mut enter = false;
+                    let mut shift_enter = false;
+                    let mut escape = false;
+                    let mut tab = false;
+                    if focused {
+                        enter = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
+                        shift_enter = ui.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Enter));
+                        escape = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+                        // 替换行没展开时不抢 Tab，留给 egui 自己的焦点切换
+                        if self.find.show_replace {
+                            tab = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab));
+                        }
+                    }
+
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.find.query)
+                            .id(query_id)
+                            .hint_text("查找内容，Enter 下一个，Shift+Enter 上一个")
+                            .desired_width(240.0),
+                    );
+                    if self.find.focus_query {
+                        resp.request_focus();
+                        self.find.focus_query = false;
+                    }
+                    if resp.changed() {
+                        query_changed = true;
+                    }
+                    if enter {
+                        step = Some(true);
+                    }
+                    if shift_enter {
+                        step = Some(false);
+                    }
+                    if escape {
+                        request_close = true;
+                    }
+                    if tab && self.find.show_replace {
+                        move_focus = Some(false);
+                    }
+
+                    ui.label(
+                        RichText::new(self.find.status_text())
+                            .size(11.5)
+                            .weak()
+                            .monospace(),
+                    );
+
+                    if ui
+                        .small_button("↑")
+                        .on_hover_text("上一个 Shift+Enter")
+                        .clicked()
+                    {
+                        step = Some(false);
+                    }
+                    if ui
+                        .small_button("↓")
+                        .on_hover_text("下一个 Enter")
+                        .clicked()
+                    {
+                        step = Some(true);
+                    }
+                    if ui.checkbox(&mut self.find.case_sensitive, "Aa").changed() {
+                        query_changed = true;
+                    }
+                    if ui.checkbox(&mut self.find.regex, ".*").changed() {
+                        query_changed = true;
+                    }
+                    if ui
+                        .selectable_label(self.find.show_replace, RichText::new("替换").size(11.5))
+                        .on_hover_text("Tab 在查找框和替换框之间切换")
+                        .clicked()
+                    {
+                        self.find.show_replace = !self.find.show_replace;
+                    }
+                    if ui.small_button("×").on_hover_text("关闭 Esc").clicked() {
+                        request_close = true;
+                    }
+                });
+
+                if self.find.show_replace {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("替换").size(11.5).weak());
+
+                        let focused = ui.memory(|m| m.has_focus(replace_id));
+                        let mut enter = false;
+                        let mut ctrl_enter = false;
+                        let mut shift_enter = false;
+                        let mut tab = false;
+                        if focused {
+                            ctrl_enter =
+                                ui.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Enter));
+                            enter = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
+                            shift_enter =
+                                ui.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Enter));
+                            tab = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab));
+                        }
+
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.find.replace)
+                                .id(replace_id)
+                                .hint_text("替换为（正则可用 $1），Enter 替换当前")
+                                .desired_width(240.0),
+                        );
+                        if self.find.focus_replace {
+                            resp.request_focus();
+                            self.find.focus_replace = false;
+                        }
+                        if enter {
+                            do_replace = true;
+                        }
+                        if ctrl_enter {
+                            do_replace_all = true;
+                        }
+                        if shift_enter {
+                            step = Some(false);
+                        }
+                        if tab {
+                            move_focus = Some(true);
+                        }
+
+                        if ui
+                            .button(RichText::new("替换").size(11.5))
+                            .on_hover_text("Enter")
+                            .clicked()
+                        {
+                            do_replace = true;
+                        }
+                        if ui
+                            .button(RichText::new("全部替换").size(11.5))
+                            .on_hover_text("Ctrl+Enter")
+                            .clicked()
+                        {
+                            do_replace_all = true;
+                        }
+                        if self.find.regex {
+                            ui.label(
+                                RichText::new("正则模式，替换串支持 $1 $2")
+                                    .size(10.5)
+                                    .weak(),
+                            );
+                        }
+                    });
+                }
+            });
+
+        if query_changed {
+            do_find = true;
+        }
+        if do_find {
+            self.find_recompute();
+        }
+        if let Some(forward) = step {
+            self.find_step(forward);
+        }
+        if do_replace {
+            self.find_replace_current();
+        }
+        if do_replace_all {
+            self.find_replace_all();
+        }
+        match move_focus {
+            Some(true) => self.find.focus_query = true,
+            Some(false) => self.find.focus_replace = true,
+            None => {}
+        }
+        if request_close {
+            self.close_find_bar();
+        }
+    }
+
+    fn status_bar(&mut self, ui: &mut Ui) {
+        egui::Panel::bottom("status_bar").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if let Some(idx) = self.active {
+                    if let Some(file) = self.tabs.get(idx) {
+                        let dirty = if file.dirty { " ●" } else { "" };
+                        ui.label(
+                            RichText::new(format!("{}{}", file.path.display(), dirty))
+                                .size(11.0)
+                                .weak(),
+                        );
+                        ui.separator();
+                        if file.large {
+                            ui.label(
+                                RichText::new(format!(
+                                    "只读预览 · {} 行 · {}",
+                                    file.line_count(),
+                                    editor::human_size(file.bytes_len)
+                                ))
+                                .size(11.0)
+                                .color(Color32::from_rgb(190, 140, 60)),
+                            );
+                        } else {
+                            ui.label(RichText::new(editor::cursor_text(file)).size(11.0));
+                            ui.separator();
+                            let lang = self.hl.language_name(Some(&file.path), &file.text);
+                            ui.label(RichText::new(lang).size(11.0).weak());
+                        }
+                    }
+                    // 光标历史：能后退几步 / 能前进几步
+                    if self.nav.len() > 1 {
+                        ui.separator();
+                        ui.label(
+                            RichText::new(format!(
+                                "历史 ←{} →{}",
+                                self.nav.back_count(),
+                                self.nav.forward_count()
+                            ))
+                            .size(11.0)
+                            .weak(),
+                        )
+                        .on_hover_text(format!(
+                            "光标停留后自动记录，共 {} 个位置\n{} 后退 / {} 前进",
+                            self.nav.len(),
+                            self.keymap.get("nav_back"),
+                            self.keymap.get("nav_forward")
+                        ));
+                    }
+                } else {
+                    ui.label(RichText::new("未打开文件").size(11.0).weak());
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(&self.status).size(11.0).weak());
+                    if let Some(idx) = self.active {
+                        if let Some(file) = self.tabs.get(idx) {
+                            let n = journal::scan(&file.text).len();
+                            if n > 0 {
+                                ui.separator();
+                                ui.label(
+                                    RichText::new(format!("{n} 个日志块"))
+                                        .size(11.0)
+                                        .weak(),
+                                );
+                            }
+                        }
+                    }
+                });
+            });
+        });
+    }
+
+    fn central(&mut self, ui: &mut Ui) {
+        // 空状态提示也读真实快捷键，用户改过之后这里不会说老组合
+        let hints = {
+            let k = |a: &str| self.keymap.get(a).to_string();
+            format!(
+                "{} 打开文件夹   {} 快速打开   {} 全局搜索\n\
+                 {} 查找   {} 替换   {} 日志块   {} / {} 块间跳转\n\
+                 {} 新建文件   {} 终端   {} 新建终端\n\
+                 {} 自动拆分   {} / {} 手动拆分   {} 关闭面板   {} 下一个面板   {} 快捷键",
+                k("open_folder"),
+                k("quick_open"),
+                k("global_search"),
+                k("find"),
+                k("replace"),
+                k("journal_insert"),
+                k("journal_prev"),
+                k("journal_next"),
+                k("new_file"),
+                k("terminal_toggle"),
+                k("terminal_new"),
+                k("split_auto"),
+                k("split_col"),
+                k("split_row"),
+                k("pane_close"),
+                k("pane_next"),
+                k("help"),
+            )
+        };
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            self.tab_bar(ui);
+            ui.separator();
+            let area = ui.available_rect_before_wrap();
+
+            // 点在哪块面板上就聚焦它：按几何命中判断，容器自己的 response 抢不过里面的 TextEdit
+            if let Some(pos) = pane_click(ui.ctx(), area) {
+                if let Some(id) = pane_at(&self.pane_layout, pos) {
+                    if self.panes.focus() != Some(id) {
+                        self.panes.set_focus(id);
+                        self.after_focus_change();
+                    }
+                }
+            }
+
+            let layout = self.panes.layout(area, pane::DIVIDER);
+            self.draw_panes(ui, &layout, &hints);
+            self.pane_layout = layout;
+        });
+    }
+
+    /// 画面板树：每块面板一个用 `max_rect` 定位的子 `Ui`，最后再叠分隔线。
+    ///
+    /// 子 `Ui` 一律走 `scope_builder`，这样 egui 会正常收尾（记录 min_rect、推进光标）；
+    /// 直接 `Ui::new` 造出来的面板没有父级关联，hover 和键盘焦点都会出问题。
+    fn draw_panes(&mut self, ui: &mut Ui, layout: &TreeLayout, hints: &str) {
+        let focus = self.panes.focus();
+        let font_size = self.font_size;
+        let dark = self.dark;
+        let keys = self.keymap.to_config();
+        let hint = |action: &str| keys.get(action).cloned().unwrap_or_default();
+
+        // 先把每块面板的位置和内容快照下来：下面闭包里要改 self.tabs / self.terminal，
+        // 不能同时再借 self.panes。越界的下标顺手当作空白面板处理。
+        let panes: Vec<(PaneId, egui::Rect, PaneKind, bool)> = layout
+            .panes
+            .iter()
+            .filter_map(|p| {
+                let kind = self.panes.payload_of(p.id).copied()?;
+                Some((p.id, p.rect, kind.sanitize(self.tabs.len()), Some(p.id) == focus))
+            })
+            .collect();
+
+        let mut changed = false;
+        let mut close_id: Option<PaneId> = None;
+        let mut split_at: Option<(PaneId, Axis)> = None;
+
+        for (id, rect, kind, focused) in panes {
+            let stroke = if focused {
+                ui.style().visuals.selection.stroke
+            } else {
+                egui::Stroke::NONE
+            };
+            let pane_id = ui.make_persistent_id(("pane", id.0));
+            let builder = egui::UiBuilder::new()
+                .scope_id(pane_id)
+                .max_rect(rect)
+                .layout(egui::Layout::top_down(egui::Align::LEFT));
+            ui.scope_builder(builder, |ui| {
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::same(2))
+                    .stroke(stroke)
+                    .show(ui, |ui| {
+                        let title = match kind {
+                            PaneKind::Editor(Some(idx)) => {
+                                let file = &self.tabs[idx];
+                                let mut t = file.title();
+                                if file.dirty {
+                                    t.push_str(" ●");
+                                }
+                                if file.large {
+                                    t.push_str(" [大]");
+                                }
+                                t
+                            }
+                            PaneKind::Editor(None) => "空白面板".to_string(),
+                            PaneKind::Terminal(t) => {
+                                let name = self
+                                    .terminal
+                                    .pane_title(t)
+                                    .unwrap_or_else(|| "终端已退出".to_string());
+                                format!("⌨ {name}")
+                            }
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(title).size(11.5).weak());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui
+                                    .small_button(RichText::new("×").size(11.0))
+                                    .on_hover_text(format!("关闭面板 {}", hint("pane_close")))
+                                    .clicked()
+                                {
+                                    close_id = Some(id);
+                                }
+                                if ui
+                                    .small_button(RichText::new("上下").size(10.5))
+                                    .on_hover_text(format!("向下拆分 {}", hint("split_row")))
+                                    .clicked()
+                                {
+                                    split_at = Some((id, Axis::Vertical));
+                                }
+                                if ui
+                                    .small_button(RichText::new("左右").size(10.5))
+                                    .on_hover_text(format!("向右拆分 {}", hint("split_col")))
+                                    .clicked()
+                                {
+                                    split_at = Some((id, Axis::Horizontal));
+                                }
+                            });
+                        });
+                        ui.separator();
+
+                        match kind {
+                            PaneKind::Editor(Some(idx)) => {
+                                let out = editor::show(
+                                    ui,
+                                    &mut self.tabs[idx],
+                                    &mut self.hl,
+                                    font_size,
+                                    dark,
+                                    pane_id,
+                                );
+                                changed |= out.changed;
+                            }
+                            PaneKind::Editor(None) => {
+                                let full = self.tabs.is_empty() && layout.panes.len() == 1;
+                                if pane_welcome(ui, full, hints, &hint) {
+                                    self.want_open_folder = true;
+                                }
+                            }
+                            PaneKind::Terminal(t) => {
+                                self.terminal.ui_leaf(ui, t, font_size * 0.95, dark);
+                            }
+                        }
+                    });
+            });
+        }
+
+        for d in &layout.dividers {
+            let did = ui.make_persistent_id(("divider", d.id.0));
+            let resp = ui.interact(d.rect, did, egui::Sense::drag());
+            if resp.dragged() {
+                if let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos()) {
+                    let coord = match d.axis {
+                        Axis::Horizontal => pos.x,
+                        Axis::Vertical => pos.y,
+                    };
+                    self.panes.drag_divider(d.id, d, coord);
+                }
+            }
+            let hot = resp.hovered() || resp.dragged();
+            let fill = if hot {
+                ui.visuals().selection.bg_fill.gamma_multiply(0.6)
+            } else {
+                ui.visuals().faint_bg_color
+            };
+            ui.painter().rect_filled(d.rect, 0.0, fill);
+            if hot {
+                ui.ctx().set_cursor_icon(match d.axis {
+                    Axis::Horizontal => egui::CursorIcon::ResizeHorizontal,
+                    Axis::Vertical => egui::CursorIcon::ResizeVertical,
+                });
+            }
+        }
+
+        if let Some((id, axis)) = split_at {
+            self.panes.set_focus(id);
+            self.split_focused(axis);
+        }
+        if let Some(id) = close_id {
+            self.close_pane(id);
+        }
+        if changed && self.find.open {
+            self.find.stale = true;
+        }
+    }
+
+    /// 顶部标签栏。标签是全局的：一块面板只是「正在显示某个标签」，
+    /// 关掉面板不会关掉标签，同一个标签也可以同时显示在两块面板里。
+    fn tab_bar(&mut self, ui: &mut Ui) {
+        let mut activate = None;
+        let mut close = None;
+        let shown = self.focused_tab();
+
+        egui::ScrollArea::horizontal()
+            .id_salt("tab_bar")
+            .max_height(28.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (i, tab) in self.tabs.iter().enumerate() {
+                        let mut title = tab.title();
+                        if tab.dirty {
+                            title.push_str(" ●");
+                        }
+                        if tab.large {
+                            title.push_str(" [大]");
+                        }
+                        // 有几个面板正在显示这个文件
+                        let count = self.pane_count_showing(i);
+                        if count > 1 {
+                            title.push_str(&format!(" ×{count}"));
+                        }
+
+                        if ui
+                            .selectable_label(Some(i) == shown, RichText::new(title).size(12.5))
+                            .on_hover_text(format!(
+                                "{}\n{} 关闭标签 · {} 关闭面板",
+                                tab.path.display(),
+                                self.keymap.get("tab_close"),
+                                self.keymap.get("pane_close"),
+                            ))
+                            .clicked()
+                        {
+                            activate = Some(i);
+                        }
+                        if ui
+                            .add(egui::Button::new(RichText::new("×").size(11.0)).frame(false))
+                            .on_hover_text("关闭标签")
+                            .clicked()
+                        {
+                            close = Some(i);
+                        }
+                        ui.add_space(4.0);
+                    }
+                });
+            });
+
+        if let Some(i) = activate {
+            self.activate_tab(i);
+        }
+        if let Some(i) = close {
+            self.close_tab(i);
+        }
+    }
+
+    /// 有多少块面板正在显示这个标签——分屏对比时标签上要能看出来。
+    fn pane_count_showing(&self, idx: usize) -> usize {
+        self.panes
+            .pane_ids()
+            .into_iter()
+            .filter(|p| self.panes.payload_of(*p).copied().and_then(PaneKind::tab) == Some(idx))
+            .count()
+    }
+
+    /// 点击标签：已经显示在某块面板里就把焦点切过去，否则送到该显示它的地方。
+    fn activate_tab(&mut self, idx: usize) {
+        let hit = self
+            .panes
+            .pane_ids()
+            .into_iter()
+            .find(|p| self.panes.payload_of(*p).copied().and_then(PaneKind::tab) == Some(idx));
+        match hit {
+            Some(p) => {
+                self.panes.set_focus(p);
+                self.after_focus_change();
+            }
+            None => self.show_in_focused_pane(idx),
+        }
+        self.revalidate_find();
+    }
+
+    // ---------- 弹窗 ----------
+
+    fn quick_open_window(&mut self, ctx: &egui::Context) {
+        let Some(state) = &mut self.quick_open else { return };
+        let mut close = false;
+        let mut choose: Option<PathBuf> = None;
+        let mut query_changed = false;
+
+        egui::Window::new("快速打开")
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 90.0))
+            .resizable(false)
+            .collapsible(false)
+            .title_bar(false)
+            .default_width(620.0)
+            .show(ctx, |ui| {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut state.query)
+                        .hint_text("输入文件名，回车打开")
+                        .desired_width(f32::INFINITY),
+                );
+                resp.request_focus();
+                if resp.changed() {
+                    query_changed = true;
+                }
+                if ui.input(|i| i.key_pressed(Key::Escape)) {
+                    close = true;
+                }
+                if ui.input(|i| i.key_pressed(Key::ArrowDown)) {
+                    state.sel = (state.sel + 1).min(state.matches.len().saturating_sub(1));
+                }
+                if ui.input(|i| i.key_pressed(Key::ArrowUp)) {
+                    state.sel = state.sel.saturating_sub(1);
+                }
+                let enter = ui.input(|i| i.key_pressed(Key::Enter));
+                ui.separator();
+
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    for (i, path) in state.matches.iter().take(30).enumerate() {
+                        let name = path
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        let rel = self
+                            .root
+                            .as_ref()
+                            .map(|r| filetree::relative(r, path))
+                            .unwrap_or_else(|| path.to_string_lossy().to_string());
+                        let selected = i == state.sel;
+                        let text = format!("{name}    {rel}");
+                        if ui
+                            .selectable_label(selected, RichText::new(text).size(12.0))
+                            .clicked()
+                        {
+                            choose = Some(path.clone());
+                        }
+                    }
+                });
+
+                if enter {
+                    if let Some(path) = state.matches.get(state.sel) {
+                        choose = Some(path.clone());
+                    }
+                }
+            });
+
+        if query_changed {
+            let query = state.query.clone();
+            let mut matches: Vec<(i32, PathBuf)> = self
+                .index
+                .iter()
+                .filter_map(|p| {
+                    let rel = self
+                        .root
+                        .as_ref()
+                        .map(|r| filetree::relative(r, p))
+                        .unwrap_or_else(|| p.to_string_lossy().to_string());
+                    fuzzy_score(&rel, &query).map(|score| (score, p.clone()))
+                })
+                .collect();
+            matches.sort_by(|a, b| b.0.cmp(&a.0));
+            state.matches = matches.into_iter().map(|(_, p)| p).collect();
+            state.sel = 0;
+        }
+
+        if let Some(path) = choose {
+            self.open_file(path, None);
+            close = true;
+        }
+        if close {
+            self.quick_open = None;
+        }
+    }
+
+    fn close_confirm(&mut self, ctx: &egui::Context) {
+        let Some(idx) = self.pending_close else { return };
+        if idx >= self.tabs.len() {
+            self.pending_close = None;
+            return;
+        }
+        let name = self.tabs[idx].title();
+        let mut action: Option<u8> = None;
+
+        egui::Window::new("未保存的修改")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(format!("{name} 有未保存的修改，要保存吗？"));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("保存并关闭").clicked() {
+                        action = Some(0);
+                    }
+                    if ui.button("直接关闭").clicked() {
+                        action = Some(1);
+                    }
+                    if ui.button("取消").clicked() {
+                        action = Some(2);
+                    }
+                });
+            });
+
+        match action {
+            Some(0) => {
+                if let Some(file) = self.tabs.get_mut(idx) {
+                    let _ = std::fs::write(&file.path, file.text.as_bytes());
+                    file.dirty = false;
+                }
+                self.force_close_tab(idx);
+                self.pending_close = None;
+            }
+            Some(1) => {
+                self.force_close_tab(idx);
+                self.pending_close = None;
+            }
+            Some(_) => self.pending_close = None,
+            None => {}
+        }
+    }
+
+    fn help_window(&mut self, ctx: &egui::Context) {
+        if !self.show_help {
+            return;
+        }
+
+        // 录制中：把这一帧的按键抓下来当新绑定
+        if let Some(action) = self.recording.clone() {
+            if let Some(combo) = keymap::capture(ctx) {
+                match combo.as_str() {
+                    "Escape" => self.recording = None,
+                    // Backspace / Delete 当作「解绑」
+                    "Backspace" | "Delete" => {
+                        self.keymap.set(&action, "");
+                        self.recording = None;
+                    }
+                    _ => {
+                        self.keymap.set(&action, &combo);
+                        self.recording = None;
+                    }
+                }
+            } else {
+                // 等待按键时也要刷新，否则「按下按键…」这个提示不会动
+                ctx.request_repaint();
+            }
+        }
+
+        let mut open = self.show_help;
+        let warn = Color32::from_rgb(200, 62, 62);
+        egui::Window::new("快捷键设置")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(470.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("全部恢复默认").size(12.0)).clicked() {
+                        self.keymap.reset_all();
+                        self.recording = None;
+                    }
+                    ui.label(
+                        RichText::new("点组合键即可重新录制 · Esc 取消 · Backspace 解绑")
+                            .size(10.5)
+                            .weak(),
+                    );
+                });
+                ui.separator();
+
+                egui::ScrollArea::vertical()
+                    .max_height(430.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let mut group = "";
+                        for def in keymap::ACTIONS {
+                            if def.group != group {
+                                if !group.is_empty() {
+                                    ui.add_space(8.0);
+                                }
+                                ui.label(
+                                    RichText::new(def.group).size(11.0).strong().weak(),
+                                );
+                                group = def.group;
+                            }
+
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [132.0, 20.0],
+                                    egui::Label::new(RichText::new(def.label).size(12.0)),
+                                );
+
+                                let recording = self.recording.as_deref() == Some(def.id);
+                                let binding = self.keymap.get(def.id).to_string();
+                                let text = if recording {
+                                    "按下按键…".to_string()
+                                } else if binding.is_empty() {
+                                    "（未绑定）".to_string()
+                                } else {
+                                    binding.clone()
+                                };
+                                let conflict = self.keymap.conflict_of(def.id);
+                                let mut rich = RichText::new(text).size(12.0).monospace();
+                                if conflict.is_some() {
+                                    rich = rich.color(warn);
+                                }
+                                if ui
+                                    .add_sized([148.0, 20.0], egui::Button::new(rich))
+                                    .on_hover_text("点击后按下新的组合键")
+                                    .clicked()
+                                {
+                                    self.recording = if recording {
+                                        None
+                                    } else {
+                                        Some(def.id.to_string())
+                                    };
+                                }
+
+                                if let Some(other) = conflict {
+                                    ui.label(
+                                        RichText::new(format!("与「{other}」冲突"))
+                                            .size(10.5)
+                                            .color(warn),
+                                    );
+                                }
+
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if !self.keymap.is_default(def.id)
+                                            && ui
+                                                .small_button(RichText::new("重置").size(11.0))
+                                                .clicked()
+                                        {
+                                            self.keymap.reset(def.id);
+                                        }
+                                    },
+                                );
+                            });
+                        }
+                    });
+
+                ui.separator();
+                ui.label(
+                    RichText::new(
+                        "查找栏里：Enter 下一个 / Shift+Enter 上一个 / Tab 在查找与替换框间切换 / Esc 关闭。\n\
+                         替换框里：Enter 替换当前 / Ctrl+Enter 全部替换。\n\
+                         日志块格式：51 个 = 开头，接标题、日期时间、[状态]，下一行起写正文。",
+                    )
+                    .size(10.5)
+                    .weak(),
+                );
+            });
+        self.show_help = open;
+    }
+}
+
+impl eframe::App for EasyEditorApp {
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.frame_count += 1;
+
+        self.search.poll();
+        // 后台面板的输出也要每帧读进屏幕模型，否则 PTY 的 channel 会一直堆
+        self.terminal.pump();
+        if self.find.open && self.find.stale {
+            self.find_recompute();
+        }
+        // 脚本要往事件队列里塞按键，而 egui 每帧开头会重建 events，
+        // 上一帧塞的到下一帧就没了——所以脚本必须排在快捷键分发之前
+        self.verify_script(&ctx);
+        self.handle_shortcuts(&ctx);
+
+        // 调试用：EASY_EDITOR_VERIFY=insert 时自动插入一个日志块
+        if self.frame_count == 20
+            && crate::config::env_var("VERIFY").as_deref() == Some("insert")
+        {
+            self.insert_journal_block();
+        }
+        // 调试用：EASY_EDITOR_VERIFY=replace 时自动执行全部替换
+        if self.frame_count == 30
+            && crate::config::env_var("VERIFY").as_deref() == Some("replace")
+        {
+            self.find_replace_all();
+        }
+
+        // 调试用：EASY_EDITOR_SHOT=1 启动后自动截图
+        if crate::config::env_flag("SHOT") {
+            if self.frame_count == 150 {
+                self.take_screenshot(&ctx);
+            } else if self.frame_count < 150 {
+                ctx.request_repaint();
+            }
+        }
+
+        if self.want_open_folder {
+            self.want_open_folder = false;
+            self.open_folder_dialog();
+        }
+
+        egui::Panel::top("toolbar")
+            .frame(
+                egui::Frame::new()
+                    .fill(ctx.global_style().visuals.panel_fill)
+                    .inner_margin(egui::Margin::symmetric(8, 5)),
+            )
+            .show(ui, |ui| self.toolbar(ui));
+
+        self.status_bar(ui);
+        self.find_bar(ui);
+        self.side_panel(ui);
+        self.central(ui);
+        // 面板树是焦点的事实来源，画完（可能点过、拆过、关过）再刷一次镜像
+        self.sync_active();
+
+        self.quick_open_window(&ctx);
+        self.close_confirm(&ctx);
+        self.help_window(&ctx);
+
+        // 编辑器在 central() 里才会把最新光标写回 OpenFile，所以放在最后收
+        self.poll_caret(&ctx);
+
+        if self.search.busy {
+            ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        }
+        // 有终端活着就要持续拉输出；大约 30fps，够跟上手速也不至于空转
+        if !self.terminal.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        }
+
+        self.sync_config();
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // 防抖可能还没来得及落盘，退出时补一次
+        self.config.save_now();
+    }
+}
+
+/// 把 `tabs` 里的下标从旧长度重映射到新长度。
+///
+/// 分屏之后每块面板都存着自己的下标，`Vec::remove` 会让后面全体前移，
+/// 忘了挪就会让某块面板莫名其妙地跳到隔壁的文件上。
+/// 恰好指向被关标签的那块面板退回空白，由调用方决定要不要顶上隔壁标签。
+fn remap_tab(slot: Option<usize>, removed: usize, remaining: usize) -> Option<usize> {
+    let a = slot?;
+    if remaining == 0 {
+        return None;
+    }
+    if a == removed {
+        Some(a.min(remaining - 1))
+    } else if a > removed {
+        Some(a - 1)
+    } else {
+        Some(a)
+    }
+}
+
+/// 这一帧在面板区域里点了一下吗？返回点击位置。
+///
+/// 只能按几何判断：egui 把容器自身的 sense 注册在它包含的控件**之下**，
+/// 所以点在 TextEdit 上的点击永远不会冒泡到面板背景，用父 response 做点击聚焦会失灵。
+fn pane_click(ctx: &egui::Context, area: egui::Rect) -> Option<egui::Pos2> {
+    ctx.input(|i| {
+        if !i.pointer.primary_clicked() {
+            return None;
+        }
+        i.pointer.interact_pos().filter(|p| area.contains(*p))
+    })
+}
+
+/// 命中测试：这个点落在哪块面板上。
+fn pane_at(layout: &TreeLayout, pos: egui::Pos2) -> Option<PaneId> {
+    layout
+        .panes
+        .iter()
+        .find(|p| p.rect.contains(pos))
+        .map(|p| p.id)
+}
+
+/// 调试脚本用：把当前焦点面板描述成一行字，方便核对方向聚焦有没有跳对。
+fn pane_desc(panes: &PaneTree<PaneKind>, layout: &TreeLayout) -> String {
+    let Some(id) = panes.focus() else {
+        return "无焦点".into();
+    };
+    let kind = match panes.payload_of(id).copied() {
+        Some(PaneKind::Editor(idx)) => format!("编辑 标签={idx:?}"),
+        Some(PaneKind::Terminal(t)) => format!("终端 id={t}"),
+        None => "空".into(),
+    };
+    let x = layout.pane_rect(id).map_or(-1.0, |r| r.min.x) as i32;
+    format!("PaneId({}) {kind} 左边缘x={x}", id.0)
+}
+
+/// 空白面板的内容。`full` 是「整屏就这一块面板且一个文件都没开」，那种情况才显示欢迎页。
+/// 返回是否请求打开文件夹。
+fn pane_welcome(ui: &mut Ui, full: bool, hints: &str, hint: &dyn Fn(&str) -> String) -> bool {
+    if !full {
+        ui.add_space(16.0);
+        ui.vertical_centered(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "这块面板还没有文件 · {} 打开，点标签也会送到这里",
+                    hint("quick_open")
+                ))
+                .size(12.0)
+                .weak(),
+            );
+        });
+        return false;
+    }
+    let mut want_open = false;
+    ui.vertical_centered(|ui| {
+        ui.add_space(ui.available_height() * 0.22);
+        ui.label(RichText::new("EasyEditor").size(30.0).strong());
+        ui.label(
+            RichText::new("小而好用的编辑器 · Rust + egui")
+                .size(13.0)
+                .weak(),
+        );
+        ui.add_space(14.0);
+        if ui.button("打开文件夹").clicked() {
+            want_open = true;
+        }
+        ui.add_space(18.0);
+        ui.label(RichText::new(hints).size(11.5).weak());
+    });
+    want_open
+}
+
+/// 把 egui 的截图写成 24 位 BMP（避免引入图片编码依赖）
+fn save_bmp(image: &egui::ColorImage, path: &Path) -> std::io::Result<()> {
+    let (w, h) = (image.width(), image.height());
+    let row_bytes = w * 3;
+    let padding = (4 - (row_bytes % 4)) % 4;
+    let data_size = (row_bytes + padding) * h;
+    let file_size = 54 + data_size;
+
+    let mut out = Vec::with_capacity(file_size);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&(file_size as u32).to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&(w as i32).to_le_bytes());
+    out.extend_from_slice(&(h as i32).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&(data_size as u32).to_le_bytes());
+    out.extend_from_slice(&2835u32.to_le_bytes());
+    out.extend_from_slice(&2835u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+
+    for y in (0..h).rev() {
+        for x in 0..w {
+            let c = image.pixels[y * w + x];
+            out.push(c.b());
+            out.push(c.g());
+            out.push(c.r());
+        }
+        for _ in 0..padding {
+            out.push(0);
+        }
+    }
+
+    std::fs::write(path, out)
+}
+
+fn line_start_offset(text: &str, line: usize) -> usize {
+    if line <= 1 {
+        return 0;
+    }
+    let mut current = 1usize;
+    for (idx, ch) in text.char_indices() {
+        if ch == '\n' {
+            current += 1;
+            if current == line {
+                return idx + 1;
+            }
+        }
+    }
+    0
+}
+
+/// 子序列模糊匹配，返回分值（越大越靠前）
+fn fuzzy_score(haystack: &str, needle: &str) -> Option<i32> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let hay: Vec<char> = haystack.to_lowercase().chars().collect();
+    let nee: Vec<char> = needle.to_lowercase().chars().collect();
+    let mut score = 0i32;
+    let mut hi = 0usize;
+    let mut last_match: Option<usize> = None;
+
+    for &c in &nee {
+        let mut found = None;
+        while hi < hay.len() {
+            if hay[hi] == c {
+                found = Some(hi);
+                break;
+            }
+            hi += 1;
+        }
+        let pos = found?;
+        score += 10;
+        if let Some(last) = last_match {
+            if pos == last + 1 {
+                score += 8;
+            }
+        }
+        if pos == 0 || hay.get(pos - 1) == Some(&'/') || hay.get(pos - 1) == Some(&'\\') {
+            score += 12;
+        }
+        last_match = Some(pos);
+        hi = pos + 1;
+    }
+    score -= hay.len().min(60) as i32 / 4;
+    Some(score)
+}
