@@ -28,6 +28,39 @@ cargo run -- D:\Codes\some-project      # 启动并打开文件夹
 cargo run -- src\app.rs                 # 启动并打开文件
 ```
 
+## 构建与打包
+
+```bash
+cargo check                             # 只做类型检查，最快
+cargo test                              # 50 个单元测试（面板树 / 快捷键 / 日志块解析 / 格式化）
+cargo build                             # 调试构建 → target\debug\easy-editor.exe
+cargo build --release                   # 发布构建 → target\release\EasyEditor.exe
+```
+
+发布构建走 `windows_subsystem = "windows"`（见 `src/main.rs` 首行），双击运行不会带控制台窗口。
+
+打包成可分发的 zip：
+
+```bash
+mkdir -p dist/EasyEditor
+cp target/release/easy-editor.exe dist/EasyEditor/EasyEditor.exe   # 和窗口标题保持一致
+cp README.md dist/EasyEditor/
+powershell -NoProfile -Command "Compress-Archive -Path dist\EasyEditor -DestinationPath dist\EasyEditor-0.1.0-windows-x64.zip -Force"
+```
+
+产物 `dist/EasyEditor-0.1.0-windows-x64.zip` 约 4.4 MB（解压后单 exe 10.5 MB）。
+别用 `tar -a -cf xxx.zip`：Git Bash 里那个 `tar` 是 GNU tar，`-a` 只认 gzip/bzip2/xz，
+后缀写 `.zip` 也只会吐一个纯 tar 包（实测前 4 个字节是文件名字面量），Windows 双击打不开。
+
+产物是**单文件**，不需要运行时。可选的 `rg.exe` 有三种放法：留在 PATH 里、和 `easy-editor.exe` 同目录、或用 `EASY_EDITOR_RG` 指定完整路径；都没有时全局搜索自动回退到内置扫描，所以打包时不必带上。
+
+交叉检查（可选）：
+
+```bash
+cargo clippy --all-targets              # 需要 rustup component add clippy
+cargo fmt --check                       # 需要 rustup component add rustfmt
+```
+
 ## 功能
 
 ### 文件树
