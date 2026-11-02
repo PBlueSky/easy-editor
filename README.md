@@ -130,6 +130,8 @@ cargo fmt --check                       # 需要 rustup component add rustfmt
 
 支持区分大小写、正则（替换串可用 `$1` `$2`）、上下跳转、单个替换、全部替换；所有匹配都会在编辑器里高亮，当前项用橙色区分。
 
+鼠标选中一个词，全文所有相同词会立刻用淡蓝底标出来（双击一次取整个词）。规则和查找栏一致：选中的词全小写就忽略大小写，含大写就精确匹配；选区正好覆盖一个完整单词时按词边界匹配，选 `id` 不会误标 `width` 里的 `id`；只圈到半截词（比如从 `foo_bar` 里选 `foo`）退回子串匹配。跨行、纯空白、超过 64 字符的选区不参与；出现次数封顶 2000 处，免得为一个单字母把全文扫穿。选词高亮和查找高亮是两套底色，叠在一起时查找优先。
+
 > 实现上有个坑：单行 `TextEdit` 收到 `Enter` 会主动 `surrender_focus`，所以等控件返回后再判断 `has_focus()` 永远是 `false`，快捷键会静默失效。这里的做法是在 `TextEdit` **之前**把按键从事件队列里 `consume` 掉，焦点就不会丢。
 
 非正则查找走字节级扫描（`memchr` + ASCII 忽略大小写），不会像逐行 `to_lowercase()` 那样给每一行分配临时字符串。
@@ -244,4 +246,4 @@ cargo fmt --check                       # 需要 rustup component add rustfmt
 ## 可选配置
 
 - 全局搜索默认在 PATH 里找 `rg.exe`，也可以放在本程序同目录，或用环境变量 `EASY_EDITOR_RG` 指定完整路径。
-- 调试用环境变量：`EASY_EDITOR_SHOT=1` 启动后自动截图；`EASY_EDITOR_VERIFY=split|nav|enter|keys|findflow|insert|replace` 启动后自动跑对应脚本（`split` 会开两个文件、左右拆分、逐块格式化、再叠两块终端并往终端敲一条命令，最后截图），便于截图核对。旧前缀 `CODE_EASY_*` 仍然兼容。
+- 调试用环境变量：`EASY_EDITOR_SHOT=1` 启动后自动截图；`EASY_EDITOR_VERIFY=split|word|nav|enter|keys|findflow|insert|replace` 启动后自动跑对应脚本（`split` 会开两个文件、左右拆分、逐块格式化、再叠两块终端并往终端敲一条命令；`word` 会造一个重复词样本、分别整词和半截选中并打印命中数），最后截图，便于核对。旧前缀 `CODE_EASY_*` 仍然兼容。

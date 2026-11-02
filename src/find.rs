@@ -224,6 +224,46 @@ impl FindState {
     }
 }
 
+/// 选词高亮的出现次数上限：再多也看不过来，白白拖慢排版。
+const MAX_OCCURRENCES: usize = 2000;
+
+/// 字母、数字、下划线算单词字符。中文没有词形变化，按字算进单词。
+pub fn is_word_char(ch: char) -> bool {
+    ch == '_' || ch.is_alphanumeric()
+}
+
+/// 找出 `needle` 在 `text` 里的全部出现，供编辑器「选中一个词就标出所有相同词」使用。
+///
+/// `whole_word` 为真时只认完整单词——选中 `id` 不会把 `width` 里的 `id` 也标上；
+/// 只选中半截词时调用方传 false，退回子串匹配，选 `Sub` 仍能找到 `SubState`。
+/// 大小写沿用查找栏的默认：needle 全小写就忽略大小写，含大写就精确匹配。
+pub fn find_occurrences(text: &str, needle: &str, whole_word: bool) -> Vec<(usize, usize)> {
+    let n = needle.as_bytes();
+    if n.is_empty() {
+        return Vec::new();
+    }
+    let starts = if needle.chars().any(char::is_uppercase) {
+        find_all_exact(text.as_bytes(), n)
+    } else {
+        find_all_ci(text.as_bytes(), n)
+    };
+    starts
+        .into_iter()
+        .map(|s| (s, s + n.len()))
+        .filter(|(a, b)| !whole_word || !touches_word(text, *a, *b))
+        .take(MAX_OCCURRENCES)
+        .collect()
+}
+
+/// 匹配片段左右是否紧贴着单词字符——贴着说明它只是某个更长的词的一部分。
+fn touches_word(text: &str, start: usize, end: usize) -> bool {
+    text[..start]
+        .chars()
+        .next_back()
+        .is_some_and(is_word_char)
+        || text[end..].chars().next().is_some_and(is_word_char)
+}
+
 /// 精确字节查找。
 fn find_all_exact(hay: &[u8], needle: &[u8]) -> Vec<usize> {
     let mut out = Vec::new();
@@ -341,5 +381,31 @@ mod tests {
         s.replace_current(&mut text);
         assert_eq!(text, "bbbb aa aa");
         assert_eq!(s.count(), 2);
+    }
+
+    #[test]
+    fn whole_word_occurrences_ignore_inner_matches() {
+        let hits = find_occurrences("let id = width + id;", "id", true);
+        assert_eq!(hits.len(), 2);
+        for (a, b) in hits {
+            assert_eq!(&"let id = width + id;"[a..b], "id");
+        }
+    }
+
+    #[test]
+    fn partial_selection_matches_substrings() {
+        assert_eq!(find_occurrences("SubState sub Sub", "Sub", false).len(), 2);
+    }
+
+    #[test]
+    fn occurrences_use_smart_case() {
+        assert_eq!(find_occurrences("Foo foo", "foo", true).len(), 2);
+        assert_eq!(find_occurrences("Foo foo", "Foo", true).len(), 1);
+    }
+
+    #[test]
+    fn occurrences_stop_at_the_cap() {
+        let text = "a ".repeat(MAX_OCCURRENCES + 100);
+        assert_eq!(find_occurrences(&text, "a", true).len(), MAX_OCCURRENCES);
     }
 }

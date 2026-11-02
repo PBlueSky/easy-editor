@@ -17,6 +17,11 @@ pub const LARGE_FILE_LINES: usize = 20_000;
 pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 /// 同时打开的标签上限。
 pub const MAX_TABS: usize = 40;
+/// 选词高亮的选区长度上限（字符数）。超过这个长度通常是整段代码，标出来没意义。
+const MAX_TERM_CHARS: usize = 64;
+
+/// 一段高亮：字节范围 + 底色。
+type Seg = (usize, usize, Color32);
 
 /// 外部发起的一次文本编辑（用于插入日志块、替换等）。
 pub struct PendingEdit {
@@ -39,6 +44,9 @@ pub struct OpenFile {
     pub jump_without_focus: bool,
     /// 外部发起的编辑
     pub pending_edit: Option<PendingEdit>,
+    /// 外部请求的选区（字节范围）。写进 TextEdit 状态，效果和鼠标拖选一样，
+    /// 因此会照常触发选词高亮。
+    pub pending_select: Option<(usize, usize)>,
     /// 大文件：只读虚拟渲染
     pub large: bool,
     /// 每行起始字节偏移，大文件模式下按需切片
@@ -46,6 +54,10 @@ pub struct OpenFile {
     /// 查找匹配（全局字节范围），用于高亮。用 Arc 共享，避免每帧深拷贝。
     pub matches: Arc<Vec<(usize, usize)>>,
     pub current_match: Option<usize>,
+    /// 选词高亮：当前选中的词在全文里的所有出现（字节范围）。
+    pub occurrences: Arc<Vec<(usize, usize)>>,
+    /// 上一次高亮用的 `(词, 是否整词)`；选区没变就不重扫全文。
+    occurrence_term: Option<(String, bool)>,
     pub bytes_len: usize,
     /// 当前光标字节偏移，供外部插入使用
     pub caret_byte: usize,
@@ -70,10 +82,13 @@ impl OpenFile {
             pending_jump: None,
             jump_without_focus: false,
             pending_edit: None,
+            pending_select: None,
             large,
             line_offsets,
             matches: Arc::new(Vec::new()),
             current_match: None,
+            occurrences: Arc::new(Vec::new()),
+            occurrence_term: None,
             bytes_len,
             caret_byte: 0,
             selection: String::new(),
@@ -96,6 +111,9 @@ impl OpenFile {
     pub fn reindex(&mut self) {
         self.line_offsets = compute_line_offsets(&self.text);
         self.bytes_len = self.text.len();
+        // 文本一动，所有字节偏移的旧匹配立刻作废，下一帧按新选区重算
+        self.occurrences = Arc::new(Vec::new());
+        self.occurrence_term = None;
     }
 
     pub fn line_text(&self, index: usize) -> &str {
@@ -182,6 +200,96 @@ pub fn char_to_byte(text: &str, char_idx: usize) -> usize {
         .unwrap_or(text.len())
 }
 
+/// 判断一次选区适不适合当作一个「词」来全文高亮。
+///
+/// 返回 `(词, 是否整词匹配)`：选区两端都贴着单词字符说明只圈到了半截词
+/// （比如从 `foo_bar` 里选了 `foo`），这时退回子串匹配更符合直觉。
+/// 跨行、纯空白、过长的选区返回 None——那些通常是整段代码，标不出来。
+fn selection_term(text: &str, a: usize, b: usize) -> Option<(String, bool)> {
+    if a >= b || b > text.len() {
+        return None;
+    }
+    let raw = &text[a..b];
+    if raw.contains('\n') {
+        return None;
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > MAX_TERM_CHARS {
+        return None;
+    }
+    // trim 掉的前导空白会让左端点右移，边界判断要用 trim 后的位置
+    let ta = a + (raw.len() - raw.trim_start().len());
+    let tb = ta + trimmed.len();
+    let glued = text[..ta]
+        .chars()
+        .next_back()
+        .is_some_and(crate::find::is_word_char)
+        || text[tb..].chars().next().is_some_and(crate::find::is_word_char);
+    Some((trimmed.to_string(), !glued))
+}
+
+/// 用上一帧的选区刷新选词高亮。
+///
+/// 必须在排版之前读：`TextEdit` 这一帧才刚把鼠标选区写进 state，
+/// 而 galley 已经排完了，放到后面就只能等下一帧。
+fn sync_occurrences(ui: &Ui, file: &mut OpenFile, edit_id: egui::Id) {
+    let plan = match TextEdit::load_state(ui.ctx(), edit_id) {
+        Some(state) => state
+            .cursor
+            .char_range()
+            .filter(|range| !range.is_empty())
+            .map(|range| {
+                let [min, max] = range.sorted_cursors();
+                (min.index.0, max.index.0)
+            })
+            .and_then(|(a, b)| {
+                selection_term(
+                    &file.text,
+                    char_to_byte(&file.text, a),
+                    char_to_byte(&file.text, b),
+                )
+            }),
+        None => None,
+    };
+    if plan == file.occurrence_term {
+        return;
+    }
+    let list = match &plan {
+        Some((term, whole)) => crate::find::find_occurrences(&file.text, term, *whole),
+        None => Vec::new(),
+    };
+    file.occurrence_term = plan;
+    file.occurrences = Arc::new(list);
+    // 高亮变了要保证再画一帧，否则鼠标停下后的最后一次选区可能永远不生效
+    ui.ctx().request_repaint();
+}
+
+/// 把查找匹配和选词出现合并成一份按起点升序的着色区间，交给排版器一次扫完。
+///
+/// 两者重叠时保留查找的底色：`append_with_matches` 先到先得，
+/// 所以查找段要排在选词段前面，靠稳定排序保持这个次序。
+fn merge_overlay(
+    matches: &[(usize, usize)],
+    current: Option<usize>,
+    occurrences: &[(usize, usize)],
+    match_bg: Color32,
+    cur_match_bg: Color32,
+    occ_bg: Color32,
+) -> Vec<Seg> {
+    let mut out = Vec::with_capacity(matches.len() + occurrences.len());
+    for (i, (a, b)) in matches.iter().enumerate() {
+        let bg = if Some(i) == current {
+            cur_match_bg
+        } else {
+            match_bg
+        };
+        out.push((*a, *b, bg));
+    }
+    out.extend(occurrences.iter().map(|(a, b)| (*a, *b, occ_bg)));
+    out.sort_by_key(|seg| seg.0);
+    out
+}
+
 /// 画一个编辑面板。
 ///
 /// `pane` 是这块面板的身份，用来给滚动位置和光标做持久化 id。
@@ -234,6 +342,12 @@ pub fn show(
     } else {
         Color32::from_rgb(255, 170, 40)
     };
+    // 选词高亮要比查找淡一档，两种高亮同时在场时不能互相盖掉
+    let occ_bg = if dark {
+        Color32::from_rgb(45, 68, 88)
+    } else {
+        Color32::from_rgb(190, 215, 240)
+    };
 
     let scroll_id = ui.make_persistent_id(("editor_scroll", pane, file.path.clone()));
     let edit_id = ui.make_persistent_id(("editor_text", pane, file.path.clone()));
@@ -265,6 +379,38 @@ pub fn show(
         }
     }
 
+    // 外部发起的选区（脚本、以后可能的「跳到定义并选中」）：
+    // 和鼠标拖选一样写进 state，所以选词高亮会照常触发。
+    // state 还没建好的首帧要留着，下一帧再试。
+    // request_focus 不能省：TextEdit 在没有焦点的那一帧会把选区压回单光标。
+    if let Some((a, b)) = file.pending_select {
+        let range = (a.min(file.text.len()), b.min(file.text.len()));
+        if let Some(mut state) = TextEdit::load_state(ui.ctx(), edit_id) {
+            let ca = byte_to_char_index(&file.text, range.0);
+            let cb = byte_to_char_index(&file.text, range.1);
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(cb),
+                egui::text::CCursor::new(ca),
+            )));
+            state.store(ui.ctx(), edit_id);
+            ui.memory_mut(|m| m.request_focus(edit_id));
+            file.pending_select = None;
+        }
+    }
+
+    // 选中一个词就把全文的相同词一起标出来，方便肉眼定位
+    sync_occurrences(ui, file, edit_id);
+
+    // 排版用的着色区间：查找命中优先，选词高亮垫在下面
+    let overlay = Arc::new(merge_overlay(
+        &file.matches,
+        file.current_match,
+        &file.occurrences,
+        match_bg,
+        cur_match_bg,
+        occ_bg,
+    ));
+
     let mut scroll_offset = None;
     if let Some(line) = jump_line {
         let target = (line as f32) * row_height - ui.available_height() * 0.4;
@@ -289,20 +435,16 @@ pub fn show(
 
             let fg = hl.fg;
             let spans_for_layout = spans.clone();
-            let matches_for_layout = file.matches.clone();
-            let current_match = file.current_match;
+            let overlay_for_layout = overlay.clone();
             let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, _wrap: f32| -> Arc<Galley> {
                 build_galley(
                     ui,
                     buf.as_str(),
                     &spans_for_layout,
-                    &matches_for_layout,
-                    current_match,
+                    &overlay_for_layout,
                     &font_id,
                     fg,
                     row_height,
-                    match_bg,
-                    cur_match_bg,
                 )
             };
 
@@ -477,18 +619,14 @@ pub fn human_size(bytes: usize) -> String {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_galley(
     ui: &Ui,
     text: &str,
     spans: &[LineSpans],
-    matches: &[(usize, usize)],
-    current: Option<usize>,
+    overlay: &[Seg],
     font_id: &FontId,
     fallback: Color32,
     line_height: f32,
-    match_bg: Color32,
-    cur_match_bg: Color32,
 ) -> Arc<Galley> {
     let mut job = LayoutJob::default();
     job.wrap.max_width = f32::INFINITY;
@@ -504,13 +642,13 @@ fn build_galley(
 
     let total_lines = text.split('\n').count();
     let mut line_start = 0usize;
-    // 匹配范围已排序，用游标推进避免逐行扫描
-    let mut match_cursor = 0usize;
+    // 着色区间按起点升序，用游标推进避免逐行扫描
+    let mut seg_cursor = 0usize;
 
     for (i, line) in text.split('\n').enumerate() {
         let line_end = line_start + line.len();
-        while match_cursor < matches.len() && matches[match_cursor].1 <= line_start {
-            match_cursor += 1;
+        while seg_cursor < overlay.len() && overlay[seg_cursor].1 <= line_start {
+            seg_cursor += 1;
         }
 
         match spans.get(i) {
@@ -520,51 +658,42 @@ fn build_galley(
                     let piece_start = offset;
                     let piece_end = offset + piece.len();
                     offset = piece_end;
-                    append_with_matches(
+                    append_segments(
                         &mut job,
                         piece,
                         piece_start,
                         piece_end,
                         *color,
                         &base,
-                        matches,
-                        match_cursor,
-                        current,
-                        match_bg,
-                        cur_match_bg,
+                        overlay,
+                        seg_cursor,
                     );
                 }
                 // 高亮结果可能丢掉了行尾空白，补齐保证行宽正确
                 if offset < line_end {
-                    append_with_matches(
+                    append_segments(
                         &mut job,
                         &text[offset..line_end],
                         offset,
                         line_end,
                         fallback,
                         &base,
-                        matches,
-                        match_cursor,
-                        current,
-                        match_bg,
-                        cur_match_bg,
+                        overlay,
+                        seg_cursor,
                     );
                 }
             }
             _ => {
                 if !line.is_empty() {
-                    append_with_matches(
+                    append_segments(
                         &mut job,
                         line,
                         line_start,
                         line_end,
                         fallback,
                         &base,
-                        matches,
-                        match_cursor,
-                        current,
-                        match_bg,
-                        cur_match_bg,
+                        overlay,
+                        seg_cursor,
                     );
                 }
             }
@@ -579,37 +708,33 @@ fn build_galley(
     ui.fonts_mut(|f| f.layout_job(job))
 }
 
+/// 把 `piece`（原文里 `[piece_start, piece_end)` 这一段）按着色区间切开写进 job。
 #[allow(clippy::too_many_arguments)]
-fn append_with_matches(
+fn append_segments(
     job: &mut LayoutJob,
     piece: &str,
     piece_start: usize,
     piece_end: usize,
     color: Color32,
     base: &TextFormat,
-    matches: &[(usize, usize)],
-    mut cursor: usize,
-    current: Option<usize>,
-    match_bg: Color32,
-    cur_match_bg: Color32,
+    overlay: &[Seg],
+    cursor: usize,
 ) {
-    // 找出与本片段相交的所有匹配
-    let mut local: Vec<(usize, usize, bool)> = Vec::new();
+    // 找出与本片段相交的所有着色区间
+    let mut local: Vec<(usize, usize, Color32)> = Vec::new();
     let mut idx = cursor;
-    while idx < matches.len() {
-        let (ms, me) = matches[idx];
+    while idx < overlay.len() {
+        let (ms, me, bg) = overlay[idx];
         if ms >= piece_end {
             break;
         }
         if me > piece_start {
             let a = ms.max(piece_start) - piece_start;
             let b = me.min(piece_end) - piece_start;
-            local.push((a, b, Some(idx) == current));
+            local.push((a, b, bg));
         }
         idx += 1;
     }
-    cursor = idx;
-    let _ = cursor;
 
     if local.is_empty() {
         let mut f = base.clone();
@@ -618,10 +743,11 @@ fn append_with_matches(
         return;
     }
 
-    // 按匹配边界切分，保证 UTF-8 边界安全
+    // 按区间边界切分，保证 UTF-8 边界安全；区间起点相同则保持插入次序，
+    // 于是先入队的查找命中会赢过选词高亮，后一段只补没覆盖到的部分。
     local.sort_by_key(|x| x.0);
     let mut pos = 0usize;
-    for (a, b, is_current) in local {
+    for (a, b, bg) in local {
         if a > pos {
             let mut f = base.clone();
             f.color = color;
@@ -632,7 +758,7 @@ fn append_with_matches(
         if s < e {
             let mut f = base.clone();
             f.color = color;
-            f.background = if is_current { cur_match_bg } else { match_bg };
+            f.background = bg;
             job.append(&piece[s..e], 0.0, f);
         }
         pos = pos.max(b);
@@ -646,4 +772,63 @@ fn append_with_matches(
 
 pub fn cursor_text(file: &OpenFile) -> String {
     format!("行 {}, 列 {}", file.line, file.col)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn whole_word_selection_matches_whole_words() {
+        let text = "fn foo() { foo(); }";
+        let (term, whole) = selection_term(text, 11, 14).unwrap();
+        assert_eq!(term, "foo");
+        assert!(whole);
+    }
+
+    #[test]
+    fn half_word_selection_falls_back_to_substring() {
+        // 从 foo_bar 里只圈走 foo，右边还粘着下划线
+        let (term, whole) = selection_term("foo_bar", 0, 3).unwrap();
+        assert_eq!(term, "foo");
+        assert!(!whole);
+    }
+
+    #[test]
+    fn ignored_selections_return_none() {
+        assert!(selection_term("a\nb", 0, 3).is_none());
+        assert!(selection_term("hello", 2, 2).is_none());
+        assert!(selection_term("   ", 0, 3).is_none());
+        let long = "x".repeat(MAX_TERM_CHARS + 1);
+        assert!(selection_term(&long, 0, long.len()).is_none());
+    }
+
+    #[test]
+    fn padded_selection_uses_trimmed_bounds() {
+        // 选区带了前后空格，整词判断要用 trim 之后的边界
+        let text = "foo bar foo";
+        let (term, whole) = selection_term(text, 3, 7).unwrap();
+        assert_eq!(term, "bar");
+        assert!(whole);
+    }
+
+    #[test]
+    fn overlay_puts_find_before_occurrence() {
+        let segs = merge_overlay(
+            &[(4, 7)],
+            Some(0),
+            &[(0, 3), (4, 7)],
+            Color32::RED,
+            Color32::GREEN,
+            Color32::BLUE,
+        );
+        assert_eq!(
+            segs,
+            vec![
+                (0, 3, Color32::BLUE),
+                (4, 7, Color32::GREEN),
+                (4, 7, Color32::BLUE),
+            ]
+        );
+    }
 }

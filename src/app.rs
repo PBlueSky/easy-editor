@@ -1456,6 +1456,59 @@ impl EasyEditorApp {
                     self.verify_stage += 1;
                 }
             }
+            "word" => {
+                const STAGES: [u64; 5] = [300, 900, 1400, 2200, 2800];
+                if self.verify_stage < STAGES.len() && ms >= STAGES[self.verify_stage] {
+                    match self.verify_stage {
+                        0 => {
+                            // id 既独立出现 3 次，也藏在 width 里两次
+                            let dir = std::path::PathBuf::from(
+                                "C:/Users/blues/AppData/Local/Temp/ee-word",
+                            );
+                            let _ = std::fs::create_dir_all(&dir);
+                            let p = dir.join("sample.rs");
+                            let _ = std::fs::write(
+                                &p,
+                                "fn calc(id: u32) -> u32 {\n    let width = 3;\n    let area = id * width;\n    id + area\n}\n",
+                            );
+                            self.open_file(p, None);
+                        }
+                        1 => {
+                            // 选中第 8..10 字节的独立 id → 期望整词匹配 3 处
+                            if let Some(idx) = self.focused_tab() {
+                                self.tabs[idx].pending_select = Some((8, 10));
+                            }
+                        }
+                        2 => {
+                            if let Some(idx) = self.focused_tab() {
+                                println!(
+                                    "[verify] word 整词选中 id → 高亮 {} 处（期望 3，width 里的不算）",
+                                    self.tabs[idx].occurrences.len()
+                                );
+                            }
+                            // 截图停在整词这一步，半截选中的样子肉眼也能推出来
+                            self.take_screenshot(ctx);
+                        }
+                        3 => {
+                            // 选中 width 里那半截 id（第 35..37 字节）→ 退化成子串匹配，
+                            // 全文 5 处：三个独立 id + 两个 width 里的 id
+                            if let Some(idx) = self.focused_tab() {
+                                self.tabs[idx].pending_select = Some((35, 37));
+                            }
+                        }
+                        4 => {
+                            if let Some(idx) = self.focused_tab() {
+                                println!(
+                                    "[verify] word 半截选中 → 高亮 {} 处（期望 5）",
+                                    self.tabs[idx].occurrences.len()
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.verify_stage += 1;
+                }
+            }
             _ => {}
         }
     }
@@ -2843,6 +2896,7 @@ impl EasyEditorApp {
                     RichText::new(
                         "查找栏里：Enter 下一个 / Shift+Enter 上一个 / Tab 在查找与替换框间切换 / Esc 关闭。\n\
                          替换框里：Enter 替换当前 / Ctrl+Enter 全部替换。\n\
+                         鼠标选中一个词，全文相同的词会一并标出（淡蓝底）；双击可直接取整个词。\n\
                          日志块格式：51 个 = 开头，接标题、日期时间、[状态]，下一行起写正文。",
                     )
                     .size(10.5)
