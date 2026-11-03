@@ -66,6 +66,8 @@ cargo fmt --check                       # 需要 rustup component add rustfmt
 ### 文件树
 `walkdir` 懒加载，默认隐藏 `.` 开头的条目（右键可切换「显示隐藏文件」）。新建文件/文件夹有三个入口：工具栏按钮、文件树顶部按钮、任意条目（含根目录）右键菜单。
 
+新建对话框弹出后输入框立刻拿到键盘焦点，可以直接敲文件名：`Enter` 创建、`Esc` 取消，不需要先用鼠标点一下输入框。
+
 配色跟 shell 里 `ls --color` 一个思路，一眼能分清类型：
 
 | 类型 | 浅色主题 | 深色主题 |
@@ -80,6 +82,18 @@ cargo fmt --check                       # 需要 rustup component add rustfmt
 `portable-pty` 起真实 PTY，`alacritty_terminal` 做 VT 解析，支持滚动、256 色、Ctrl+C 等控制键。
 
 终端不是单独的底部面板，而是和编辑器一样是**面板树里的一块**：`Ctrl+Shift+`` ` 随时新开一块终端，可以同时并排好几块，各跑各的 shell。顶部工具栏里的 `shell:` 下拉框选的是「下一个新建终端用哪个 shell」，自动检测本机可用的：PowerShell 7 / Windows PowerShell / 命令提示符 / Git Bash / WSL。已经开着的终端不受影响，各自记住自己的进程和标题。
+
+自动探测不一定找得到（比如 Git Bash 没进 PATH）。工具栏的 `⚙` 按钮打开「终端设置」，给当前选中的 shell 单独指定**程序路径**和**启动参数**，留空就回到自动探测 / 内置参数，改动直接写进 `config.json`：
+
+```json
+{
+  "terminal_shell": "gitbash",
+  "terminal_programs": { "gitbash": "D:/Softwares/Git/bin/bash.exe" },
+  "terminal_args": { "gitbash": "-l" }
+}
+```
+
+种类 id 是 `pwsh` / `powershell` / `cmd` / `gitbash` / `wsl`；`terminal_args` 用空格分隔，带空格的参数用双引号包住。
 
 ### 工作日志块
 不是独立的任务数据库，而是**写在普通文本文件里**的一种约定格式，可以直接和正文混排、跟着文件走、用 git 管理：
@@ -141,6 +155,12 @@ cargo fmt --check                       # 需要 rustup component add rustfmt
 
 结果统计会显示命中数、耗时和使用的引擎，例如 `166 处结果 · 75 ms · ripgrep`。
 
+结果表格的两列交互：
+
+- 「位置」列窄，长路径会截断成 `a_very_long_directory_…`。悬浮在这一格上会浮出**完整绝对路径**，光标变成手形
+- 拖动「位置」和「内容」之间的分隔线可以加宽这一列，宽度记在表格里，后续每帧都保持（`Column::auto()` 做不到——表格每帧要跑一遍测量 pass，拖出来的宽度下一帧就被按内容打回原形）
+- 点任意一格直接打开对应文件并跳到命中行
+
 ### 大文件
 | 阈值 | 行为 |
 |---|---|
@@ -167,6 +187,7 @@ cargo fmt --check                       # 需要 rustup component add rustfmt
 
 - 每块面板顶部有自己的标题条（文件名 + 未保存标记，或 `⌨ shell 标题`），右侧三个小按钮：`左右` `上下` 拆分、`×` 关闭
 - 面板之间的分割线可以拖动，比例按当前像素位置换算，限制在 5%~95%
+- 聚焦框按整块面板的矩形来画：面板里既没文件也没终端（只剩欢迎页或空白）时，边框照样撑满整块，不会缩成一小条
 - `Ctrl+Shift+Tab` / `Ctrl+Alt+Shift+Tab` 循环聚焦（WT 没有这条，留着给多面板时快速轮转）
 - 鼠标点在哪块面板上就聚焦哪块——按坐标命中判断，不靠控件的点击冒泡（egui 里容器自己的响应区在子控件**下面**，点在 `TextEdit` 上的点击永远不会传到面板背景，所以只能自己算）
 
@@ -219,7 +240,7 @@ cargo fmt --check                       # 需要 rustup component add rustfmt
 
 ## 配置持久化
 
-字号、深浅主题、侧栏展开状态、侧栏页签、是否显示隐藏文件、上次打开的工作目录、改过的快捷键，
+字号、深浅主题、侧栏展开状态、侧栏页签、是否显示隐藏文件、上次打开的工作目录、终端偏好（用哪个 shell、程序路径、启动参数）、改过的快捷键，
 都会自动存到 `%APPDATA%\easy-editor\config.json`，下次启动原样恢复。
 
 写盘有 600ms 防抖（拖字号时不会狂写磁盘），退出时再补一次。

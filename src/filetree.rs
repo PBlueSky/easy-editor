@@ -71,7 +71,8 @@ pub struct FileTree {
     pub selected: Option<PathBuf>,
     /// (父目录, 是否为目录)
     new_entry: Option<(PathBuf, bool)>,
-    new_name: String,
+    /// 新建对话框里正在输入的名字
+    pub new_name: String,
     pub show_hidden: bool,
     pub error: Option<String>,
 }
@@ -491,4 +492,129 @@ pub fn relative(root: &Path, path: &Path) -> String {
 #[allow(dead_code)]
 pub fn row_rect(ui: &Ui) -> Rect {
     Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width(), 20.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SCREEN: Vec2 = Vec2::new(420.0, 700.0);
+
+    /// 走 egui 正常的输入管线跑一帧：事件必须是 RawInput 里的，
+    /// 因为指针状态在 begin_pass 就算好了，事后往 events 里塞是没用的。
+    fn pass(ctx: &egui::Context, tree: &mut FileTree, events: Vec<egui::Event>) -> egui::FullOutput {
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, SCREEN)),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_pass(raw, |ctx| {
+            ctx.root_ui(|ui| {
+                egui::Panel::left("side").show(ui, |ui| {
+                    let _ = tree.ui(ui, false);
+                });
+            });
+        });
+        // 测试里没有真正的渲染器，字体图集的增量没人消费，
+        // epaint 会在 TexturesDelta 被 drop 时断言，这里手动清掉。
+        out.textures_delta.clear();
+        out
+    }
+
+    fn pointer(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    /// 在渲染结果里找一段文字的位置，用来算「该点哪里」。
+    fn find_text(out: &egui::FullOutput, needle: &str) -> Option<Rect> {
+        fn walk(shape: &egui::Shape, needle: &str) -> Option<Rect> {
+            match shape {
+                egui::Shape::Text(t) => {
+                    (t.galley.job.text == needle).then(|| t.galley.rect.translate(t.pos.to_vec2()))
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| walk(s, needle)),
+                _ => None,
+            }
+        }
+        out.shapes.iter().find_map(|c| walk(&c.shape, needle))
+    }
+
+    /// 菜单弹出的帧数不固定，多跑几帧等到它出现。
+    fn wait_for_text(
+        ctx: &egui::Context,
+        tree: &mut FileTree,
+        needle: &str,
+    ) -> Option<Rect> {
+        for _ in 0..4 {
+            let out = pass(ctx, tree, vec![]);
+            if let Some(rect) = find_text(&out, needle) {
+                return Some(rect);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn right_click_new_file_dialog_accepts_typing() {
+        let dir = std::env::temp_dir().join("easy-editor-tree-menu-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let mut tree = FileTree::new(dir.clone());
+
+        let out = pass(&ctx, &mut tree, vec![]);
+        let row = find_text(&out, "a.txt")
+            .expect("文件树里没画出 a.txt")
+            .center();
+
+        pass(&ctx, &mut tree, pointer(row, egui::PointerButton::Secondary, true));
+        pass(&ctx, &mut tree, pointer(row, egui::PointerButton::Secondary, false));
+        let item = wait_for_text(&ctx, &mut tree, "新建文件")
+            .expect("右键没有弹出「新建文件」菜单")
+            .center();
+
+        pass(&ctx, &mut tree, pointer(item, egui::PointerButton::Primary, true));
+        pass(&ctx, &mut tree, pointer(item, egui::PointerButton::Primary, false));
+        // Window 的第一帧只量尺寸不画内容，再跑一帧才能看到它
+        let out = pass(&ctx, &mut tree, vec![]);
+        assert!(tree.new_entry.is_some(), "点了菜单项却没记下新建目标");
+        assert!(
+            find_text(&out, "文件名，如 main.rs").is_some(),
+            "新建对话框没画出来"
+        );
+
+        pass(
+            &ctx,
+            &mut tree,
+            vec![egui::Event::Text("probe.txt".into())],
+        );
+        assert_eq!(
+            tree.new_name, "probe.txt",
+            "对话框里的输入框没收到键盘文字"
+        );
+
+        pass(
+            &ctx,
+            &mut tree,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(dir.join("probe.txt").is_file(), "回车没能把文件建出来");
+    }
 }

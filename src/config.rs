@@ -43,6 +43,14 @@ pub struct Config {
     /// 用户改过的快捷键：动作 id -> 组合字符串。
     /// 只存改过的项，缺的用内置默认值补齐，这样以后加新动作不会破坏老配置。
     pub keymap: BTreeMap<String, String>,
+    /// 新建终端默认用的 shell 种类 id（`pwsh` / `powershell` / `cmd` / `gitbash` / `wsl`）。
+    /// 空串 = 自动挑本机第一个可用的。
+    pub terminal_shell: String,
+    /// 终端程序路径覆盖：种类 id -> 绝对路径。
+    /// 装在非标准目录（比如 `D:\Softwares\GitBash`）时靠这个指过去。
+    pub terminal_programs: BTreeMap<String, String>,
+    /// 终端启动参数覆盖：种类 id -> 参数字符串（空格分隔，带空格的用双引号包住）。
+    pub terminal_args: BTreeMap<String, String>,
 }
 
 impl Default for Config {
@@ -55,6 +63,9 @@ impl Default for Config {
             show_hidden: false,
             side_tab: "files".into(),
             keymap: BTreeMap::new(),
+            terminal_shell: String::new(),
+            terminal_programs: BTreeMap::new(),
+            terminal_args: BTreeMap::new(),
         }
     }
 }

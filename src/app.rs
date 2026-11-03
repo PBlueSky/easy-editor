@@ -17,7 +17,7 @@ use crate::nav::{CaretHistory, NavPoint};
 use crate::pane::{self, Axis, Dir, PaneId, PaneTree, TreeLayout};
 use crate::search::SearchState;
 use crate::syntax::Highlighter;
-use crate::terminal::TerminalPanel;
+use crate::terminal::{TerminalPanel, TerminalSettings};
 use crate::theme;
 
 #[derive(PartialEq, Clone, Copy)]
@@ -120,6 +120,8 @@ pub struct EasyEditorApp {
     keymap: Keymap,
     /// 正在录制新快捷键的动作 id
     recording: Option<String>,
+    /// 「终端设置」窗口是否打开
+    show_terminal_settings: bool,
     /// 中央区域的面板树（tmux 式：一块块面板递归切分，编辑器与终端共用一棵树）
     panes: PaneTree<PaneKind>,
     /// 上一帧算出的面板矩形，方位键找邻居时要用
@@ -134,14 +136,20 @@ pub struct EasyEditorApp {
 
 impl EasyEditorApp {
     pub fn new(cc: &eframe::CreationContext<'_>, target: Option<PathBuf>) -> Self {
+        Self::bootstrap(&cc.egui_ctx, target)
+    }
+
+    /// 不碰 `eframe` 上下文的构造入口：测试里没有真实的窗口和 GL 上下文，
+    /// 但照样要把配置、字体、面板树这套起手式跑一遍。
+    fn bootstrap(ctx: &egui::Context, target: Option<PathBuf>) -> Self {
         let config = ConfigStore::load();
         let font_size = config.data.font_size;
         let dark = config.data.dark;
         let show_side = config.data.show_side;
         let side = SideTab::from_key(&config.data.side_tab);
 
-        theme::install_fonts(&cc.egui_ctx);
-        theme::apply_style(&cc.egui_ctx, dark);
+        theme::install_fonts(ctx);
+        theme::apply_style(ctx, dark);
 
         let keymap = Keymap::from_config(&config.data.keymap);
 
@@ -153,7 +161,10 @@ impl EasyEditorApp {
             active: None,
             side,
             show_side,
-            terminal: TerminalPanel::new(std::env::current_dir().unwrap_or_default()),
+            terminal: TerminalPanel::new(
+                std::env::current_dir().unwrap_or_default(),
+                TerminalSettings::from_config(&config.data.terminal_programs, &config.data.terminal_args),
+            ),
             search: SearchState::default(),
             find: FindState::default(),
             hl: Highlighter::new(dark),
@@ -171,6 +182,7 @@ impl EasyEditorApp {
             nav: CaretHistory::new(),
             keymap,
             recording: None,
+            show_terminal_settings: false,
             panes: PaneTree::new(),
             pane_layout: TreeLayout::default(),
             last_editor_pane: None,
@@ -180,6 +192,8 @@ impl EasyEditorApp {
         // 中央区域始终至少有一块面板；空工作区时它显示欢迎页
         let root = app.panes.set_root(PaneKind::Editor(None));
         app.last_editor_pane = Some(root);
+        // 配置里指定的终端偏好：本机没有这个种类就保持自动选择
+        app.terminal.apply_pref(&app.config.data.terminal_shell);
 
         // 命令行参数优先
         if let Some(path) = target {
@@ -259,6 +273,21 @@ impl EasyEditorApp {
             self.config.data.keymap = km;
             changed = true;
         }
+        // 终端：默认种类 + 路径/参数覆盖。覆盖项先去掉空串再比，配置文件才不会长毛。
+        let pref = self.terminal.shell.id().to_string();
+        if self.config.data.terminal_shell != pref {
+            self.config.data.terminal_shell = pref;
+            changed = true;
+        }
+        let (programs, args) = self.terminal.settings.to_config();
+        if self.config.data.terminal_programs != programs {
+            self.config.data.terminal_programs = programs;
+            changed = true;
+        }
+        if self.config.data.terminal_args != args {
+            self.config.data.terminal_args = args;
+            changed = true;
+        }
         if changed {
             self.config.touch();
         }
@@ -299,11 +328,7 @@ impl EasyEditorApp {
                     self.search.start(&root);
                 }
             }
-            Some("newfile") => {
-                if let Some(tree) = &mut self.tree {
-                    tree.request_new(false);
-                }
-            }
+            Some("newfile") => {}
             _ => {}
         }
     }
@@ -664,8 +689,8 @@ impl EasyEditorApp {
 
     /// 全部走 `keymap`，用户改过的绑定立刻生效。
     ///
-    /// 检查顺序有意义：带 Shift 的组合要先于不带 Shift 的检查，
-    /// 否则 `Ctrl+Shift+S` 会被 `Ctrl+S` 抢先消费掉。
+    /// 同一个键上挂了多个动作（`Ctrl+W` / `Ctrl+Shift+W`），归属由 keymap 按修饰键
+    /// 挑最吻合的那个，所以这里的书写顺序不影响结果。
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         // 录制新快捷键时把所有快捷键都屏蔽掉，否则按键会顺手触发一堆动作
         if self.recording.is_some() {
@@ -1509,6 +1534,38 @@ impl EasyEditorApp {
                     self.verify_stage += 1;
                 }
             }
+            // 新建对话框能不能吃键盘：先让对话框弹出，再塞一条真实 Text 事件进去
+            "newfile" => {
+                const STAGES: [u64; 5] = [300, 900, 1500, 2100, 2600];
+                if self.verify_stage < STAGES.len() && ms >= STAGES[self.verify_stage] {
+                    match self.verify_stage {
+                        0 => {
+                            let dir = std::path::PathBuf::from(
+                                "C:/Users/blues/AppData/Local/Temp/ee-new",
+                            );
+                            let _ = std::fs::create_dir_all(&dir);
+                            let _ = std::fs::write(dir.join("a.txt"), "a\n");
+                            self.open_workspace(dir);
+                        }
+                        1 => {
+                            if let Some(tree) = &mut self.tree {
+                                tree.request_new(false);
+                            }
+                        }
+                        2 => ctx.input_mut(|i| {
+                            i.events.push(egui::Event::Text("probe.txt".into()));
+                        }),
+                        3 => println!(
+                            "[verify] newfile 输入后文件名={:?} 焦点={:?}",
+                            self.tree.as_ref().map(|t| t.new_name.clone()),
+                            ctx.memory(|m| m.focused().map(|id| id.value()))
+                        ),
+                        4 => self.take_screenshot(ctx),
+                        _ => {}
+                    }
+                    self.verify_stage += 1;
+                }
+            }
             _ => {}
         }
     }
@@ -1751,6 +1808,13 @@ impl EasyEditorApp {
                             }
                         }
                     });
+                if ui
+                    .small_button("⚙")
+                    .on_hover_text("配置终端的程序路径与启动参数")
+                    .clicked()
+                {
+                    self.show_terminal_settings = !self.show_terminal_settings;
+                }
                 let h_dec = hint("font_dec");
                 if ui
                     .small_button("-")
@@ -1791,7 +1855,8 @@ impl EasyEditorApp {
         egui::Panel::left("side")
             .resizable(true)
             .default_size(300.0)
-            .size_range(180.0..=620.0)
+            // 上限给足：全局搜索结果里的长路径要靠拉宽侧栏看全
+            .size_range(180.0..=900.0)
             .show(ui, |ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
@@ -1920,12 +1985,30 @@ impl EasyEditorApp {
             .id_salt("search_results")
             .striped(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::auto().at_least(90.0).clip(true))
+            // 交互同时挂在整格和格子里的 Label 上。格子是 egui_extras 在内容之后注册的，
+            // 但 Label 铺满格宽后会在命中测试里赢过格子，于是格子只在上下边缘那点区域
+            // 收得到 hover；正文的浮窗、手形光标、点击都得靠 Label 自己来。
+            // 默认 `Sense::hover()` 只能悬停不能点，所以两处都要显式要 click。
+            .sense(egui::Sense::click())
+            // 位置列可以拖右边线加宽（宽度记在表格状态里），内容列吃掉剩下的空间。
+            // 这里刻意不用 `Column::auto()`：表格每帧都要跑一遍测量 pass，auto 列会被
+            // 按内容重新算宽，刚拖出来的宽度下一帧就被打回原形。
+            .column(
+                Column::initial(140.0)
+                    .at_least(60.0)
+                    .resizable(true)
+                    .clip(true),
+            )
             .column(Column::remainder().clip(true))
             .header(18.0, |mut header| {
-                header.col(|ui| {
-                    ui.label(RichText::new("位置").size(11.0).strong());
+                let (_, resp) = header.col(|ui| {
+                    let lr = ui.add(
+                        egui::Label::new(RichText::new("位置").size(11.0).strong())
+                            .sense(egui::Sense::hover()),
+                    );
+                    lr.on_hover_text("拖动表头分隔线可以加宽这一列");
                 });
+                resp.on_hover_text("拖动表头分隔线可以加宽这一列");
                 header.col(|ui| {
                     ui.label(RichText::new("内容").size(11.0).strong());
                 });
@@ -1934,35 +2017,58 @@ impl EasyEditorApp {
                 body.rows(18.0, hits.len(), |mut row| {
                     let index = row.index();
                     let hit = &hits[index];
-                    row.col(|ui| {
+                    let tip = hit.path.to_string_lossy().to_string();
+                    let (_, resp) = row.col(|ui| {
                         let name = root
                             .as_ref()
                             .map(|r| filetree::relative(r, &hit.path))
                             .unwrap_or_else(|| hit.path.to_string_lossy().to_string());
-                        let label = format!("{}:{}", name, hit.line);
-                        if ui
-                            .add(
-                                egui::Label::new(RichText::new(label).size(11.0).monospace())
-                                    .truncate(),
+                        // truncate 只要那个省略号；全文交给浮窗
+                        let lr = ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("{}:{}", name, hit.line))
+                                    .size(11.0)
+                                    .monospace(),
                             )
-                            .clicked()
-                        {
+                            .truncate()
+                            .sense(egui::Sense::click()),
+                        );
+                        let lr = lr
+                            .on_hover_text(tip.clone())
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if lr.clicked() {
                             clicked = Some(index);
                         }
                     });
-                    row.col(|ui| {
-                        if ui
-                            .add(
-                                egui::Label::new(
-                                    RichText::new(hit.preview.clone()).size(11.0).monospace(),
-                                )
-                                .truncate(),
+                    // 格子的 hover 覆盖 Label 之外的边缘，指针也一起变手形
+                    let resp = resp
+                        .on_hover_text(tip)
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if resp.clicked() {
+                        clicked = Some(index);
+                    }
+                    let tip = format!("第 {} 行：{}", hit.line, hit.preview);
+                    let (_, resp) = row.col(|ui| {
+                        let lr = ui.add(
+                            egui::Label::new(
+                                RichText::new(hit.preview.clone()).size(11.0).monospace(),
                             )
-                            .clicked()
-                        {
+                            .truncate()
+                            .sense(egui::Sense::click()),
+                        );
+                        let lr = lr
+                            .on_hover_text(tip.clone())
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if lr.clicked() {
                             clicked = Some(index);
                         }
                     });
+                    let resp = resp
+                        .on_hover_text(tip)
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if resp.clicked() {
+                        clicked = Some(index);
+                    }
                 });
             });
 
@@ -2429,9 +2535,10 @@ impl EasyEditorApp {
                 .max_rect(rect)
                 .layout(egui::Layout::top_down(egui::Align::LEFT));
             ui.scope_builder(builder, |ui| {
+                // 描边自己画（见循环末尾）：Frame 是照着 content 的 min_rect 上色的，
+                // 空白面板内容只有一行标题，焦点框就会缩成一条，撑不满这一格。
                 egui::Frame::new()
                     .inner_margin(egui::Margin::same(2))
-                    .stroke(stroke)
                     .show(ui, |ui| {
                         let title = match kind {
                             PaneKind::Editor(Some(idx)) => {
@@ -2506,6 +2613,10 @@ impl EasyEditorApp {
                         }
                     });
             });
+            if stroke.width > 0.0 {
+                ui.painter()
+                    .rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
+            }
         }
 
         for d in &layout.dividers {
@@ -2771,6 +2882,112 @@ impl EasyEditorApp {
         }
     }
 
+    /// 「终端设置」：给当前选中的 shell 指定可执行文件路径和启动参数，改动直接进 config.json。
+    ///
+    /// 装在非标准目录的 Git Bash（`which` 和内置候选都摸不到）靠这个才起得来。
+    fn terminal_settings_window(&mut self, ctx: &egui::Context) {
+        if !self.show_terminal_settings {
+            return;
+        }
+        let mut open = true;
+        let mut done = false;
+        egui::Window::new("终端设置")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                let kind = self.terminal.shell;
+                let id = kind.id().to_string();
+                // 先取本地副本：闭包里既要读又要写 self.terminal.settings，直接借会打架
+                let mut program = self
+                    .terminal
+                    .settings
+                    .programs
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut args = self
+                    .terminal
+                    .settings
+                    .args
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_default();
+
+                ui.label(
+                    RichText::new(format!("{}（{}）", kind.label(), kind.id()))
+                        .size(12.5)
+                        .strong(),
+                );
+                ui.separator();
+
+                ui.label(RichText::new("程序路径（留空 = 自动探测）").size(11.5).weak());
+                let p_resp = ui.add(
+                    egui::TextEdit::singleline(&mut program)
+                        .hint_text(r"C:\Program Files\Git\bin\bash.exe")
+                        .desired_width(360.0),
+                );
+                let found = match kind.detected() {
+                    Some(path) => format!("自动探测到：{}", path.display()),
+                    None => "本机没探测到，需要手工指定路径".to_string(),
+                };
+                ui.label(RichText::new(found).size(11.0).weak());
+                if !program.trim().is_empty() && !Path::new(program.trim()).is_file() {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        "这个路径现在还不存在",
+                    );
+                }
+
+                ui.add_space(6.0);
+                ui.label(RichText::new("启动参数（留空 = 内置参数）").size(11.5).weak());
+                let a_resp = ui.add(
+                    egui::TextEdit::singleline(&mut args)
+                        .hint_text("例如：-NoProfile -NoLogo")
+                        .desired_width(360.0),
+                );
+                ui.label(
+                    RichText::new("按空格拆分，带空格的参数用双引号包住。")
+                        .size(11.0)
+                        .weak(),
+                );
+
+                ui.add_space(6.0);
+                let mut cleared = false;
+                ui.horizontal(|ui| {
+                    if ui.button("清除覆盖").clicked() {
+                        program.clear();
+                        args.clear();
+                        cleared = true;
+                    }
+                    if ui.button("完成").clicked() {
+                        done = true;
+                    }
+                });
+                ui.label(
+                    RichText::new(format!(
+                        "改动即时生效，并写进 {}",
+                        config::Config::path().display()
+                    ))
+                    .size(11.0)
+                    .weak(),
+                );
+
+                if p_resp.changed() || a_resp.changed() || cleared {
+                    self.terminal
+                        .settings
+                        .programs
+                        .insert(id.clone(), program.trim().to_string());
+                    self.terminal.settings.args.insert(id, args.trim().to_string());
+                    // 路径可能让某个种类从「没有」变成「可用」，可用列表要跟着重算
+                    self.terminal.refresh();
+                }
+            });
+        // open 由标题栏的 ✕ 写，done 由「完成」按钮写，两个都得认
+        self.show_terminal_settings = open && !done;
+    }
+
     fn help_window(&mut self, ctx: &egui::Context) {
         if !self.show_help {
             return;
@@ -2907,8 +3124,10 @@ impl EasyEditorApp {
     }
 }
 
-impl eframe::App for EasyEditorApp {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+impl EasyEditorApp {
+    /// 一帧的全部 UI。单独拆出来是因为 `eframe::Frame` 在测试里造不出来，
+    /// 拆开后无窗口测试也能驱动一遍真实布局。
+    fn draw(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         self.frame_count += 1;
 
@@ -2968,6 +3187,7 @@ impl eframe::App for EasyEditorApp {
         self.quick_open_window(&ctx);
         self.close_confirm(&ctx);
         self.help_window(&ctx);
+        self.terminal_settings_window(&ctx);
 
         // 编辑器在 central() 里才会把最新光标写回 OpenFile，所以放在最后收
         self.poll_caret(&ctx);
@@ -2981,6 +3201,12 @@ impl eframe::App for EasyEditorApp {
         }
 
         self.sync_config();
+    }
+}
+
+impl eframe::App for EasyEditorApp {
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -3012,13 +3238,27 @@ fn remap_tab(slot: Option<usize>, removed: usize, remaining: usize) -> Option<us
 ///
 /// 只能按几何判断：egui 把容器自身的 sense 注册在它包含的控件**之下**，
 /// 所以点在 TextEdit 上的点击永远不会冒泡到面板背景，用父 response 做点击聚焦会失灵。
+///
+/// 纯几何又会误伤悬浮层：盖在面板上的 `Window`（新建文件、终端设置）和右键菜单，落点
+/// 同样"在面板矩形里"。一旦认账就会 `set_focus` → `after_focus_change` → 终端面板
+/// `request_focus`，而这一步发生在左侧栏的对话框之后，键盘焦点被终端抢走，
+/// 表现为"新建文件时打不了字"。所以先问 egui 这一点命中了哪个可交互 Area。
 fn pane_click(ctx: &egui::Context, area: egui::Rect) -> Option<egui::Pos2> {
-    ctx.input(|i| {
+    let pos = ctx.input(|i| {
         if !i.pointer.primary_clicked() {
             return None;
         }
         i.pointer.interact_pos().filter(|p| area.contains(*p))
-    })
+    })?;
+    // layer_id_at 要读 memory，不能嵌在 ctx.input 的读锁里。
+    // 面板本身就在 Background 层，只有 Middle/Foreground 才是真正压在上面的窗口和菜单。
+    if ctx
+        .layer_id_at(pos)
+        .is_some_and(|layer| layer.order >= egui::Order::Middle)
+    {
+        return None;
+    }
+    Some(pos)
 }
 
 /// 命中测试：这个点落在哪块面板上。
@@ -3172,4 +3412,485 @@ fn fuzzy_score(haystack: &str, needle: &str) -> Option<i32> {
     }
     score -= hay.len().min(60) as i32 / 4;
     Some(score)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Pos2, Rect, Vec2};
+
+    const SCREEN: Vec2 = Vec2::new(1400.0, 880.0);
+
+    /// 走 egui 正常的输入管线跑一帧。指针状态在 `begin_pass` 里就算好了，
+    /// 事后往 `input_mut` 的 events 里塞点击是没用的，必须从这里进。
+    fn frame(
+        app: &mut EasyEditorApp,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SCREEN)),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_pass(raw, |ctx| {
+            ctx.root_ui(|ui| app.draw(ui));
+        });
+        // 没有真的渲染器消费字体图集的增量，epaint 会在 drop 时断言
+        out.textures_delta.clear();
+        out
+    }
+
+    fn pointer(pos: Pos2, button: egui::PointerButton, pressed: bool) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: Modifiers::NONE,
+            },
+        ]
+    }
+
+    fn find_text(out: &egui::FullOutput, needle: &str) -> Option<Rect> {
+        fn walk(shape: &egui::Shape, needle: &str) -> Option<Rect> {
+            match shape {
+                egui::Shape::Text(t) => {
+                    (t.galley.job.text == needle).then(|| t.galley.rect.translate(t.pos.to_vec2()))
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| walk(s, needle)),
+                _ => None,
+            }
+        }
+        out.shapes.iter().find_map(|c| walk(&c.shape, needle))
+    }
+
+    fn wait_for_text(
+        app: &mut EasyEditorApp,
+        ctx: &egui::Context,
+        needle: &str,
+    ) -> Option<Rect> {
+        for _ in 0..4 {
+            let out = frame(app, ctx, vec![]);
+            if let Some(rect) = find_text(&out, needle) {
+                return Some(rect);
+            }
+        }
+        None
+    }
+
+    /// 在只放了 `a.txt` 的临时目录里起一个应用，停在侧栏「文件」页签上。
+    ///
+    /// 页签和侧栏可见性都得显式设：`bootstrap` 读的是真实用户的 config.json，
+    /// 里面存着上一次手工操作留下的页签，测试不能跟着它漂。
+    fn app_in_folder(dir_name: &str, content: &str) -> (egui::Context, EasyEditorApp, PathBuf) {
+        let dir = std::env::temp_dir().join(dir_name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), content).unwrap();
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let mut app = EasyEditorApp::bootstrap(&ctx, Some(dir.clone()));
+        app.side = SideTab::Files;
+        app.show_side = true;
+        (ctx, app, dir)
+    }
+
+    /// 右键文件树 → 点「新建文件」→ 打字 → 回车建文件。
+    ///
+    /// 只单测 FileTree 复现不了这条链路：对话框是浮在中央面板上的，
+    /// 点菜单那一下还会顺带走过面板聚焦，两边凑在一起才看得出焦点最终落在谁身上。
+    #[test]
+    fn right_click_new_file_takes_typing_in_full_app() {
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-menu-test", "a\n");
+
+        let out = frame(&mut app, &ctx, vec![]);
+        let row = find_text(&out, "a.txt")
+            .expect("文件树里没画出 a.txt")
+            .center();
+
+        frame(&mut app, &ctx, pointer(row, egui::PointerButton::Secondary, true));
+        frame(
+            &mut app,
+            &ctx,
+            pointer(row, egui::PointerButton::Secondary, false),
+        );
+        let item = wait_for_text(&mut app, &ctx, "新建文件")
+            .expect("右键没有弹出「新建文件」菜单")
+            .center();
+
+        frame(&mut app, &ctx, pointer(item, egui::PointerButton::Primary, true));
+        frame(
+            &mut app,
+            &ctx,
+            pointer(item, egui::PointerButton::Primary, false),
+        );
+        let out = frame(&mut app, &ctx, vec![]);
+        assert!(
+            find_text(&out, "文件名，如 main.rs").is_some(),
+            "新建对话框没画出来"
+        );
+
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Text("probe.txt".into())],
+        );
+        assert_eq!(
+            app.tree.as_ref().unwrap().new_name,
+            "probe.txt",
+            "对话框里的输入框没收到键盘文字，焦点不在它身上"
+        );
+
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        assert!(dir.join("probe.txt").is_file(), "回车没能把文件建出来");
+    }
+
+    /// 右键某一行 → 点菜单里的「新建文件」，把对话框打开。返回输入框位置。
+    fn open_new_dialog(app: &mut EasyEditorApp, ctx: &egui::Context, row: Pos2) -> Pos2 {
+        frame(app, ctx, pointer(row, egui::PointerButton::Secondary, true));
+        frame(
+            app,
+            ctx,
+            pointer(row, egui::PointerButton::Secondary, false),
+        );
+        let item = wait_for_text(app, ctx, "新建文件")
+            .expect("右键没有弹出「新建文件」菜单")
+            .center();
+        frame(app, ctx, pointer(item, egui::PointerButton::Primary, true));
+        frame(
+            app,
+            ctx,
+            pointer(item, egui::PointerButton::Primary, false),
+        );
+        // Window 首帧只量尺寸不画内容，再跑一帧才算真的开好了
+        let out = frame(app, ctx, vec![]);
+        let hint = find_text(&out, "文件名，如 main.rs");
+        assert!(hint.is_some(), "新建对话框没画出来");
+        hint.unwrap().center()
+    }
+
+    /// 一帧里同时给一个 Key 和一个 Text，和 winit 对可打印键的真实行为一致。
+    fn typed(ch: char) -> Vec<egui::Event> {
+        let key = match ch {
+            'a' => Key::A,
+            'b' => Key::B,
+            'c' => Key::C,
+            'x' => Key::X,
+            'y' => Key::Y,
+            'z' => Key::Z,
+            _ => unreachable!(),
+        };
+        vec![
+            egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            },
+            egui::Event::Text(ch.to_string()),
+        ]
+    }
+
+    /// 正常打字：逐键、每键一帧。
+    #[test]
+    fn new_file_dialog_takes_keypresses() {
+        let (ctx, mut app, _dir) = app_in_folder("easy-editor-app-key-test", "a\n");
+
+        let out = frame(&mut app, &ctx, vec![]);
+        let row = find_text(&out, "a.txt")
+            .expect("文件树里没画出 a.txt")
+            .center();
+        open_new_dialog(&mut app, &ctx, row);
+
+        for ch in ['a', 'b', 'c'] {
+            frame(&mut app, &ctx, typed(ch));
+        }
+        assert_eq!(
+            app.tree.as_ref().unwrap().new_name,
+            "abc",
+            "逐个按键打不进新建对话框"
+        );
+    }
+
+    /// 先点编辑器（键盘焦点落在编辑器上），再走右键新建。
+    #[test]
+    fn new_file_dialog_takes_keypresses_after_editor_click() {
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-key-edit-test", "hello\n");
+        app.open_file(dir.join("a.txt"), None);
+
+        let out = frame(&mut app, &ctx, vec![]);
+        let row = find_text(&out, "a.txt")
+            .expect("文件树里没画出 a.txt")
+            .center();
+
+        // 在编辑区第一行文字上点一下，把键盘焦点交给编辑器。
+        // 必须点在真有文字的地方：TextEdit 只按行数占高，短文件的编辑区下方是空白，
+        // 点在空白处连编辑器都命中不了。
+        let spot = find_text(&out, "hello\n")
+            .or_else(|| find_text(&out, "hello"))
+            .expect("编辑器里没画出 hello")
+            .center();
+        frame(&mut app, &ctx, pointer(spot, egui::PointerButton::Primary, true));
+        frame(
+            &mut app,
+            &ctx,
+            pointer(spot, egui::PointerButton::Primary, false),
+        );
+        for ch in ['x', 'y', 'z'] {
+            frame(&mut app, &ctx, typed(ch));
+        }
+        assert!(
+            app.tabs[0].text.contains("xyz"),
+            "前置条件不成立：焦点没落到编辑器上"
+        );
+
+        open_new_dialog(&mut app, &ctx, row);
+        for ch in ['a', 'b', 'c'] {
+            frame(&mut app, &ctx, typed(ch));
+        }
+        assert_eq!(
+            app.tree.as_ref().unwrap().new_name,
+            "abc",
+            "编辑器抢过焦点后，新建对话框就打不进字了"
+        );
+    }
+
+    /// 悬浮窗盖在面板上时，点它不能算点面板。
+    ///
+    /// 这是「新建文件打不了字」的根因：认账之后 `after_focus_change` 会给终端面板
+    /// `request_focus`，而它发生在左侧栏对话框之后，键盘焦点就被终端抢走。
+    /// 但也不能一律不算——点在面板空白处仍要能切换聚焦面板。
+    #[test]
+    fn pane_click_skips_points_covered_by_floating_windows() {
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-pane-click-test", "hello\n");
+        app.open_file(dir.join("a.txt"), None);
+
+        let out = frame(&mut app, &ctx, vec![]);
+        let row = find_text(&out, "a.txt")
+            .expect("文件树里没画出 a.txt")
+            .center();
+        let pane = app.pane_layout.panes[0].rect;
+        let dialog = open_new_dialog(&mut app, &ctx, row);
+        assert!(
+            pane.contains(dialog),
+            "前置条件不成立：对话框没落在面板矩形里（{dialog:?} vs {pane:?}）"
+        );
+
+        let click = |app: &mut EasyEditorApp, pos: Pos2| {
+            frame(app, &ctx, pointer(pos, egui::PointerButton::Primary, true));
+            frame(app, &ctx, pointer(pos, egui::PointerButton::Primary, false));
+            pane_click(&ctx, pane)
+        };
+
+        // 面板左上角那块空白：没有悬浮窗压着，照常算面板点击
+        let empty = pane.min + Vec2::new(40.0, 20.0);
+        assert_eq!(
+            click(&mut app, empty),
+            Some(empty),
+            "点在面板空白处没算成面板点击，聚焦面板的鼠标切换会失灵"
+        );
+        assert_eq!(
+            click(&mut app, dialog),
+            None,
+            "点在悬浮对话框上被当成了点面板，焦点会从输入框抢走"
+        );
+    }
+
+    fn texts(out: &egui::FullOutput) -> Vec<String> {
+        fn walk(shape: &egui::Shape, v: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => v.push(t.galley.job.text.clone()),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, v)),
+                _ => {}
+            }
+        }
+        let mut v = Vec::new();
+        out.shapes.iter().for_each(|c| walk(&c.shape, &mut v));
+        v
+    }
+
+    /// 跑一帧，同时推进 `RawInput.time`。
+    /// 悬浮提示的延时是按 time 算的，time 不动就永远等不到。
+    fn frame_time(
+        app: &mut EasyEditorApp,
+        ctx: &egui::Context,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SCREEN)),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_pass(raw, |ctx| {
+            ctx.root_ui(|ui| app.draw(ui));
+        });
+        out.textures_delta.clear();
+        out
+    }
+
+    /// 造一个「搜索只命中一条、路径长到必须截断」的应用，停在结果表格上。
+    fn app_with_long_hit(dir_name: &str) -> (egui::Context, EasyEditorApp, PathBuf) {
+        let dir = std::env::temp_dir().join(dir_name);
+        let _ = std::fs::remove_dir_all(&dir);
+        let nested = dir
+            .join("a_very_long_directory_name_for_testing_truncation")
+            .join("b_another_nested_level");
+        std::fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("c_long_named_file.txt");
+        std::fs::write(&file, "needle line\n").unwrap();
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let mut app = EasyEditorApp::bootstrap(&ctx, Some(dir.clone()));
+        app.side = SideTab::Search;
+        app.show_side = true;
+        app.search.hits = vec![crate::search::SearchHit {
+            path: file.clone(),
+            line: 1,
+            col: 1,
+            preview: "needle line".into(),
+        }];
+        (ctx, app, file)
+    }
+
+    fn text_rect_where(out: &egui::FullOutput, pred: impl Fn(&str) -> bool) -> Option<Rect> {
+        fn walk(shape: &egui::Shape, pred: &impl Fn(&str) -> bool) -> Option<Rect> {
+            match shape {
+                egui::Shape::Text(t) => (pred)(&t.galley.job.text)
+                    .then(|| t.galley.rect.translate(t.pos.to_vec2())),
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| walk(s, pred)),
+                _ => None,
+            }
+        }
+        out.shapes.iter().find_map(|c| walk(&c.shape, &pred))
+    }
+
+    /// 结果行里那条路径的矩形。用 starts_with 排除浮窗：浮窗显示的是绝对路径。
+    fn hit_row(out: &egui::FullOutput) -> Rect {
+        text_rect_where(out, |t| t.starts_with("a_very_long")).expect("搜索结果行没画出来")
+    }
+
+    /// 结果行右边最近的一条竖线，就是拖列宽用的分隔线。
+    fn divider_after(out: &egui::FullOutput, row: Rect) -> f32 {
+        fn walk(shape: &egui::Shape, hits: &mut Vec<(f32, f32, f32)>) {
+            match shape {
+                egui::Shape::LineSegment { points, .. } => {
+                    if (points[0].x - points[1].x).abs() < 0.5 {
+                        hits.push((points[0].x, points[0].y, points[1].y));
+                    }
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, hits)),
+                _ => {}
+            }
+        }
+        let mut lines = Vec::new();
+        for c in &out.shapes {
+            walk(&c.shape, &mut lines);
+        }
+        let y = row.center().y;
+        lines
+            .iter()
+            .filter(|(x, _, _)| *x > row.right())
+            .filter(|(_, y0, y1)| y0.min(*y1) <= y && y <= y0.max(*y1))
+            .map(|(x, _, _)| *x)
+            .min_by(f32::total_cmp)
+            .unwrap_or_else(|| panic!("结果行右侧 {y} 处找不到列分隔线，竖线={lines:?}"))
+    }
+
+    /// 悬浮结果行要浮出完整路径，点一下要能打开对应文件。
+    #[test]
+    fn search_result_row_hovers_full_path_and_opens_file() {
+        let (ctx, mut app, file) = app_with_long_hit("easy-editor-app-search-hover-test");
+        let out = frame(&mut app, &ctx, vec![]);
+        let before = texts(&out);
+        let row = hit_row(&out);
+
+        // 指针到位后不再动，tooltip_delay 才走得完
+        let mut out =
+            frame_time(&mut app, &ctx, 1.0, vec![egui::Event::PointerMoved(row.center())]);
+        for i in 1..8 {
+            out = frame_time(&mut app, &ctx, 1.0 + i as f64 * 0.3, vec![]);
+        }
+        let after = texts(&out);
+        let full = file.to_string_lossy().to_string();
+        assert!(
+            after.iter().any(|t| t == &full),
+            "悬浮在结果行上没有浮出完整路径，新增文字 {:?}",
+            after
+                .iter()
+                .filter(|t| !before.contains(t))
+                .collect::<Vec<_>>()
+        );
+        // 手形光标截图里看不出来，只能问 egui 这一帧想设哪个光标
+        assert_eq!(
+            out.platform_output.cursor_icon,
+            egui::CursorIcon::PointingHand,
+            "悬浮在结果行上时光标没变成手形"
+        );
+
+        let center = row.center();
+        frame(&mut app, &ctx, pointer(center, egui::PointerButton::Primary, true));
+        frame(
+            &mut app,
+            &ctx,
+            pointer(center, egui::PointerButton::Primary, false),
+        );
+        assert_eq!(
+            app.active.map(|i| app.tabs[i].path.clone()),
+            Some(file),
+            "点结果行没能打开对应文件"
+        );
+    }
+
+    /// 拖位置列的分隔线加宽之后，下一帧不能被表格自己的测量 pass 打回原宽。
+    ///
+    /// `Column::auto()` 会踩这个坑：ScrollArea 每帧先跑一遍 sizing pass，
+    /// auto 列在 sizing pass 里无条件按内容重算宽度，把手拖出来的宽度只活一帧。
+    #[test]
+    fn search_result_column_keeps_the_dragged_width() {
+        let (ctx, mut app, _file) = app_with_long_hit("easy-editor-app-search-resize-test");
+        let out = frame(&mut app, &ctx, vec![]);
+        let row = hit_row(&out);
+        let x = divider_after(&out, row);
+        let narrow = row.width();
+        let y = row.center().y;
+
+        let start = egui::pos2(x, y);
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(start)]);
+        frame(&mut app, &ctx, pointer(start, egui::PointerButton::Primary, true));
+        for i in 1..=6 {
+            let p = egui::pos2(x + i as f32 * 12.0, y);
+            frame(&mut app, &ctx, vec![egui::Event::PointerMoved(p)]);
+        }
+        frame(
+            &mut app,
+            &ctx,
+            pointer(egui::pos2(x + 72.0, y), egui::PointerButton::Primary, false),
+        );
+
+        for i in 0..3 {
+            let out = frame(&mut app, &ctx, vec![]);
+            let wide = hit_row(&out).width();
+            assert!(
+                wide > narrow + 20.0,
+                "拖宽位置列后第 {i} 帧宽度被打回 {wide}（拖之前 {narrow}）"
+            );
+        }
+    }
 }

@@ -4,6 +4,7 @@
 //! 又请求焦点，否则请求会打在一个不存在的 id 上，下一帧就被清理掉，
 //! 表现为「终端能显示、点进去也看不出异常，但打字完全没反应」。
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -48,6 +49,30 @@ pub enum ShellKind {
 }
 
 impl ShellKind {
+    /// 列表顺序即偏好顺序。
+    pub const ALL: &'static [ShellKind] = &[
+        Self::Pwsh,
+        Self::WindowsPowerShell,
+        Self::Cmd,
+        Self::GitBash,
+        Self::Wsl,
+    ];
+
+    /// 配置文件里用的稳定 id，别和 `label()` 混用——label 是给人看的中文。
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Pwsh => "pwsh",
+            Self::WindowsPowerShell => "powershell",
+            Self::Cmd => "cmd",
+            Self::GitBash => "gitbash",
+            Self::Wsl => "wsl",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|k| k.id() == id)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Pwsh => "PowerShell 7",
@@ -58,53 +83,58 @@ impl ShellKind {
         }
     }
 
-    fn program(self) -> Option<PathBuf> {
+    /// 自动探测到的可执行文件（不含配置里的覆盖路径）。
+    pub fn detected(self) -> Option<PathBuf> {
         match self {
             Self::Pwsh => which("pwsh.exe"),
             Self::WindowsPowerShell => which("powershell.exe"),
-            Self::Cmd => which("cmd.exe").or_else(|| {
-                std::env::var_os("COMSPEC").map(PathBuf::from)
-            }),
+            Self::Cmd => which("cmd.exe").or_else(|| std::env::var_os("COMSPEC").map(PathBuf::from)),
             Self::GitBash => find_git_bash(),
             Self::Wsl => which("wsl.exe"),
         }
     }
 
-    /// 列出本机可用的 shell，顺序即偏好顺序。
-    pub fn detect() -> Vec<Self> {
-        [
-            Self::Pwsh,
-            Self::WindowsPowerShell,
-            Self::Cmd,
-            Self::GitBash,
-            Self::Wsl,
-        ]
-        .into_iter()
-        .filter(|k| k.program().is_some())
-        .collect()
+    /// 实际要启动的程序：配置里写了就用配置的，否则自动探测。
+    fn program(self, settings: &TerminalSettings) -> Option<PathBuf> {
+        settings.program(self).or_else(|| self.detected())
     }
 
-    fn build(self, cwd: &Path) -> Option<CommandBuilder> {
-        let program = self.program()?;
+    /// 可用的 shell 列表。配置里显式写了路径的种类即使探测不到也算可用，
+    /// 这样路径写错时会在启动时报错，而不是静默消失。
+    pub fn detect(settings: &TerminalSettings) -> Vec<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .filter(|k| k.program(settings).is_some())
+            .collect()
+    }
+
+    fn build(self, cwd: &Path, settings: &TerminalSettings) -> Option<CommandBuilder> {
+        let program = self.program(settings)?;
         let mut cmd = CommandBuilder::new(program);
-        match self {
-            Self::Pwsh => {
-                cmd.arg("-NoLogo");
+        // 启动参数：配置优先；配置留空才用下面这套内置参数
+        if let Some(args) = settings.args(self) {
+            for arg in args {
+                cmd.arg(arg);
             }
-            Self::WindowsPowerShell => {
-                cmd.arg("-NoLogo");
+        } else {
+            match self {
+                Self::Pwsh | Self::WindowsPowerShell => {
+                    cmd.arg("-NoLogo");
+                }
+                Self::GitBash => {
+                    cmd.arg("-i");
+                    cmd.arg("-l");
+                }
+                Self::Wsl => {
+                    // wsl.exe 不认 Windows 路径，用 --cd 传目录
+                    cmd.arg("--cd");
+                    cmd.arg(cwd.to_string_lossy().to_string());
+                }
+                Self::Cmd => {}
             }
-            Self::GitBash => {
-                cmd.arg("-i");
-                cmd.arg("-l");
-            }
-            Self::Wsl => {
-                // wsl.exe 不认 Windows 路径，用 --cd 传目录
-                cmd.arg("--cd");
-                cmd.arg(cwd.to_string_lossy().to_string());
-            }
-            Self::Cmd => {}
         }
+        // WSL 的落点靠 --cd，给它设 Windows 工作目录没有意义；其余 shell 直接设 cwd
         if self != Self::Wsl {
             cmd.cwd(cwd);
         }
@@ -113,9 +143,94 @@ impl ShellKind {
     }
 }
 
+/// 终端设置：程序路径与启动参数按 shell 种类覆盖，都来自 `config.json`。
+/// 缺省即自动探测 + 内置参数，所以配置文件里只会有用户真正改过的条目。
+#[derive(Clone, Debug, Default)]
+pub struct TerminalSettings {
+    /// 种类 id -> 可执行文件路径
+    pub programs: BTreeMap<String, String>,
+    /// 种类 id -> 启动参数字符串（空格分隔，双引号包住带空格的参数）
+    pub args: BTreeMap<String, String>,
+}
+
+impl TerminalSettings {
+    pub fn from_config(programs: &BTreeMap<String, String>, args: &BTreeMap<String, String>) -> Self {
+        Self {
+            programs: programs.clone(),
+            args: args.clone(),
+        }
+    }
+
+    /// 写回配置，顺手丢掉空串，配置文件才不会积累噪音。
+    pub fn to_config(&self) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+        let clean = |map: &BTreeMap<String, String>| {
+            map.iter()
+                .filter(|(_, v)| !v.trim().is_empty())
+                .map(|(k, v)| (k.clone(), v.trim().to_string()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        (clean(&self.programs), clean(&self.args))
+    }
+
+    fn program(&self, kind: ShellKind) -> Option<PathBuf> {
+        self.programs
+            .get(kind.id())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    }
+
+    fn args(&self, kind: ShellKind) -> Option<Vec<String>> {
+        let raw = self.args.get(kind.id())?;
+        if raw.trim().is_empty() {
+            return None;
+        }
+        Some(split_args(raw))
+    }
+}
+
+/// 按空白切分参数，双引号里的空格算一个整体：`-c "echo hi"` → `["-c", "echo hi"]`。
+pub fn split_args(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut started = false;
+    for ch in text.chars() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                started = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if started {
+                    out.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        out.push(cur);
+    }
+    out
+}
+
 fn find_git_bash() -> Option<PathBuf> {
-    if let Some(p) = which("bash.exe") {
-        return Some(p);
+    // Git for Windows 里 bash 一定和 git.exe 同一次安装；顺着 git.exe 往上找比在 PATH 里
+    // 瞎摸靠谱 —— PATH 里可能混进 System32 那个 WSL 启动桩，拿它当 Git Bash 起不来。
+    if let Some(git) = which("git.exe") {
+        for dir in [git.parent(), git.parent().and_then(|p| p.parent())] {
+            if let Some(root) = dir {
+                let candidate = root.join("bin").join("bash.exe");
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
     }
     let candidates = [
         r"C:\Program Files\Git\bin\bash.exe",
@@ -126,6 +241,15 @@ fn find_git_bash() -> Option<PathBuf> {
         .iter()
         .map(PathBuf::from)
         .find(|p| p.is_file())
+        .or_else(|| which("bash.exe").filter(|p| !looks_like_wsl_stub(p)))
+}
+
+/// `C:\Windows\System32\bash.exe` 只是转交给 WSL 的桩，不是 Git Bash。
+fn looks_like_wsl_stub(path: &Path) -> bool {
+    path.to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+        .contains("\\windows\\system32\\")
 }
 
 fn which(name: &str) -> Option<PathBuf> {
@@ -195,6 +319,7 @@ impl Terminal {
         cols: usize,
         rows: usize,
         shell: ShellKind,
+        settings: &TerminalSettings,
     ) -> Result<Self, String> {
         let cols = cols.max(20);
         let rows = rows.max(5);
@@ -208,9 +333,9 @@ impl Terminal {
             })
             .map_err(|e| format!("创建伪终端失败：{e}"))?;
 
-        let cmd = shell
-            .build(cwd)
-            .ok_or_else(|| format!("找不到 {} 的可执行文件", shell.label()))?;
+        let cmd = shell.build(cwd, settings).ok_or_else(|| {
+            format!("找不到 {} 的可执行文件，可在终端设置里指定路径", shell.label())
+        })?;
 
         let child = pair
             .slave
@@ -666,11 +791,13 @@ pub struct TerminalPanel {
     /// 新建终端时使用的 shell
     pub shell: ShellKind,
     pub available: Vec<ShellKind>,
+    /// 程序路径 / 启动参数的覆盖项，来自 config.json
+    pub settings: TerminalSettings,
 }
 
 impl TerminalPanel {
-    pub fn new(cwd: PathBuf) -> Self {
-        let available = ShellKind::detect();
+    pub fn new(cwd: PathBuf, settings: TerminalSettings) -> Self {
+        let available = ShellKind::detect(&settings);
         let shell = available.first().copied().unwrap_or(ShellKind::Cmd);
         Self {
             terms: Vec::new(),
@@ -678,6 +805,24 @@ impl TerminalPanel {
             cwd,
             shell,
             available,
+            settings,
+        }
+    }
+
+    /// 套用配置里的 shell 偏好；本机没有这个种类就保持自动选择。
+    pub fn apply_pref(&mut self, id: &str) {
+        if let Some(kind) = ShellKind::from_id(id) {
+            if self.available.contains(&kind) {
+                self.shell = kind;
+            }
+        }
+    }
+
+    /// 改了设置后重算可用列表；首选被挪走时退回自动选择。
+    pub fn refresh(&mut self) {
+        self.available = ShellKind::detect(&self.settings);
+        if !self.available.contains(&self.shell) {
+            self.shell = self.available.first().copied().unwrap_or(ShellKind::Cmd);
         }
     }
 
@@ -720,7 +865,7 @@ impl TerminalPanel {
     pub fn create(&mut self) -> Result<u64, String> {
         let id = self.next_id;
         self.next_id += 1;
-        let term = Terminal::spawn(id, &self.cwd, 100, 28, self.shell)?;
+        let term = Terminal::spawn(id, &self.cwd, 100, 28, self.shell, &self.settings)?;
         self.terms.push(term);
         Ok(id)
     }
@@ -788,4 +933,64 @@ fn looks_like_exe_path(title: &str) -> bool {
         return true;
     }
     lower.contains("\\system32\\") || lower.contains("\\windows\\")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_ids_roundtrip() {
+        for kind in ShellKind::ALL {
+            let id = kind.id();
+            assert!(!id.is_empty());
+            assert_eq!(ShellKind::from_id(id), Some(*kind), "{id} 反查失败");
+        }
+        assert_eq!(ShellKind::from_id("nope"), None);
+    }
+
+    #[test]
+    fn splits_args_with_quotes() {
+        assert_eq!(split_args("-i -l"), ["-i", "-l"]);
+        assert_eq!(split_args("  -NoProfile   -NoLogo "), ["-NoProfile", "-NoLogo"]);
+        assert_eq!(split_args(r#"--cd "C:\My Dir""#), ["--cd", r"C:\My Dir"]);
+        assert_eq!(split_args(""), Vec::<String>::new());
+        // 引号里的空串仍然是一个参数
+        assert_eq!(split_args(r#"--exec """#), ["--exec", ""]);
+    }
+
+    #[test]
+    fn config_drops_blank_overrides() {
+        let mut s = TerminalSettings::default();
+        s.programs
+            .insert("gitbash".into(), r"D:\Git\bin\bash.exe".into());
+        s.programs.insert("wsl".into(), "   ".into());
+        let (programs, args) = s.to_config();
+        assert_eq!(programs.len(), 1);
+        assert_eq!(
+            programs.get("gitbash").map(String::as_str),
+            Some(r"D:\Git\bin\bash.exe")
+        );
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn configured_program_beats_detection() {
+        let mut s = TerminalSettings::default();
+        s.programs
+            .insert("gitbash".into(), r"D:\Softwares\GitBash\bin\bash.exe".into());
+        // 路径存在与否交给启动时报错，这里必须认账，否则用户改了配置却静默失效
+        assert!(ShellKind::GitBash.program(&s).is_some());
+        assert!(ShellKind::detect(&s).contains(&ShellKind::GitBash));
+    }
+
+    #[test]
+    fn wsl_stub_is_not_git_bash() {
+        assert!(looks_like_wsl_stub(Path::new(
+            r"C:\Windows\System32\bash.exe"
+        )));
+        assert!(!looks_like_wsl_stub(Path::new(
+            r"D:\Softwares\GitBash\bin\bash.exe"
+        )));
+    }
 }

@@ -244,6 +244,9 @@ impl Keymap {
     }
 
     /// 这一帧是否按下了某个动作的快捷键；按下就把它从事件队列里摘掉，避免编辑器重复消费。
+    ///
+    /// 归属由 [`Self::owns`] 决定，不靠调用顺序：egui 的宽松匹配会让 `Ctrl+W`
+    /// 把 `Ctrl+Shift+W` 那一下抢先吃掉，`pane_close` 就永远轮不到了。
     pub fn consume(&self, ctx: &egui::Context, action: &str) -> bool {
         let binding = self.get(action);
         if binding.is_empty() {
@@ -252,17 +255,48 @@ impl Keymap {
         let Some((mods, key)) = parse(binding) else {
             return false;
         };
-        if ctx.input_mut(|i| i.consume_key(mods, key)) {
+        if self.take(ctx, action, mods, key) {
             return true;
         }
         // 键盘上 `Ctrl+=` 和 `Ctrl++` 是同一个物理键，两种写法都认
-        if key == Key::Plus {
-            return ctx.input_mut(|i| i.consume_key(mods, Key::Equals));
+        let twin = match key {
+            Key::Plus => Key::Equals,
+            Key::Equals => Key::Plus,
+            _ => return false,
+        };
+        self.take(ctx, action, mods, twin)
+    }
+
+    fn take(&self, ctx: &egui::Context, action: &str, mods: Modifiers, key: Key) -> bool {
+        let owned = ctx.input(|i| {
+            i.events.iter().any(|event| {
+                matches!(event, egui::Event::Key { key: k, pressed: true, modifiers, .. }
+                    if *k == key && self.owns(action, key, *modifiers))
+            })
+        });
+        owned && ctx.input_mut(|i| i.consume_key(mods, key))
+    }
+
+    /// 一个键上可能挂着多个动作（`Ctrl+W` 关标签 / `Ctrl+Shift+W` 关面板）。
+    /// 在所有能宽松匹配上这次按键的绑定里，挑修饰键最吻合的那个：
+    /// 完全吻合的优先，其次才轮到多按了 Shift/Alt 的宽松吻合。
+    fn owns(&self, action: &str, key: Key, pressed: Modifiers) -> bool {
+        let mut best: Option<&str> = None;
+        let mut best_exact = false;
+        for (id, binding) in &self.map {
+            let Some((mods, k)) = parse(binding) else {
+                continue;
+            };
+            if k != key || !pressed.matches_logically(mods) {
+                continue;
+            }
+            let exact = pressed.matches_exact(mods);
+            if best.is_none() || (exact && !best_exact) {
+                best = Some(id);
+                best_exact = exact;
+            }
         }
-        if key == Key::Equals {
-            return ctx.input_mut(|i| i.consume_key(mods, Key::Plus));
-        }
-        false
+        best.is_some_and(|owner| owner == action)
     }
 }
 
@@ -315,5 +349,31 @@ mod tests {
         let mut km = Keymap::default();
         km.set("find", "");
         assert_eq!(km.get("find"), "");
+    }
+
+    /// egui 的 `consume_key` 会忽略多按的 Shift/Alt，所以同一个键上挂着两个动作时
+    /// 必须挑出修饰键最吻合的那个，否则 `Ctrl+Shift+W` 会被 `Ctrl+W` 抢走。
+    #[test]
+    fn most_specific_binding_wins() {
+        let km = Keymap::default();
+        let ctrl = Modifiers::CTRL;
+        let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
+        let ctrl_alt_shift = Modifiers::CTRL | Modifiers::ALT | Modifiers::SHIFT;
+
+        assert!(km.owns("pane_close", Key::W, ctrl_shift));
+        assert!(!km.owns("tab_close", Key::W, ctrl_shift));
+        // 没按 Shift 时不该反过来
+        assert!(km.owns("tab_close", Key::W, ctrl));
+        assert!(!km.owns("pane_close", Key::W, ctrl));
+
+        assert!(km.owns("save_all", Key::S, ctrl_shift));
+        assert!(!km.owns("save", Key::S, ctrl_shift));
+        assert!(km.owns("new_folder", Key::N, ctrl_shift));
+        assert!(km.owns("terminal_new", Key::Backtick, ctrl_shift));
+        assert!(km.owns("pane_prev", Key::Tab, ctrl_alt_shift));
+        assert!(!km.owns("pane_next", Key::Tab, ctrl_alt_shift));
+        assert!(km.owns("pane_next", Key::Tab, ctrl_shift));
+        assert!(km.owns("global_search", Key::F, ctrl_shift));
+        assert!(!km.owns("find", Key::F, ctrl_shift));
     }
 }
