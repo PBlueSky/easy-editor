@@ -2608,6 +2608,10 @@ impl EasyEditorApp {
                 .max_rect(rect)
                 .layout(egui::Layout::top_down(egui::Align::LEFT));
             ui.scope_builder(builder, |ui| {
+                // 子 Ui 的 clip 是从父级继承下来的，只有根 Ui 才会把 clip 设成自己的
+                // max_rect。不夹一下，正文里不换行的长行、终端网格这些横向溢出的东西
+                // 就照着整个中央面板去画，左右两块面板的文字直接叠在一起。
+                ui.shrink_clip_rect(rect);
                 // 描边自己画（见循环末尾）：Frame 是照着 content 的 min_rect 上色的，
                 // 空白面板内容只有一行标题，焦点框就会缩成一条，撑不满这一格。
                 egui::Frame::new()
@@ -4239,5 +4243,133 @@ mod tests {
             (after - before - drag).length() < 2.0,
             "拖标题条没能挪动窗口：从 {before:?} 拖 {drag:?}，结果在 {after:?}"
         );
+    }
+
+    /// 左右两块面板并排时，各自的内容不许画到隔壁那一格去。
+    ///
+    /// 子 `Ui` 的 clip 是从父级继承的，不会跟着 `max_rect` 收窄，所以正文里不换行的
+    /// 长行会照着整个中央面板去画，两块面板的文字叠在一起看不清。
+    #[test]
+    fn pane_content_is_clipped_to_its_own_rect() {
+        /// 返回 (正文, 这一笔实际被夹在哪个矩形里)。galley 自己的矩形可以超出面板
+        /// ——那只是排版宽度——真正决定屏幕上有没有画出去的是 `ClippedShape.clip_rect`。
+        fn painted(out: &egui::FullOutput, ch: char) -> Vec<(String, Rect)> {
+            let mut hits = Vec::new();
+            fn walk(shape: &egui::Shape, ch: char, hits: &mut Vec<String>) {
+                match shape {
+                    egui::Shape::Text(t) => {
+                        let s = t.galley.job.text.clone();
+                        if s.len() > 40 && s.chars().all(|c| c == ch || c == '\n') {
+                            hits.push(s);
+                        }
+                    }
+                    egui::Shape::Vec(shapes) => {
+                        for s in shapes {
+                            walk(s, ch, hits);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for c in &out.shapes {
+                let mut inner = Vec::new();
+                walk(&c.shape, ch, &mut inner);
+                hits.extend(inner.into_iter().map(|s| (s, c.clip_rect)));
+            }
+            hits
+        }
+
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-clip", "x\n");
+        std::fs::write(dir.join("a_left.txt"), format!("{}\n", "L".repeat(300))).unwrap();
+        std::fs::write(dir.join("b_right.txt"), format!("{}\n", "R".repeat(300))).unwrap();
+        app.open_file(dir.join("a_left.txt"), None);
+        app.open_file(dir.join("b_right.txt"), None);
+        let left = app.panes.focus().unwrap();
+        let right = app
+            .panes
+            .split(left, Axis::Horizontal, PaneKind::Editor(Some(0)))
+            .unwrap();
+        // 左边看左文件、右边看右文件，两边的正文才好分辨
+        *app.panes.payload_of_mut(left).unwrap() = PaneKind::Editor(Some(0));
+        *app.panes.payload_of_mut(right).unwrap() = PaneKind::Editor(Some(1));
+
+        let mut t = 1.0;
+        let mut out = frame_time(&mut app, &ctx, t, vec![]);
+        t += 0.1;
+        let lrect = app.pane_layout.pane_rect(left).unwrap();
+        let rrect = app.pane_layout.pane_rect(right).unwrap();
+        assert!(lrect.max.x < rrect.min.x, "两块面板没有左右并排");
+
+        // 指针在两块面板之间来回，悬浮、光标闪烁这些额外绘制也要一起认
+        for pos in [lrect.center(), rrect.center(), lrect.center()] {
+            out = frame_time(&mut app, &ctx, t, vec![egui::Event::PointerMoved(pos)]);
+            t += 0.1;
+            for _ in 0..4 {
+                out = frame_time(&mut app, &ctx, t, vec![]);
+                t += 0.1;
+            }
+        }
+
+        let left_text = painted(&out, 'L');
+        let right_text = painted(&out, 'R');
+        assert!(
+            !left_text.is_empty() && !right_text.is_empty(),
+            "两边正文没同时画出来：L={} R={}",
+            left_text.len(),
+            right_text.len()
+        );
+        for (s, clip) in left_text {
+            assert!(
+                clip.max.x <= lrect.max.x + 1.0,
+                "左面板的正文往右画出了自己的格子：{:?} 夹在 {:.0}..{:.0}，格子到 {:.0} 为止",
+                &s[..12],
+                clip.min.x,
+                clip.max.x,
+                lrect.max.x
+            );
+        }
+        for (s, clip) in right_text {
+            assert!(
+                clip.min.x >= rrect.min.x - 1.0,
+                "右面板的正文往左画出了自己的格子：{:?} 夹在 {:.0}..{:.0}，格子从 {:.0} 开始",
+                &s[..12],
+                clip.min.x,
+                clip.max.x,
+                rrect.min.x
+            );
+        }
+    }
+
+    /// 面板夹了 clip 之后，右键标题的「移动面板」菜单还得照样浮出来、照样点得动。
+    ///
+    /// 菜单是独立图层的 Area，本就不该跟着面板的裁剪走；这条是给上面那个修复兜底的。
+    #[test]
+    fn pane_context_menu_escapes_the_pane_clip() {
+        let (ctx, mut app, _dir) = app_in_folder("easy-editor-app-pane-menu", "a\n");
+        let left = app.panes.focus().unwrap();
+        app.panes
+            .split(left, Axis::Horizontal, PaneKind::Editor(None));
+        frame(&mut app, &ctx, vec![]);
+        let lrect = app.pane_layout.pane_rect(left).unwrap();
+        let grab = Pos2::new(lrect.min.x + 20.0, lrect.min.y + 10.0);
+
+        frame(&mut app, &ctx, pointer(grab, egui::PointerButton::Secondary, true));
+        frame(
+            &mut app,
+            &ctx,
+            pointer(grab, egui::PointerButton::Secondary, false),
+        );
+        let item = wait_for_text(&mut app, &ctx, "移到最下方")
+            .expect("右键标题没有弹出「移动面板」菜单")
+            .center();
+
+        frame(&mut app, &ctx, pointer(item, egui::PointerButton::Primary, true));
+        frame(
+            &mut app,
+            &ctx,
+            pointer(item, egui::PointerButton::Primary, false),
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.status, "已移动面板", "点「移到最下方」没有生效");
     }
 }
