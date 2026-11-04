@@ -307,8 +307,7 @@ pub fn show(
         return show_large(ui, file, font_size, dark, pane);
     }
 
-    let spans: Arc<Vec<LineSpans>> = hl.highlight(Some(&file.path), &file.text);
-    let line_count = spans.len().max(1).max(file.line_count());
+    let line_count = file.line_count().max(1);
     let font_id = FontId::monospace(font_size);
     // 与 theme 保持一致的固定行高，避免中英文混排时行高抖动
     let row_height = theme::mono_row_height(font_size);
@@ -401,16 +400,6 @@ pub fn show(
     // 选中一个词就把全文的相同词一起标出来，方便肉眼定位
     sync_occurrences(ui, file, edit_id);
 
-    // 排版用的着色区间：查找命中优先，选词高亮垫在下面
-    let overlay = Arc::new(merge_overlay(
-        &file.matches,
-        file.current_match,
-        &file.occurrences,
-        match_bg,
-        cur_match_bg,
-        occ_bg,
-    ));
-
     let mut scroll_offset = None;
     if let Some(line) = jump_line {
         let target = (line as f32) * row_height - ui.available_height() * 0.4;
@@ -434,14 +423,29 @@ pub fn show(
                 ui.allocate_exact_size(Vec2::new(gutter_width, gutter_height), Sense::hover());
 
             let fg = hl.fg;
-            let spans_for_layout = spans.clone();
-            let overlay_for_layout = overlay.clone();
+            let path = file.path.clone();
+            // 高亮必须跟着 layouter 实际拿到的文本算：TextEdit 会先应用本帧的编辑
+            // （外部插入日志块、键盘输入）再回调 layouter，提前算好的 spans
+            // 一旦字节数对不上就会切坏 UTF-8 字符。
+            let matches = file.matches.clone();
+            let occurrences = file.occurrences.clone();
+            let current_match = file.current_match;
             let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, _wrap: f32| -> Arc<Galley> {
+                let text = buf.as_str();
+                let spans = hl.highlight(Some(&path), text);
+                let overlay = merge_overlay(
+                    &matches,
+                    current_match,
+                    &occurrences,
+                    match_bg,
+                    cur_match_bg,
+                    occ_bg,
+                );
                 build_galley(
                     ui,
-                    buf.as_str(),
-                    &spans_for_layout,
-                    &overlay_for_layout,
+                    text,
+                    &spans,
+                    &overlay,
                     &font_id,
                     fg,
                     row_height,
@@ -745,9 +749,12 @@ fn append_segments(
 
     // 按区间边界切分，保证 UTF-8 边界安全；区间起点相同则保持插入次序，
     // 于是先入队的查找命中会赢过选词高亮，后一段只补没覆盖到的部分。
+    // 着色区间来自上一帧的查找/选区，文本可能已经变了，偏移要先夹回并落到字符边界上。
     local.sort_by_key(|x| x.0);
     let mut pos = 0usize;
     for (a, b, bg) in local {
+        let a = snap_up(piece, a);
+        let b = snap_down(piece, b);
         if a > pos {
             let mut f = base.clone();
             f.color = color;
@@ -761,13 +768,31 @@ fn append_segments(
             f.background = bg;
             job.append(&piece[s..e], 0.0, f);
         }
-        pos = pos.max(b);
+        pos = pos.max(e);
     }
     if pos < piece.len() {
         let mut f = base.clone();
         f.color = color;
         job.append(&piece[pos..], 0.0, f);
     }
+}
+
+/// 向后落到最近的字符边界（越界则停在末尾）。
+fn snap_up(piece: &str, at: usize) -> usize {
+    let mut at = at.min(piece.len());
+    while at < piece.len() && !piece.is_char_boundary(at) {
+        at += 1;
+    }
+    at
+}
+
+/// 向前落到最近的字符边界。
+fn snap_down(piece: &str, at: usize) -> usize {
+    let mut at = at.min(piece.len());
+    while at > 0 && !piece.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
 }
 
 pub fn cursor_text(file: &OpenFile) -> String {
