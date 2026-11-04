@@ -591,6 +591,10 @@ impl Terminal {
             }
         }
         if menu_paste {
+            // 粘贴走的是 RequestPaste：真正的 Event::Paste 要下一帧才回到 egui 的事件队列。
+            // 而刚点完菜单项，键盘焦点已经跟着菜单区走了，下一帧终端不再是 focused，
+            // 那份剪贴板内容就会被当成「不归我」的事件丢掉。所以这里先把焦点要回来。
+            resp.request_focus();
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
         }
