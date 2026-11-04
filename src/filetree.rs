@@ -8,6 +8,19 @@ use walkdir::WalkDir;
 
 use crate::format;
 
+/// 遍历搜索时跳过的重型 / 版本控制目录。
+const SKIP_DIRS: [&str; 9] = [
+    ".git",
+    "target",
+    "node_modules",
+    "dist",
+    "build",
+    ".idea",
+    ".vscode",
+    "__pycache__",
+    ".venv",
+];
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EntryKind {
     Dir,
@@ -73,6 +86,10 @@ pub struct FileTree {
     new_entry: Option<(PathBuf, bool)>,
     /// 新建对话框里正在输入的名字
     pub new_name: String,
+    /// 文件搜索框：按名称 / 相对路径片段过滤整个工作区
+    pub filter: String,
+    /// 上次搜索结果，`(查询串, 命中)`；查询没变就不重新遍历目录
+    filter_cache: Option<(String, Vec<Entry>)>,
     pub show_hidden: bool,
     pub error: Option<String>,
 }
@@ -86,6 +103,8 @@ impl FileTree {
             selected: None,
             new_entry: None,
             new_name: String::new(),
+            filter: String::new(),
+            filter_cache: None,
             show_hidden: false,
             error: None,
         };
@@ -95,6 +114,7 @@ impl FileTree {
 
     pub fn refresh(&mut self) {
         self.children.clear();
+        self.filter_cache = None;
     }
 
     fn read(&self, dir: &Path) -> Vec<Entry> {
@@ -230,12 +250,26 @@ impl FileTree {
 
         ui.add_space(2.0);
 
+        // 文件搜索：输入片段后在整个工作区里按名称 / 相对路径过滤
+        ui.horizontal(|ui| {
+            ui.add_space(2.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.filter)
+                    .hint_text("搜索文件（名称或路径片段）")
+                    .desired_width((ui.available_width() - 4.0).max(60.0)),
+            );
+        });
+
         egui::ScrollArea::both()
             .id_salt("file_tree_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let root = self.root.clone();
-                self.render_dir(ui, &root, 0, dark, &mut action);
+                if self.filter.trim().is_empty() {
+                    let root = self.root.clone();
+                    self.render_dir(ui, &root, 0, dark, &mut action);
+                } else {
+                    self.render_search_results(ui, dark, &mut action);
+                }
             });
 
         if let Some((parent, is_dir)) = self.new_entry.clone() {
@@ -243,6 +277,150 @@ impl FileTree {
         }
 
         action
+    }
+
+    /// 扫描整个工作区，返回名称或相对路径包含筛选词的条目。
+    /// 结果缓存到查询串变化为止，打字时不会每帧重新遍历目录。
+    fn matching_entries(&mut self) -> Vec<Entry> {
+        let query = self.filter.trim().to_lowercase();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        if let Some((cached, hits)) = &self.filter_cache {
+            if *cached == query {
+                return hits.clone();
+            }
+        }
+        let show_hidden = self.show_hidden;
+        let mut hits: Vec<Entry> = Vec::new();
+        let walker = WalkDir::new(&self.root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| {
+                if e.depth() == 0 {
+                    return true;
+                }
+                let name = e.file_name().to_string_lossy();
+                if !show_hidden && name.starts_with('.') {
+                    return false;
+                }
+                !(e.file_type().is_dir() && SKIP_DIRS.contains(&name.as_ref()))
+            });
+        for e in walker.filter_map(|e| e.ok()) {
+            if e.depth() == 0 || !(e.file_type().is_dir() || e.file_type().is_file()) {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            let rel = relative(&self.root, e.path());
+            if !name.to_lowercase().contains(&query) && !rel.to_lowercase().contains(&query) {
+                continue;
+            }
+            let is_dir = e.file_type().is_dir();
+            let kind = if is_dir {
+                EntryKind::Dir
+            } else if is_executable(e.path()) {
+                EntryKind::Exec
+            } else {
+                EntryKind::File
+            };
+            hits.push(Entry {
+                name,
+                path: e.path().to_path_buf(),
+                is_dir,
+                kind,
+            });
+            if hits.len() >= 500 {
+                break;
+            }
+        }
+        hits.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        self.filter_cache = Some((query, hits.clone()));
+        hits
+    }
+
+    fn render_search_results(
+        &mut self,
+        ui: &mut Ui,
+        dark: bool,
+        out: &mut Option<TreeAction>,
+    ) {
+        let hits = self.matching_entries();
+        if hits.is_empty() {
+            ui.add_space(8.0);
+            ui.label(RichText::new("没有匹配的文件").weak().size(12.0));
+            return;
+        }
+        let font = FontId::proportional(12.5);
+        let sub_font = FontId::proportional(11.0);
+        for entry in hits {
+            let row_h = 20.0;
+            let width = ui.available_width().max(120.0);
+            let (rect, response) =
+                ui.allocate_exact_size(Vec2::new(width, row_h), Sense::click());
+
+            if self.selected.as_deref() == Some(entry.path.as_path()) {
+                ui.painter()
+                    .rect_filled(rect, 3.0, ui.visuals().selection.bg_fill.gamma_multiply(0.35));
+            } else if response.hovered() {
+                ui.painter()
+                    .rect_filled(rect, 3.0, ui.visuals().widgets.hovered.weak_bg_fill);
+            }
+
+            let color = kind_color(entry.kind, dark);
+            let galley =
+                ui.fonts_mut(|f| f.layout_no_wrap(entry.name.clone(), font.clone(), color));
+            let name_width = galley.size().x;
+            let painter = ui.painter();
+            painter.galley(
+                egui::pos2(rect.left() + 6.0, rect.center().y - galley.size().y * 0.5),
+                galley,
+                color,
+            );
+
+            let rel = relative(&self.root, &entry.path);
+            let dir = rel.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+            if !dir.is_empty() {
+                painter.text(
+                    egui::pos2(rect.left() + 6.0 + name_width + 10.0, rect.center().y),
+                    Align2::LEFT_CENTER,
+                    dir,
+                    sub_font.clone(),
+                    color.gamma_multiply(0.6),
+                );
+            }
+
+            if response.clicked() {
+                self.selected = Some(entry.path.clone());
+                if entry.is_dir {
+                    // 点目录就展开到它在树里的位置，顺手退出搜索
+                    self.expand_to(&entry.path);
+                    self.filter.clear();
+                    self.filter_cache = None;
+                } else {
+                    *out = Some(TreeAction::Open(entry.path.clone()));
+                }
+            }
+        }
+    }
+
+    /// 展开从根目录到 `path` 的所有父级，供搜索结果跳回树视图。
+    fn expand_to(&mut self, path: &Path) {
+        let mut cur = path.parent();
+        while let Some(p) = cur {
+            if !p.starts_with(&self.root) {
+                break;
+            }
+            self.expanded.insert(p.to_path_buf());
+            if p == self.root {
+                break;
+            }
+            cur = p.parent();
+        }
     }
 
     fn render_dir(
@@ -456,18 +634,7 @@ pub fn collect_files(root: &Path, limit: usize) -> Vec<PathBuf> {
         .filter_entry(|e| {
             if e.file_type().is_dir() && e.depth() > 0 {
                 let name = e.file_name().to_string_lossy();
-                const SKIP: [&str; 9] = [
-                    ".git",
-                    "target",
-                    "node_modules",
-                    "dist",
-                    "build",
-                    ".idea",
-                    ".vscode",
-                    "__pycache__",
-                    ".venv",
-                ];
-                !SKIP.contains(&name.as_ref())
+                !SKIP_DIRS.contains(&name.as_ref())
             } else {
                 true
             }
@@ -616,5 +783,36 @@ mod tests {
             }],
         );
         assert!(dir.join("probe.txt").is_file(), "回车没能把文件建出来");
+    }
+
+    /// 文件搜索按名称和相对路径片段匹配，并且不会漏掉子目录里的文件。
+    #[test]
+    fn filter_matches_names_and_relative_paths() {
+        let dir = std::env::temp_dir().join("easy-editor-tree-filter-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn x() {}\n").unwrap();
+        std::fs::write(dir.join("notes.txt"), "hello\n").unwrap();
+
+        let mut tree = FileTree::new(dir.clone());
+
+        tree.filter = "main".into();
+        let hits = tree.matching_entries();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "main.rs");
+
+        // 路径片段同样能搜到子目录里的文件
+        tree.filter = "src/lib".into();
+        let hits = tree.matching_entries();
+        assert!(hits.iter().any(|e| e.path.ends_with("src/lib.rs")));
+
+        // 大小写不敏感
+        tree.filter = "NOTES".into();
+        let hits = tree.matching_entries();
+        assert!(hits.iter().any(|e| e.name == "notes.txt"));
+
+        tree.filter = "不存在的文件".into();
+        assert!(tree.matching_entries().is_empty());
     }
 }
