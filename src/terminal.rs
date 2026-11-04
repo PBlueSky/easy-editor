@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::grid::{Dimensions, Grid, Scroll};
 use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config as TermConfig, Term};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
 use eframe::egui::{self, Color32, FontId, Rect, Sense, Ui, Vec2};
@@ -24,6 +24,30 @@ use crate::theme;
 struct Dims {
     cols: usize,
     rows: usize,
+}
+
+/// 终端里的一个格子位置。行号是**绝对行**（含回滚历史），
+/// 这样滚动之后选区不会跟着屏幕跑。
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SelPoint {
+    line: i32,
+    col: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Selection {
+    anchor: SelPoint,
+    end: SelPoint,
+}
+
+impl Selection {
+    fn ordered(self) -> (SelPoint, SelPoint) {
+        if (self.anchor.line, self.anchor.col) <= (self.end.line, self.end.col) {
+            (self.anchor, self.end)
+        } else {
+            (self.end, self.anchor)
+        }
+    }
 }
 
 impl Dimensions for Dims {
@@ -308,6 +332,8 @@ pub struct Terminal {
     dims: Dims,
     pub exited: bool,
     scroll_acc: f32,
+    /// 鼠标拖选的范围（绝对行坐标）
+    selection: Option<Selection>,
     /// 下一帧请求焦点（新建终端后自动聚焦，省得用户还要点一下）
     pub focus_requested: bool,
 }
@@ -386,6 +412,7 @@ impl Terminal {
             dims,
             exited: false,
             scroll_acc: 0.0,
+            selection: None,
             focus_requested: false,
         })
     }
@@ -445,6 +472,12 @@ impl Terminal {
         self.write(text.as_bytes());
     }
 
+    /// 取出当前选区覆盖的文字（按屏幕顺序，行尾空格裁掉）。
+    fn selection_text(&self) -> Option<String> {
+        let selection = self.selection?;
+        extract_selection(self.term.grid(), self.dims.cols, selection)
+    }
+
     /// 画出这块终端。PTY 输出一律由 [`TerminalPanel::pump`] 每帧统一读，
     /// 这里只负责渲染和键盘，所以没被画到的面板也不会积压输出。
     pub fn ui(&mut self, ui: &mut Ui, font_size: f32, dark: bool, id: egui::Id) {
@@ -469,6 +502,22 @@ impl Terminal {
         }
         let focused = resp.has_focus();
 
+        // egui 默认把 Tab / 方向键 / Esc 当焦点导航键，终端里一按 Tab 焦点就跳到
+        // 别的按钮上，补全和历史都没法用。有焦点时把这些键锁给终端自己。
+        if focused {
+            ui.memory_mut(|m| {
+                m.set_focus_lock_filter(
+                    id,
+                    egui::EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true,
+                    },
+                )
+            });
+        }
+
         let bg = if dark {
             Color32::from_rgb(24, 26, 30)
         } else {
@@ -480,6 +529,71 @@ impl Terminal {
 
         let display_offset = self.term.renderable_content().display_offset;
         let grid = self.term.grid();
+        let topmost = grid.topmost_line().0;
+        let bottommost = grid.bottommost_line().0;
+
+        // 鼠标位置 -> 绝对行/列。行号跟随回滚偏移，滚动后选区仍指向原来的文字。
+        let point_at = |pos: egui::Pos2| -> SelPoint {
+            let row = (((pos.y - rect.top()) / row_h).floor() as i32)
+                .clamp(0, rows as i32 - 1);
+            let col = (((pos.x - rect.left()) / char_w).floor() as i32)
+                .clamp(0, cols as i32 - 1) as usize;
+            SelPoint {
+                line: (row - display_offset as i32).clamp(topmost, bottommost),
+                col,
+            }
+        };
+
+        if resp.clicked() {
+            self.selection = None;
+        } else if resp.drag_started() {
+            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                let p = point_at(pos);
+                self.selection = Some(Selection { anchor: p, end: p });
+            }
+        } else if resp.dragged() {
+            if let (Some(pos), Some(sel)) = (
+                ui.input(|i| i.pointer.interact_pos()),
+                self.selection.as_mut(),
+            ) {
+                sel.end = point_at(pos);
+            }
+        }
+
+        let sel_bg = if dark {
+            Color32::from_rgba_unmultiplied(82, 139, 255, 80)
+        } else {
+            Color32::from_rgba_unmultiplied(40, 105, 210, 60)
+        };
+
+        // 右键菜单：复制选中内容 / 粘贴。终端不像编辑器那样有内建右键菜单，
+        // 不熟悉 Ctrl+Shift+C/V 的用户只能靠这里。
+        if resp.secondary_clicked() {
+            resp.request_focus();
+        }
+        let mut menu_copy = false;
+        let mut menu_paste = false;
+        resp.context_menu(|ui| {
+            if ui.button("复制").clicked() {
+                menu_copy = true;
+                ui.close();
+            }
+            if ui.button("粘贴").clicked() {
+                menu_paste = true;
+                ui.close();
+            }
+        });
+        if menu_copy {
+            if let Some(text) = self.selection_text() {
+                if !text.is_empty() {
+                    ui.ctx().copy_text(text);
+                }
+            }
+        }
+        if menu_paste {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+        }
         let default_bg = bg;
         let default_fg = if dark {
             Color32::from_rgb(214, 219, 226)
@@ -529,6 +643,26 @@ impl Terminal {
                     0.0,
                     color,
                 );
+            }
+
+            // 选中区域的底色垫在文字下面
+            if let Some(sel) = self.selection {
+                let (start, end) = sel.ordered();
+                if line.0 >= start.line && line.0 <= end.line {
+                    let c0 = if line.0 == start.line { start.col } else { 0 };
+                    let c1 = if line.0 == end.line { end.col } else { cols - 1 };
+                    if c0 <= c1 && c0 < cols {
+                        let c1 = c1.min(cols - 1);
+                        painter.rect_filled(
+                            Rect::from_min_size(
+                                egui::pos2(rect.left() + c0 as f32 * char_w, y),
+                                Vec2::new((c1 + 1 - c0) as f32 * char_w, row_h),
+                            ),
+                            0.0,
+                            sel_bg,
+                        );
+                    }
+                }
             }
 
             // 文本：逐 cell 定位，保证宽字符（中文）严格占两格
@@ -603,17 +737,58 @@ impl Terminal {
         // 否则编辑器的 TextEdit 会再吃一遍同样的字符。
         if focused {
             let mut out: Vec<u8> = Vec::new();
+            let mut copy = false;
+            let mut paste = false;
+            let mut typed = false;
             ui.input_mut(|i| {
                 i.events.retain(|event| {
                     match event {
+                        // Ctrl+C 会被 winit 转成 Copy 事件，终端里再按惯例
+                        // 「有选区就复制，没选区就发中断」。
+                        egui::Event::Copy | egui::Event::Cut => {
+                            copy = true;
+                            false
+                        }
+                        egui::Event::Key {
+                            key,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } if modifiers.ctrl && modifiers.shift && *key == egui::Key::C => {
+                            copy = true;
+                            false
+                        }
+                        egui::Event::Key {
+                            key,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } if modifiers.ctrl && modifiers.shift && *key == egui::Key::V => {
+                            paste = true;
+                            false
+                        }
                         egui::Event::Text(_) | egui::Event::Key { .. } | egui::Event::Paste(_) => {
                             encode_event(event, &mut out);
+                            typed = true;
                             false
                         }
                         _ => true,
                     }
                 });
             });
+            if typed {
+                self.selection = None;
+            }
+            if copy {
+                match self.selection_text() {
+                    Some(text) if !text.is_empty() => ui.ctx().copy_text(text),
+                    _ => out.push(0x03),
+                }
+            }
+            if paste {
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+            }
             self.write(&out);
         }
 
@@ -627,6 +802,47 @@ impl Terminal {
             );
         }
     }
+}
+
+/// 从网格里按选区取文字。行号是绝对行，网格索引负责换算回滚历史。
+fn extract_selection(
+    grid: &Grid<Cell>,
+    cols: usize,
+    selection: Selection,
+) -> Option<String> {
+    let (start, end) = selection.ordered();
+    if start.line == end.line && start.col == end.col {
+        return None;
+    }
+    let topmost = grid.topmost_line().0;
+    let bottommost = grid.bottommost_line().0;
+    let mut out = String::new();
+    for line in start.line..=end.line {
+        let c0 = if line == start.line { start.col } else { 0 };
+        let c1 = if line == end.line {
+            end.col
+        } else {
+            cols.saturating_sub(1)
+        };
+        let mut text = String::new();
+        if line >= topmost && line <= bottommost {
+            let row = &grid[Line(line)];
+            for col in c0..=c1.min(cols.saturating_sub(1)) {
+                let cell = &row[Column(col)];
+                // 宽字符的占位格跳过，字符本身已经在上一个格子里取到了
+                if cell.flags.intersects(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                // 未填充的格子偶尔会是 NUL，复制出来不能带进去
+                text.push(if cell.c == '\0' { ' ' } else { cell.c });
+            }
+        }
+        out.push_str(text.trim_end());
+        if line < end.line {
+            out.push('\n');
+        }
+    }
+    Some(out)
 }
 
 fn encode_event(event: &egui::Event, out: &mut Vec<u8>) {
@@ -654,6 +870,7 @@ fn encode_event(event: &egui::Event, out: &mut Vec<u8>) {
             match key {
                 egui::Key::Enter => out.extend_from_slice(b"\r"),
                 egui::Key::Backspace => out.push(0x7f),
+                egui::Key::Tab if modifiers.shift => out.extend_from_slice(b"\x1b[Z"),
                 egui::Key::Tab => out.extend_from_slice(b"\t"),
                 egui::Key::Escape => out.push(0x1b),
                 egui::Key::ArrowUp => out.extend_from_slice(b"\x1b[A"),
@@ -992,5 +1209,47 @@ mod tests {
         assert!(!looks_like_wsl_stub(Path::new(
             r"D:\Softwares\GitBash\bin\bash.exe"
         )));
+    }
+
+    fn term_with(text: &str) -> (Term<Listener>, Dims) {
+        let dims = Dims { cols: 24, rows: 4 };
+        let (tx, _rx) = channel();
+        let mut term = Term::new(TermConfig::default(), &dims, Listener { tx });
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut term, text.as_bytes());
+        (term, dims)
+    }
+
+    #[test]
+    fn selection_copies_rows() {
+        let (term, dims) = term_with("hello\r\nworld\r\n");
+        let selection = Selection {
+            anchor: SelPoint { line: 0, col: 0 },
+            end: SelPoint { line: 1, col: 4 },
+        };
+        let text = extract_selection(term.grid(), dims.cols, selection).unwrap();
+        assert_eq!(text, "hello\nworld");
+    }
+
+    #[test]
+    fn selection_skips_wide_char_spacer() {
+        let (term, dims) = term_with("工作日志\r\n");
+        // 每个汉字占两列，选区覆盖四个汉字（列 0..=6，其中奇数位是占位格）
+        let selection = Selection {
+            anchor: SelPoint { line: 0, col: 0 },
+            end: SelPoint { line: 0, col: 6 },
+        };
+        let text = extract_selection(term.grid(), dims.cols, selection).unwrap();
+        assert_eq!(text, "工作日志");
+    }
+
+    #[test]
+    fn empty_selection_copies_nothing() {
+        let (term, dims) = term_with("abc");
+        let selection = Selection {
+            anchor: SelPoint { line: 0, col: 1 },
+            end: SelPoint { line: 0, col: 1 },
+        };
+        assert!(extract_selection(term.grid(), dims.cols, selection).is_none());
     }
 }
