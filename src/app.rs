@@ -20,7 +20,7 @@ use crate::syntax::Highlighter;
 use crate::terminal::{TerminalPanel, TerminalSettings};
 use crate::theme;
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum SideTab {
     Files,
     Search,
@@ -957,7 +957,10 @@ impl EasyEditorApp {
         self.split_focused(axis);
     }
 
-    /// 新建一块终端面板，默认切在焦点面板下方。
+    /// 新建一块终端面板，切在焦点面板右侧。
+    ///
+    /// 之前固定切在下方，用户没有任何办法把终端放到右边；改成左右并排后，
+    /// 编辑器在左、终端在右，正好是多数人习惯的布局。
     fn new_terminal_pane(&mut self) {
         let id = match self.terminal.create() {
             Ok(id) => id,
@@ -967,12 +970,73 @@ impl EasyEditorApp {
             }
         };
         if self
-            .split_with(Axis::Vertical, PaneKind::Terminal(id))
+            .split_with(Axis::Horizontal, PaneKind::Terminal(id))
             .is_none()
         {
             self.terminal.remove(id);
             self.status = "没有可拆分的面板".into();
         }
+    }
+
+    /// 把一块面板移到工作区最靠某个方向的边缘（右键面板标题）。
+    ///
+    /// 先把它从树里摘下来（父 Split 自动收起），再把负载切到边缘面板的对应一侧。
+    /// `split` 总是把新面板排在后面，要放到左侧/上方时再交换一次负载。
+    fn move_pane_to(&mut self, id: PaneId, dir: Dir) {
+        if self.panes.count() < 2 || !self.panes.contains(id) {
+            return;
+        }
+        let Some(payload) = self.panes.payload_of(id).copied() else {
+            return;
+        };
+        let edge_key = |rect: egui::Rect| match dir {
+            Dir::Right => rect.max.x,
+            Dir::Left => -rect.min.x,
+            Dir::Up => -rect.min.y,
+            Dir::Down => rect.max.y,
+        };
+        let mut best: Option<(PaneId, f32)> = None;
+        for p in &self.pane_layout.panes {
+            if p.id == id {
+                continue;
+            }
+            let key = edge_key(p.rect);
+            if best.is_none_or(|(_, k)| key > k) {
+                best = Some((p.id, key));
+            }
+        }
+        let Some((target, _)) = best else { return };
+
+        if self.panes.remove(id).is_none() {
+            return;
+        }
+        let axis = match dir {
+            Dir::Left | Dir::Right => Axis::Horizontal,
+            Dir::Up | Dir::Down => Axis::Vertical,
+        };
+        let Some(new_id) = self.panes.split(target, axis, payload) else {
+            return;
+        };
+        if matches!(dir, Dir::Left | Dir::Up) {
+            // 拆出来的面板排在右侧/下方，交换负载就能让它落到左侧/上方
+            if let (Some(a), Some(b)) = (
+                self.panes.payload_of(target).copied(),
+                self.panes.payload_of(new_id).copied(),
+            ) {
+                if let Some(slot) = self.panes.payload_of_mut(target) {
+                    *slot = b;
+                }
+                if let Some(slot) = self.panes.payload_of_mut(new_id) {
+                    *slot = a;
+                }
+            }
+        }
+        self.panes.set_focus(new_id);
+        if let Some(t) = self.panes.payload_of(new_id).copied().and_then(PaneKind::terminal_id) {
+            self.terminal.request_focus(t);
+        }
+        self.status = "已移动面板".into();
+        self.after_focus_change();
     }
 
     /// 已经在某块终端面板上就不动，否则聚焦第一块 / 新建一块。
@@ -1927,8 +1991,15 @@ impl EasyEditorApp {
         }
     }
 
-    fn search_panel(&mut self, ui: &mut Ui) {
-        ui.add_space(2.0);
+    /// 开始全局搜索；没打开文件夹时给出提示，而不是静默无反应。
+    fn search_now(&mut self) {
+        match self.root.clone() {
+            Some(root) => self.search.start(&root),
+            None => self.search.info = "先打开文件夹再搜索".into(),
+        }
+    }
+
+    fn search_panel(&mut self, ui: &mut Ui) {        ui.add_space(2.0);
         let resp = ui.add(
             egui::TextEdit::singleline(&mut self.search.query)
                 .hint_text("搜索内容，回车开始")
@@ -1940,16 +2011,12 @@ impl EasyEditorApp {
         }
         let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
         if enter {
-            if let Some(root) = self.root.clone() {
-                self.search.start(&root);
-            }
+            self.search_now();
         }
 
         ui.horizontal(|ui| {
             if ui.button(RichText::new("搜索").size(12.0)).clicked() {
-                if let Some(root) = self.root.clone() {
-                    self.search.start(&root);
-                }
+                self.search_now();
             }
             ui.checkbox(&mut self.search.case_sensitive, "Aa");
             ui.checkbox(&mut self.search.regex, ".*");
@@ -2522,6 +2589,7 @@ impl EasyEditorApp {
         let mut changed = false;
         let mut close_id: Option<PaneId> = None;
         let mut split_at: Option<(PaneId, Axis)> = None;
+        let mut move_to: Option<(PaneId, Dir)> = None;
 
         for (id, rect, kind, focused) in panes {
             let stroke = if focused {
@@ -2562,7 +2630,27 @@ impl EasyEditorApp {
                             }
                         };
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(title).size(11.5).weak());
+                            ui.add(
+                                egui::Label::new(RichText::new(title).size(11.5).weak())
+                                    .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text("右键：移动面板")
+                            .context_menu(|ui| {
+                                // 终端只能开在下方时用户没法把它挪到右边，
+                                // 这里给每块面板一个「移到边缘」的入口。
+                                ui.label(RichText::new("移动面板").size(11.0).weak());
+                                for (label, dir) in [
+                                    ("移到最右侧", Dir::Right),
+                                    ("移到最左侧", Dir::Left),
+                                    ("移到最上方", Dir::Up),
+                                    ("移到最下方", Dir::Down),
+                                ] {
+                                    if ui.button(label).clicked() {
+                                        move_to = Some((id, dir));
+                                        ui.close();
+                                    }
+                                }
+                            });
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui
                                     .small_button(RichText::new("×").size(11.0))
@@ -2649,6 +2737,9 @@ impl EasyEditorApp {
         if let Some((id, axis)) = split_at {
             self.panes.set_focus(id);
             self.split_focused(axis);
+        }
+        if let Some((id, dir)) = move_to {
+            self.move_pane_to(id, dir);
         }
         if let Some(id) = close_id {
             self.close_pane(id);
@@ -3892,5 +3983,117 @@ mod tests {
                 "拖宽位置列后第 {i} 帧宽度被打回 {wide}（拖之前 {narrow}）"
             );
         }
+    }
+
+    /// 插入日志块后把光标放进标题里打字，不能崩（用户反馈的崩溃路径）。
+    #[test]
+    fn editing_journal_title_after_insert_does_not_panic() {
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-journal-title-test", "hello\n");
+        app.open_file(dir.join("a.txt"), None);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        app.insert_journal_block();
+        frame(&mut app, &ctx, vec![]);
+        let text = app.tabs[0].text.clone();
+        assert!(text.contains(crate::journal::RULE));
+        let title_at = text.find("工作日志1").expect("标题不在文本里");
+        // 光标落在标题中间（标题是多字节中文，这里专门验字符边界）
+        app.tabs[0].pending_jump = Some(title_at + 3);
+        frame(&mut app, &ctx, vec![]);
+        for ch in ["标", "题", "x"] {
+            frame(&mut app, &ctx, vec![egui::Event::Text(ch.into())]);
+        }
+        assert!(app.tabs[0].text.contains("标题"));
+        // 选中标题剩下的部分再覆盖输入
+        let text = app.tabs[0].text.clone();
+        let a = text.find("日志1").expect("标题不在文本里");
+        let b = a + "日志1".len();
+        app.tabs[0].pending_select = Some((a, b));
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![egui::Event::Text("新标题".into())]);
+        assert!(app.tabs[0].text.contains("新标题"));
+        // 侧栏日志页签也过一遍
+        app.side = SideTab::Journal;
+        app.show_side = true;
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        app.journal_goto(true);
+        app.journal_toggle();
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.tabs[0].text.contains(crate::journal::RULE));
+    }
+
+    fn key_press(key: Key, modifiers: Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// Ctrl+Shift+F 走完整链路：开侧栏 → 输入关键字 → 回车 → 后台搜索回填结果。
+    #[test]
+    fn global_search_shortcut_finds_workspace_matches() {
+        let (ctx, mut app, _dir) =
+            app_in_folder("easy-editor-app-search-flow", "hello world\nbye\n");
+        frame(&mut app, &ctx, vec![]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![key_press(Key::F, Modifiers::CTRL | Modifiers::SHIFT)],
+        );
+        assert_eq!(app.side, SideTab::Search, "快捷键没有切到搜索页签");
+        assert!(app.show_side, "快捷键没有打开侧栏");
+
+        frame(&mut app, &ctx, vec![egui::Event::Text("hello".into())]);
+        assert_eq!(app.search.query, "hello", "搜索框没收到键盘输入");
+        frame(&mut app, &ctx, vec![key_press(Key::Enter, Modifiers::NONE)]);
+
+        for _ in 0..200 {
+            frame(&mut app, &ctx, vec![]);
+            if !app.search.busy && !app.search.hits.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            app.search.hits.iter().any(|h| h.preview.contains("hello")),
+            "全局搜索没有结果：info={:?}",
+            app.search.info
+        );
+    }
+
+    /// 「移到最右侧」：原先上下堆叠的面板要变成左右并排，并且贴到工作区右缘。
+    #[test]
+    fn moving_pane_to_right_splits_side_by_side() {
+        let (ctx, mut app, _dir) =
+            app_in_folder("easy-editor-app-move-pane-test", "hello\n");
+        let root = app.panes.focus().unwrap();
+        app.panes.split(root, Axis::Vertical, PaneKind::Editor(None));
+        frame(&mut app, &ctx, vec![]);
+        let bottom = app.panes.focus().unwrap();
+        let before = app.pane_layout.pane_rect(bottom).unwrap();
+
+        app.move_pane_to(bottom, Dir::Right);
+        frame(&mut app, &ctx, vec![]);
+
+        let moved_id = app.panes.focus().unwrap();
+        let moved = app.pane_layout.pane_rect(moved_id).unwrap();
+        let other = app
+            .pane_layout
+            .panes
+            .iter()
+            .find(|p| p.id != moved_id)
+            .unwrap()
+            .rect;
+        assert!(
+            moved.min.x >= other.max.x,
+            "没有变成左右并排：moved={moved:?} other={other:?}"
+        );
+        assert!(moved.min.x > before.min.x, "没有向右移动：before={before:?}");
     }
 }
