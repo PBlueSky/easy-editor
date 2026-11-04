@@ -122,6 +122,8 @@ pub struct EasyEditorApp {
     recording: Option<String>,
     /// 「终端设置」窗口是否打开
     show_terminal_settings: bool,
+    /// 「终端设置」窗口这次出现时要不要摆回屏幕正中
+    center_terminal_settings: bool,
     /// 中央区域的面板树（tmux 式：一块块面板递归切分，编辑器与终端共用一棵树）
     panes: PaneTree<PaneKind>,
     /// 上一帧算出的面板矩形，方位键找邻居时要用
@@ -183,6 +185,7 @@ impl EasyEditorApp {
             keymap,
             recording: None,
             show_terminal_settings: false,
+            center_terminal_settings: false,
             panes: PaneTree::new(),
             pane_layout: TreeLayout::default(),
             last_editor_pane: None,
@@ -1878,6 +1881,8 @@ impl EasyEditorApp {
                     .clicked()
                 {
                     self.show_terminal_settings = !self.show_terminal_settings;
+                    // 只在重新打开的那一刻要求居中，之后窗口随用户拖到哪算哪
+                    self.center_terminal_settings = self.show_terminal_settings;
                 }
                 let h_dec = hint("font_dec");
                 if ui
@@ -2982,99 +2987,101 @@ impl EasyEditorApp {
         }
         let mut open = true;
         let mut done = false;
-        egui::Window::new("终端设置")
+        let win_id = egui::Id::unique("terminal_settings");
+        let mut window = egui::Window::new("终端设置")
+            .id(win_id)
             .open(&mut open)
             .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(ctx, |ui| {
-                let kind = self.terminal.shell;
-                let id = kind.id().to_string();
-                // 先取本地副本：闭包里既要读又要写 self.terminal.settings，直接借会打架
-                let mut program = self
-                    .terminal
-                    .settings
-                    .programs
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or_default();
-                let mut args = self
-                    .terminal
-                    .settings
-                    .args
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or_default();
+            // 窗口跟着内容收放：尺寸写死就会在按钮底下空出一大片
+            .auto_sized();
+        // anchor 每帧都生效，一直挂着就拖不动，所以只在刚打开那几帧居中。
+        // auto_sized 第一帧还在量尺寸（尺寸是无穷大），照那个尺寸算居中会算飞到屏幕外，
+        // 因此等 egui 记下真实矩形后再摆正。
+        if self.center_terminal_settings && ctx.memory(|m| m.area_rect(win_id).is_some()) {
+            window = window.anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO);
+            self.center_terminal_settings = false;
+        }
+        window.show(ctx, |ui| {
+            // auto_sized 按最宽的子控件撑窗口，路径字符串一塞就撑到屏幕外，所以宽度锁死
+            ui.set_max_width(420.0);
+            ui.set_min_width(420.0);
 
-                ui.label(
-                    RichText::new(format!("{}（{}）", kind.label(), kind.id()))
-                        .size(12.5)
-                        .strong(),
-                );
-                ui.separator();
+            let kind = self.terminal.shell;
+            let id = kind.id().to_string();
+            // 先取本地副本：闭包里既要读又要写 self.terminal.settings，直接借会打架
+            let mut program = self
+                .terminal
+                .settings
+                .programs
+                .get(&id)
+                .cloned()
+                .unwrap_or_default();
+            let mut args = self
+                .terminal
+                .settings
+                .args
+                .get(&id)
+                .cloned()
+                .unwrap_or_default();
 
-                ui.label(RichText::new("程序路径（留空 = 自动探测）").size(11.5).weak());
-                let p_resp = ui.add(
-                    egui::TextEdit::singleline(&mut program)
-                        .hint_text(r"C:\Program Files\Git\bin\bash.exe")
-                        .desired_width(360.0),
-                );
-                let found = match kind.detected() {
-                    Some(path) => format!("自动探测到：{}", path.display()),
-                    None => "本机没探测到，需要手工指定路径".to_string(),
-                };
-                ui.label(RichText::new(found).size(11.0).weak());
-                if !program.trim().is_empty() && !Path::new(program.trim()).is_file() {
-                    ui.colored_label(
-                        ui.visuals().error_fg_color,
-                        "这个路径现在还不存在",
-                    );
+            ui.label(
+                RichText::new(format!("{}（{}）", kind.label(), kind.id()))
+                    .size(12.5)
+                    .strong(),
+            );
+            ui.separator();
+
+            ui.label(RichText::new("程序路径（留空 = 自动探测）").size(11.5).weak());
+            let p_resp = ui.add(
+                egui::TextEdit::singleline(&mut program)
+                    .hint_text(r"C:\Program Files\Git\bin\bash.exe")
+                    .desired_width(f32::INFINITY),
+            );
+            let found = match kind.detected() {
+                Some(path) => format!("自动探测到：{}", path.display()),
+                None => "本机没探测到，需要手工指定路径".to_string(),
+            };
+            muted_line(ui, found);
+            if !program.trim().is_empty() && !Path::new(program.trim()).is_file() {
+                ui.colored_label(ui.visuals().error_fg_color, "这个路径现在还不存在");
+            }
+
+            ui.add_space(6.0);
+            ui.label(RichText::new("启动参数（留空 = 内置参数）").size(11.5).weak());
+            let a_resp = ui.add(
+                egui::TextEdit::singleline(&mut args)
+                    .hint_text("例如：-NoProfile -NoLogo")
+                    .desired_width(f32::INFINITY),
+            );
+            muted_line(ui, "按空格拆分，带空格的参数用双引号包住。");
+            muted_line(ui, format!("改动即时生效，并写进 {}", config::Config::path().display()));
+
+            ui.add_space(6.0);
+            let mut cleared = false;
+            ui.horizontal(|ui| {
+                if ui.button("清除覆盖").clicked() {
+                    program.clear();
+                    args.clear();
+                    cleared = true;
                 }
-
-                ui.add_space(6.0);
-                ui.label(RichText::new("启动参数（留空 = 内置参数）").size(11.5).weak());
-                let a_resp = ui.add(
-                    egui::TextEdit::singleline(&mut args)
-                        .hint_text("例如：-NoProfile -NoLogo")
-                        .desired_width(360.0),
-                );
-                ui.label(
-                    RichText::new("按空格拆分，带空格的参数用双引号包住。")
-                        .size(11.0)
-                        .weak(),
-                );
-
-                ui.add_space(6.0);
-                let mut cleared = false;
-                ui.horizontal(|ui| {
-                    if ui.button("清除覆盖").clicked() {
-                        program.clear();
-                        args.clear();
-                        cleared = true;
-                    }
+                // 主操作贴到右缘，别和「清除覆盖」挤在一坨
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("完成").clicked() {
                         done = true;
                     }
                 });
-                ui.label(
-                    RichText::new(format!(
-                        "改动即时生效，并写进 {}",
-                        config::Config::path().display()
-                    ))
-                    .size(11.0)
-                    .weak(),
-                );
-
-                if p_resp.changed() || a_resp.changed() || cleared {
-                    self.terminal
-                        .settings
-                        .programs
-                        .insert(id.clone(), program.trim().to_string());
-                    self.terminal.settings.args.insert(id, args.trim().to_string());
-                    // 路径可能让某个种类从「没有」变成「可用」，可用列表要跟着重算
-                    self.terminal.refresh();
-                }
             });
+
+            if p_resp.changed() || a_resp.changed() || cleared {
+                self.terminal
+                    .settings
+                    .programs
+                    .insert(id.clone(), program.trim().to_string());
+                self.terminal.settings.args.insert(id, args.trim().to_string());
+                // 路径可能让某个种类从「没有」变成「可用」，可用列表要跟着重算
+                self.terminal.refresh();
+            }
+        });
         // open 由标题栏的 ✕ 写，done 由「完成」按钮写，两个都得认
         self.show_terminal_settings = open && !done;
     }
@@ -3304,6 +3311,20 @@ impl eframe::App for EasyEditorApp {
         // 防抖可能还没来得及落盘，退出时补一次
         self.config.save_now();
     }
+}
+
+/// 窄面板里的一行说明：超宽就截断，全文交给悬浮提示。
+///
+/// 浮窗宽度是固定的，而 `C:\Users\<很长>\AppData\Roaming\...` 这种串没有可折行的空格，
+/// 直接 label 会横着捅穿窗口边框，盖住底下的内容。
+fn muted_line(ui: &mut Ui, text: impl Into<String>) {
+    let text = text.into();
+    let resp = ui.add(
+        egui::Label::new(RichText::new(&text).size(11.0).weak())
+            .truncate()
+            .sense(egui::Sense::hover()),
+    );
+    resp.on_hover_text(text);
 }
 
 /// 把 `tabs` 里的下标从旧长度重映射到新长度。
@@ -4095,5 +4116,128 @@ mod tests {
             "没有变成左右并排：moved={moved:?} other={other:?}"
         );
         assert!(moved.min.x > before.min.x, "没有向右移动：before={before:?}");
+    }
+
+    /// 「移到最下方」：左右并排的面板要变成上下堆叠，并且贴到工作区下缘。
+    #[test]
+    fn moving_pane_to_bottom_stacks_below() {
+        let (ctx, mut app, _dir) =
+            app_in_folder("easy-editor-app-move-pane-down", "hello\n");
+        let left = app.panes.focus().unwrap();
+        app.panes.split(left, Axis::Horizontal, PaneKind::Editor(None));
+        frame(&mut app, &ctx, vec![]);
+        let before = app.pane_layout.pane_rect(left).unwrap();
+
+        app.move_pane_to(left, Dir::Down);
+        frame(&mut app, &ctx, vec![]);
+
+        let moved_id = app.panes.focus().unwrap();
+        let moved = app.pane_layout.pane_rect(moved_id).unwrap();
+        let other = app
+            .pane_layout
+            .panes
+            .iter()
+            .find(|p| p.id != moved_id)
+            .unwrap()
+            .rect;
+        assert!(
+            moved.min.y >= other.max.y,
+            "没有变成上下堆叠：moved={moved:?} other={other:?}"
+        );
+        assert!(moved.min.y > before.min.y, "没有向下移动：before={before:?}");
+        assert_eq!(app.status, "已移动面板");
+    }
+
+    /// 「终端设置」浮窗：内容都装得下窗口，而且标题条拖着能动。
+    ///
+    /// 原来窗口尺寸写死 340×420：条目一多就从下边缘捅出去，按钮画到窗口外面的面板上；
+    /// 再加上 anchor 每帧生效，拖到哪都会被弹回屏幕正中。
+    #[test]
+    fn terminal_settings_window_fits_content_and_moves() {
+        let (ctx, mut app, _dir) = app_in_folder("easy-editor-app-settings-window", "a\n");
+        app.show_terminal_settings = true;
+        app.center_terminal_settings = true;
+        // 头几帧只在量尺寸、摆位置，尺寸落定后 egui 才让窗口参与交互
+        for _ in 0..5 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let out = frame(&mut app, &ctx, vec![]);
+
+        let win = egui::Id::unique("terminal_settings");
+        let window = ctx
+            .memory(|m| m.area_rect(win))
+            .expect("没有记下「终端设置」窗口的矩形");
+        assert!(
+            (window.center() - Pos2::new(SCREEN.x / 2.0, SCREEN.y / 2.0)).length() < 8.0,
+            "打开时没摆到屏幕正中：{window:?}"
+        );
+        let check = |starts: &str| {
+            let needle = starts.to_string();
+            let r = text_rect_where(&out, |t| t.starts_with(needle.as_str()))
+                .unwrap_or_else(|| panic!("窗口里没画出「{starts}」"));
+            assert!(
+                window.expand2(Vec2::splat(1.0)).contains(r.min)
+                    && window.expand2(Vec2::splat(1.0)).contains(r.max),
+                "「{starts}」画在窗口外面：文字 {r:?}，窗口 {window:?}"
+            );
+        };
+        for line in [
+            "程序路径",
+            "自动探测到",
+            "启动参数",
+            "按空格拆分",
+            "改动即时生效",
+        ] {
+            check(line);
+        }
+
+        // 按钮那一行：两个按钮各占一块，谁也不许压在别的文字上
+        let clear = find_text(&out, "清除覆盖").expect("没画出「清除覆盖」");
+        let done = find_text(&out, "完成").expect("没画出「完成」");
+        assert!(
+            clear.max.x < done.min.x,
+            "两个按钮叠在一起：{clear:?} {done:?}"
+        );
+        assert!(
+            window.expand2(Vec2::splat(1.0)).contains(done.max),
+            "「完成」按钮跑到窗口外了：{done:?}，窗口 {window:?}"
+        );
+        // 按钮是最后一行，底下不许再留一大片空白（用户看到的「按钮压在内容上面」就是顺序 + 空场）
+        let footer = text_rect_where(&out, |t| t.starts_with("改动即时生效"))
+            .expect("没画出「改动即时生效…」这行");
+        assert!(
+            footer.max.y <= clear.min.y + 1.0,
+            "按钮排到了说明文字上面：按钮 {clear:?}，说明 {footer:?}"
+        );
+        assert!(
+            window.max.y - done.max.y < 24.0,
+            "窗口底下空了一大截：按钮行 {done:?}，窗口 {window:?}"
+        );
+
+        let title = find_text(&out, "终端设置").expect("窗口标题没画出来");
+        let grab = title.center();
+        let before = window.min;
+        let drag = Vec2::new(120.0, 60.0);
+        frame(&mut app, &ctx, pointer(grab, egui::PointerButton::Primary, true));
+        for i in 1..=6 {
+            let p = grab + drag * (i as f32 / 6.0);
+            frame(&mut app, &ctx, vec![egui::Event::PointerMoved(p)]);
+        }
+        frame(
+            &mut app,
+            &ctx,
+            pointer(grab + drag, egui::PointerButton::Primary, false),
+        );
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let after = ctx
+            .memory(|m| m.area_rect(win))
+            .expect("拖完就没有窗口矩形了")
+            .min;
+        assert!(
+            (after - before - drag).length() < 2.0,
+            "拖标题条没能挪动窗口：从 {before:?} 拖 {drag:?}，结果在 {after:?}"
+        );
     }
 }
