@@ -32,7 +32,7 @@ cargo run -- src\app.rs                 # 启动并打开文件
 
 ```bash
 cargo check                             # 只做类型检查，最快
-cargo test                              # 85 个单元测试（面板树 / 快捷键 / 日志块解析 / 格式化 / 无头界面行为）
+cargo test                              # 87 个单元测试（面板树 / 快捷键 / 日志块解析 / 格式化 / 无头界面行为）
 cargo build                             # 调试构建 → target\debug\easy-editor.exe
 cargo build --release                   # 发布构建 → target\release\EasyEditor.exe
 ```
@@ -62,6 +62,9 @@ cargo fmt --check                       # 需要 rustup component add rustfmt
 ```
 
 ## 功能
+
+### 顶部工具栏
+窗口拖窄到一排装不下时，剩下的按钮换到第二排继续排，不会被挤成一团、也不会把字叠着画；右侧那组（工作区名 / 字号 / shell / 主题）换排后照旧从右边往左钉。工作区名排不下就截断，鼠标悬浮看完整路径。顶栏高度是照上一帧的内容量的，换行后会自己补一帧重绘，把第二排露出来。
 
 ### 文件树
 `walkdir` 懒加载，默认隐藏 `.` 开头的条目（右键可切换「显示隐藏文件」）。新建文件/文件夹有三个入口：工具栏按钮、文件树顶部按钮、任意条目（含根目录）右键菜单。

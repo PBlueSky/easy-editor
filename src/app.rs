@@ -105,6 +105,8 @@ pub struct EasyEditorApp {
     dark: bool,
     /// 编辑器自动换行：开着长行折进面板，关着长行横向滚出去
     word_wrap: bool,
+    /// 顶栏内容上一帧的高度（取整）。面板高度是照上一帧量的，换行后旧高度会把第二排裁掉
+    toolbar_h: i32,
     status: String,
     quick_open: Option<QuickOpen>,
     pending_close: Option<usize>,
@@ -176,6 +178,7 @@ impl EasyEditorApp {
             font_size,
             dark,
             word_wrap,
+            toolbar_h: 0,
             status: "Ctrl+O 打开文件夹 · Ctrl+P 快速打开 · Ctrl+` 终端".into(),
             quick_open: None,
             pending_close: None,
@@ -1693,7 +1696,9 @@ impl EasyEditorApp {
         let keys = self.keymap.to_config();
         let hint = |action: &str| keys.get(action).cloned().unwrap_or_default();
 
-        ui.horizontal(|ui| {
+        // 顶栏用可换行的横排：窗口拖窄时按钮排到第二排去，而不是被挤成一团。
+        let top = ui.min_rect().bottom();
+        ui.horizontal_wrapped(|ui| {
             ui.add_space(2.0);
             let h_open = hint("open_folder");
             if ui
@@ -1870,6 +1875,13 @@ impl EasyEditorApp {
                 self.insert_journal_block();
             }
 
+            // 右组是从右往左排的，这一排剩下的地方不够就会一路压过左组的字，
+            // 所以先换一排再排它。注意要量「这一排还剩多少」：可换行布局下
+            // available_width() 报的是整排的宽度，永远碰不到这个阈值。
+            // 430 = 右组固定那部分（实测约 350）再留一点看工作区名的地方。
+            if ui.available_rect_before_wrap().width() < 430.0 {
+                ui.end_row();
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let h_help = format!("快捷键设置  {}", hint("help"));
                 if ui
@@ -1935,14 +1947,27 @@ impl EasyEditorApp {
 
                 if let Some(root) = &self.root {
                     let parent = root.parent().unwrap_or(root.as_path());
-                    ui.label(
-                        RichText::new(filetree::relative(parent, root))
-                            .size(11.5)
-                            .weak(),
-                    );
+                    // 工作区名可能很长，顶栏不是看全名的地方：排不下就截断，完整路径挂悬浮。
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(filetree::relative(parent, root))
+                                .size(11.5)
+                                .weak(),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(root.display().to_string());
                 }
             });
         });
+
+        // 顶栏换行后要比上一帧更高，而面板高度是照上一帧量的——旧高度的裁剪区会把
+        // 第二排切掉。宽度是外部事件，不会再触发一帧，所以这里主动补要一帧。
+        let h = (ui.min_rect().bottom() - top).round() as i32;
+        if h != self.toolbar_h {
+            self.toolbar_h = h;
+            ui.ctx().request_repaint();
+        }
     }
 
     fn side_panel(&mut self, ui: &mut Ui) {
@@ -3577,8 +3602,18 @@ mod tests {
         ctx: &egui::Context,
         events: Vec<egui::Event>,
     ) -> egui::FullOutput {
+        frame_at(app, ctx, SCREEN, events)
+    }
+
+    /// 同上，但自己指定屏幕尺寸——窗口挤到多窄就得量多窄。
+    fn frame_at(
+        app: &mut EasyEditorApp,
+        ctx: &egui::Context,
+        size: Vec2,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
         let raw = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SCREEN)),
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
             events,
             ..Default::default()
         };
@@ -4570,6 +4605,200 @@ mod tests {
                 before_r.left(),
                 after_r.left()
             );
+        }
+    }
+
+    /// 顶栏那些按钮的字。窄窗口下挤不下时宁可让它们换行，也不能叠着画。
+    const TOOLBAR_LABELS: &[&str] = &[
+        "打开文件夹",
+        "保存",
+        "←",
+        "→",
+        "新文件",
+        "新文件夹",
+        "侧栏",
+        "折行",
+        "终端",
+        "+终端",
+        "‖ 拆分",
+        "═ 拆分",
+        "快速打开",
+        "全局搜索",
+        "查找",
+        "日志块",
+        "深色",
+        "?",
+    ];
+
+    /// 顶栏里的每一行文字（按钮、字号、shell 下拉、工作区名都算），
+    /// 按 (排, 列) 从上到下、从左到右。
+    ///
+    /// 用「形状属于哪块裁剪区」认人，不用 y 坐标带：顶栏换行后会变高，
+    /// 而侧栏表头、欢迎页上也有「新文件」「打开文件夹」这些同名按钮。
+    /// 顶栏那条裁剪区贴在窗口顶上，别的都从它下面开始。
+    fn toolbar_texts(out: &egui::FullOutput) -> Vec<(String, Rect)> {
+        fn walk(shape: &egui::Shape, v: &mut Vec<(String, Rect)>) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    let text = t.galley.job.text.as_str();
+                    if !text.trim().is_empty() {
+                        v.push((text.to_owned(), t.galley.rect.translate(t.pos.to_vec2())));
+                    }
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, v)),
+                _ => {}
+            }
+        }
+        let mut v: Vec<(String, Rect)> = Vec::new();
+        for clipped in &out.shapes {
+            if clipped.clip_rect.min.y <= 12.0 && clipped.clip_rect.max.y <= 200.0 {
+                walk(&clipped.shape, &mut v);
+            }
+        }
+        v.sort_by(|a, b| {
+            (a.1.top().total_cmp(&b.1.top())).then_with(|| a.1.left().total_cmp(&b.1.left()))
+        });
+        v
+    }
+
+    /// 两两比对，返回叠在一起的名字对。
+    fn overlaps(v: &[(String, Rect)]) -> Vec<(String, String)> {
+        let mut bad = Vec::new();
+        for (i, (a, ra)) in v.iter().enumerate() {
+            for (b, rb) in &v[i + 1..] {
+                if ra.intersects(*rb) {
+                    bad.push((a.clone(), b.clone()));
+                }
+            }
+        }
+        bad
+    }
+
+    /// 顶栏文字按 (排, 列) 排好，并跑到高度稳定为止。
+    ///
+    /// 面板高度是照上一帧的内容量的，顶栏换行后得再画一帧，第二排才不会被旧高度的
+    /// 裁剪区切掉——`toolbar` 自己会补要这一帧，测试这边同样多跑几帧模拟重绘。
+    fn settled_toolbar(
+        app: &mut EasyEditorApp,
+        ctx: &egui::Context,
+        size: Vec2,
+    ) -> Vec<(String, Rect)> {
+        let mut v = Vec::new();
+        for _ in 0..3 {
+            v = toolbar_texts(&frame_at(app, ctx, size, vec![]));
+        }
+        v
+    }
+
+    fn names(v: &[(String, Rect)]) -> Vec<&str> {
+        let mut n: Vec<&str> = v.iter().map(|(s, _)| s.as_str()).collect();
+        n.sort_unstable();
+        n
+    }
+
+    /// 拖窄那一帧顶栏还是旧高度，第二排会被裁剪区切掉，所以换行得主动补要重绘帧；
+    /// 但补个一两帧量稳就该停，一直要会变成空转。
+    #[test]
+    fn toolbar_repaint_settles_when_it_stacks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (ctx, mut app, _dir) = app_in_folder("easy-editor-app-toolbar-repaint", "a\n");
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        {
+            let hits = hits.clone();
+            ctx.set_request_repaint_callback(move |_| {
+                hits.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        let count = || hits.load(Ordering::Relaxed);
+
+        // 头一帧还在量顶栏高度，那一次补要不作数
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let base = count();
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(count(), base, "宽窗口顶栏稳定后还在反复要重绘：{base}");
+
+        frame_at(&mut app, &ctx, Vec2::new(900.0, 880.0), vec![]);
+        let jumped = count();
+        assert!(
+            jumped > base,
+            "顶栏换行没补要重绘帧：第二排会被旧高度的裁剪区切掉"
+        );
+        frame_at(&mut app, &ctx, Vec2::new(900.0, 880.0), vec![]);
+        assert!(
+            count() <= base + 2,
+            "一次换行最多补两帧就该停：base={base}，一帧后={jumped}"
+        );
+        for _ in 0..3 {
+            frame_at(&mut app, &ctx, Vec2::new(900.0, 880.0), vec![]);
+        }
+        let stacked = count();
+        for _ in 0..3 {
+            frame_at(&mut app, &ctx, Vec2::new(900.0, 880.0), vec![]);
+        }
+        assert_eq!(count(), stacked, "顶栏高度量稳后还在反复要重绘：会空转");
+
+        // 拖回去也一样：换回一排同样要补帧，补完就停
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(count() > stacked, "顶栏收回一排同样要补帧");
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let back = count();
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert_eq!(count(), back, "回到宽窗口后还在反复要重绘：会空转");
+    }
+
+    /// 窗口拖窄时顶栏按钮换排，不能挤成一团把字叠着画；够宽时仍然是一排。
+    #[test]
+    fn toolbar_stacks_instead_of_overlapping_when_narrow() {
+        let (ctx, mut app, _dir) = app_in_folder("easy-editor-app-toolbar", "a\n");
+        // 那个按钮写「深色」还是「浅色」跟着 self.dark 走，钉死免得跟着用户配置漂
+        app.dark = false;
+        let mut want = TOOLBAR_LABELS.to_vec();
+        want.sort_unstable();
+
+        // 从窗口最小宽度往上一档一档量：哪一档都不许叠字、不许挤掉按钮、不许画出右边缘
+        for w in [800.0, 900.0, 1000.0, 1100.0, 1200.0, 1300.0, 1400.0] {
+            let all = settled_toolbar(&mut app, &ctx, Vec2::new(w, 880.0));
+            let buttons: Vec<(String, Rect)> = all
+                .iter()
+                .filter(|(s, _)| TOOLBAR_LABELS.contains(&s.as_str()))
+                .cloned()
+                .collect();
+            assert_eq!(
+                names(&buttons),
+                want,
+                "{w} 宽顶栏按钮没排齐：{:?}",
+                names(&buttons)
+            );
+            assert!(
+                overlaps(&all).is_empty(),
+                "{w} 宽顶栏叠字：{:?}",
+                overlaps(&all)
+            );
+            assert!(
+                all.iter().all(|(_, r)| r.right() <= w - 8.0),
+                "{w} 宽顶栏画到窗口外面了：{all:?}"
+            );
+
+            // 1400 放得下一整排，就别白占高度；900 放不下，必须换排
+            if w >= 1400.0 {
+                assert!(
+                    all.iter().all(|(_, r)| r.top() < 24.0),
+                    "1400 宽顶栏占了不止一排：{all:?}"
+                );
+            }
+            if w <= 900.0 {
+                assert!(
+                    all.iter().any(|(_, r)| r.top() >= 24.0),
+                    "{w} 宽顶栏还在硬挤一排：{all:?}"
+                );
+            }
         }
     }
 }
