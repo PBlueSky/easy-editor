@@ -138,9 +138,13 @@ pub fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// 代码区行高（像素）。编辑器与行号栏必须用同一个值，否则会错行。
-pub fn mono_row_height(font_size: f32) -> f32 {
-    (font_size * MONO_LINE_HEIGHT).round()
+/// 代码区行高（点）。编辑器与行号栏必须用同一个值，否则会错行。
+///
+/// epaint 会把每行高度按物理像素取整，125% / 150% 缩放下行高不是整数点。
+/// 这里提前做同样的取整，行号、当前行底色和光标才能和文字落在同一条线上。
+pub fn mono_row_height(font_size: f32, pixels_per_point: f32) -> f32 {
+    let raw = font_size * MONO_LINE_HEIGHT;
+    (raw * pixels_per_point).round() / pixels_per_point
 }
 
 /// 应用整体视觉风格。

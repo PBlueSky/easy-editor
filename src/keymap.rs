@@ -44,6 +44,7 @@ pub const ACTIONS: &[ActionDef] = &[
     ActionDef { id: "terminal_new", label: "新建终端面板", group: "视图", default: "Ctrl+Shift+Backtick" },
     ActionDef { id: "font_inc", label: "放大字号", group: "视图", default: "Ctrl+Plus" },
     ActionDef { id: "font_dec", label: "缩小字号", group: "视图", default: "Ctrl+Minus" },
+    ActionDef { id: "wrap_toggle", label: "切换自动换行", group: "视图", default: "Alt+Z" },
     ActionDef { id: "help", label: "快捷键设置", group: "视图", default: "F1" },
     ActionDef { id: "screenshot", label: "截图", group: "视图", default: "F12" },
     // 分屏：默认键抄 Windows Terminal（Alt+Shift+D 自动拆 / + 左右 / - 上下，Alt+方向键切焦点）

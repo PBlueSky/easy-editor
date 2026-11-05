@@ -23,6 +23,7 @@ chrono = "0.4"
 rfd = "0.15"
 regex = "1"
 memchr = "2"
+unicode-width = "0.2"
 
 # 依赖库用 O2 编译，自身代码保持快速迭代
 [profile.dev]

@@ -103,6 +103,8 @@ pub struct EasyEditorApp {
     hl: Highlighter,
     font_size: f32,
     dark: bool,
+    /// 编辑器自动换行：开着长行折进面板，关着长行横向滚出去
+    word_wrap: bool,
     status: String,
     quick_open: Option<QuickOpen>,
     pending_close: Option<usize>,
@@ -148,6 +150,7 @@ impl EasyEditorApp {
         let font_size = config.data.font_size;
         let dark = config.data.dark;
         let show_side = config.data.show_side;
+        let word_wrap = config.data.word_wrap;
         let side = SideTab::from_key(&config.data.side_tab);
 
         theme::install_fonts(ctx);
@@ -172,6 +175,7 @@ impl EasyEditorApp {
             hl: Highlighter::new(dark),
             font_size,
             dark,
+            word_wrap,
             status: "Ctrl+O 打开文件夹 · Ctrl+P 快速打开 · Ctrl+` 终端".into(),
             quick_open: None,
             pending_close: None,
@@ -255,6 +259,10 @@ impl EasyEditorApp {
         }
         if self.config.data.show_side != self.show_side {
             self.config.data.show_side = self.show_side;
+            changed = true;
+        }
+        if self.config.data.word_wrap != self.word_wrap {
+            self.config.data.word_wrap = self.word_wrap;
             changed = true;
         }
         let tab = self.side.key();
@@ -757,6 +765,9 @@ impl EasyEditorApp {
         }
         if self.keymap.consume(ctx, "side_toggle") {
             self.show_side = !self.show_side;
+        }
+        if self.keymap.consume(ctx, "wrap_toggle") {
+            self.toggle_wrap();
         }
         if self.keymap.consume(ctx, "terminal_new") {
             self.new_terminal_pane();
@@ -1653,6 +1664,17 @@ impl EasyEditorApp {
         let _ = ctx;
     }
 
+    /// 切换自动换行。长行要么折进面板，要么横向滚出去，两种都只能看见一种。
+    fn toggle_wrap(&mut self) {
+        self.word_wrap = !self.word_wrap;
+        self.status = if self.word_wrap {
+            "已开启自动换行"
+        } else {
+            "已关闭自动换行，长行可以横向滚动"
+        }
+        .to_string();
+    }
+
     fn open_quick_open(&mut self) {
         let mut matches = self.index.clone();
         matches.truncate(200);
@@ -1760,6 +1782,15 @@ impl EasyEditorApp {
                 side = !side;
             }
             self.show_side = side;
+
+            let h_wrap = format!("长行折进面板 / 横向滚动  {}", hint("wrap_toggle"));
+            if ui
+                .selectable_label(self.word_wrap, RichText::new("折行").size(12.5))
+                .on_hover_text(h_wrap)
+                .clicked()
+            {
+                self.toggle_wrap();
+            }
 
             let h_term = format!("聚焦终端面板，没有就开一块  {}", hint("terminal_toggle"));
             if ui
@@ -2577,6 +2608,7 @@ impl EasyEditorApp {
         let focus = self.panes.focus();
         let font_size = self.font_size;
         let dark = self.dark;
+        let wrap = self.word_wrap;
         let keys = self.keymap.to_config();
         let hint = |action: &str| keys.get(action).cloned().unwrap_or_default();
 
@@ -2695,6 +2727,7 @@ impl EasyEditorApp {
                                     font_size,
                                     dark,
                                     pane_id,
+                                    wrap,
                                 );
                                 changed |= out.changed;
                             }
@@ -4371,5 +4404,172 @@ mod tests {
         );
         frame(&mut app, &ctx, vec![]);
         assert_eq!(app.status, "已移动面板", "点「移到最下方」没有生效");
+    }
+
+    /// 收集画面：`(正文, 矩形)`，只挑单层嵌套的图形。
+    fn all_texts(out: &egui::FullOutput) -> Vec<(String, Rect)> {
+        fn walk(shape: &egui::Shape, v: &mut Vec<(String, Rect)>) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    v.push((t.galley.job.text.clone(), t.galley.rect.translate(t.pos.to_vec2())))
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, v)),
+                _ => {}
+            }
+        }
+        let mut v = Vec::new();
+        out.shapes.iter().for_each(|c| walk(&c.shape, &mut v));
+        v
+    }
+
+    /// 行号栏里的数字，按 y 从上到下。取面板左边那一条竖带，正文不在这儿。
+    fn gutter(out: &egui::FullOutput, pane: Rect) -> Vec<(String, Rect)> {
+        let mut nums: Vec<(String, Rect)> = all_texts(out)
+            .into_iter()
+            .filter(|(s, r)| {
+                !s.is_empty()
+                    && s.chars().all(|c| c.is_ascii_digit())
+                    && r.min.x >= pane.min.x
+                    && r.max.x <= pane.min.x + 60.0
+            })
+            .collect();
+        nums.sort_by(|a, b| a.1.top().total_cmp(&b.1.top()));
+        nums
+    }
+
+    /// 那份正文（整份文件一块 galley）的矩形。
+    fn body(out: &egui::FullOutput, ch: char) -> Option<Rect> {
+        all_texts(out)
+            .into_iter()
+            .filter(|(s, _)| s.matches(ch).count() > 40)
+            .map(|(_, r)| r)
+            .max_by(|a, b| a.width().total_cmp(&b.width()))
+    }
+
+    /// 折行开关：关着时长行照原样排出面板（好挂横向滚动条），
+    /// 开着时同一个长行要折进面板里，而且行号得跟着折出来的视觉行走，
+    /// 不能还按「一行一个视觉行」往下排。
+    #[test]
+    fn word_wrap_folds_long_lines_and_moves_line_numbers() {
+        let long = "A".repeat(400);
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-wrap", "seed\n");
+        // 第 1 行超长，第 3 行是空行：空行也要占一个视觉行，不然行号整列会漂
+        std::fs::write(dir.join("w.txt"), format!("{long}\nb\n\nc\n")).unwrap();
+        app.open_file(dir.join("w.txt"), None);
+        app.word_wrap = false;
+
+        let out = frame(&mut app, &ctx, vec![]);
+        let pane = app
+            .pane_layout
+            .pane_rect(app.panes.focus().unwrap())
+            .unwrap();
+        let flat = body(&out, 'A').expect("不折行时长行没画出来");
+        assert!(
+            flat.width() > pane.width() * 2.0,
+            "不折行的长行本该排出面板，却只有 {:.0} 宽（面板 {:.0}）",
+            flat.width(),
+            pane.width()
+        );
+        let nums = gutter(&out, pane);
+        assert_eq!(
+            nums.len(),
+            5,
+            "行号不齐：{:?}",
+            nums.iter().map(|n| &n.0).collect::<Vec<_>>()
+        );
+        let row = nums[1].1.top() - nums[0].1.top();
+        assert!(row > 1.0, "一个视觉行高只有 {row:.1}？");
+
+        app.word_wrap = true;
+        let out = frame(&mut app, &ctx, vec![]);
+        let folded = body(&out, 'A').expect("折行后长行没画出来");
+        assert!(
+            folded.width() <= pane.width(),
+            "折行后正文还是比面板宽：{:.0} vs {:.0}",
+            folded.width(),
+            pane.width()
+        );
+        let nums = gutter(&out, pane);
+        assert_eq!(
+            nums.len(),
+            5,
+            "折行后行号不齐：{:?}",
+            nums.iter().map(|n| &n.0).collect::<Vec<_>>()
+        );
+        // 第 1 行至少折成了两个视觉行，所以第 2 行的行号要比原来低一整行以上
+        let gap = nums[1].1.top() - nums[0].1.top();
+        assert!(
+            gap > row * 1.5,
+            "折行后第 2 行的行号没跟着往下挪：差 {gap:.0}，一个行高 {row:.0}"
+        );
+        // 空行和短行还是一个视觉行，间距要回到行高
+        for i in 2..4 {
+            let d = nums[i + 1].1.top() - nums[i].1.top();
+            assert!(
+                (d - row).abs() < 1.0,
+                "第 {} 行到第 {} 行的间距是 {d:.1}，行高是 {row:.1}",
+                i + 1,
+                i + 2
+            );
+        }
+    }
+
+    /// 不折行时长行要真的能横向滚出来，而且行号栏不能跟着滚走。
+    #[test]
+    fn long_line_scrolls_horizontally_when_wrap_is_off() {
+        let long = "A".repeat(400);
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-hscroll", "seed\n");
+        std::fs::write(dir.join("h.txt"), format!("{long}\nb\n")).unwrap();
+        app.open_file(dir.join("h.txt"), None);
+        app.word_wrap = false;
+
+        let pane = {
+            frame(&mut app, &ctx, vec![]);
+            app.pane_layout
+                .pane_rect(app.panes.focus().unwrap())
+                .unwrap()
+        };
+        // 指针停在正文上，横向滚动条才吃得到滚轮
+        let over = pane.center();
+        let mut t = 1.0;
+        let out = frame_time(&mut app, &ctx, t, vec![egui::Event::PointerMoved(over)]);
+        t += 0.1;
+        let before = body(&out, 'A').expect("正文没画出来");
+        let nums_before = gutter(&out, pane);
+
+        // `delta` 说的是「内容往哪儿挪」，所以要往右滚得给负的 x
+        let wheel = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: Vec2::new(-600.0, 0.0),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: Modifiers::NONE,
+        };
+        // 滚轮有惯性，要跑几帧才停得下来，时间也得跟着推进去
+        let mut out = frame_time(&mut app, &ctx, t, vec![wheel]);
+        t += 0.1;
+        for _ in 0..6 {
+            out = frame_time(&mut app, &ctx, t, vec![]);
+            t += 0.1;
+        }
+
+        let after = body(&out, 'A').expect("滚动后正文没画出来");
+        assert!(
+            after.left() < before.left() - 20.0,
+            "横向滚轮没把正文推走：{:.0} -> {:.0}",
+            before.left(),
+            after.left()
+        );
+        let nums_after = gutter(&out, pane);
+        assert_eq!(nums_before.len(), nums_after.len());
+        for (i, (num, before_r)) in nums_before.iter().enumerate() {
+            let after_r = &nums_after[i].1;
+            assert!(
+                (before_r.left() - after_r.left()).abs() < 1.0,
+                "行号 {num} 跟着横向滚走了：{:.0} -> {:.0}",
+                before_r.left(),
+                after_r.left()
+            );
+        }
     }
 }

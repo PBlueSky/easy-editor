@@ -51,6 +51,8 @@ pub struct Config {
     pub terminal_programs: BTreeMap<String, String>,
     /// 终端启动参数覆盖：种类 id -> 参数字符串（空格分隔，带空格的用双引号包住）。
     pub terminal_args: BTreeMap<String, String>,
+    /// 编辑器自动换行：长行折到面板宽度，而不是横向滚出去。
+    pub word_wrap: bool,
 }
 
 impl Default for Config {
@@ -66,6 +68,7 @@ impl Default for Config {
             terminal_shell: String::new(),
             terminal_programs: BTreeMap::new(),
             terminal_args: BTreeMap::new(),
+            word_wrap: false,
         }
     }
 }

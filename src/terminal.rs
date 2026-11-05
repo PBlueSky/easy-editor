@@ -483,7 +483,7 @@ impl Terminal {
     pub fn ui(&mut self, ui: &mut Ui, font_size: f32, dark: bool, id: egui::Id) {
         let font = FontId::monospace(font_size);
         // 与编辑器统一行高，中文不会把行撑高
-        let row_h = theme::mono_row_height(font_size);
+        let row_h = theme::mono_row_height(font_size, ui.ctx().pixels_per_point());
         let char_w = ui.fonts_mut(|f| f.glyph_width(&font, 'M')).max(1.0);
 
         let avail = ui.available_size();

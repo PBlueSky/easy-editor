@@ -1,10 +1,12 @@
 //! 代码编辑器控件：行号 + 语法高亮 + 可编辑 + 跳转 + 大文件虚拟渲染。
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{self, Color32, FontId, Galley, Rect, ScrollArea, Sense, TextEdit, Ui, Vec2};
+use unicode_width::UnicodeWidthChar as _;
 
 use crate::syntax::{Highlighter, LineSpans};
 use crate::theme;
@@ -295,6 +297,7 @@ fn merge_overlay(
 /// `pane` 是这块面板的身份，用来给滚动位置和光标做持久化 id。
 /// 同一个文件可能在两块面板里出现（对比 / 边看边写），
 /// 少了这个参数两边就会共用一份 state，光标互相打架。
+/// `wrap` 是自动换行开关：开着长行折进视口，关着长行横向滚出去。
 pub fn show(
     ui: &mut Ui,
     file: &mut OpenFile,
@@ -302,6 +305,7 @@ pub fn show(
     font_size: f32,
     dark: bool,
     pane: egui::Id,
+    wrap: bool,
 ) -> EditorOutput {
     if file.large {
         return show_large(ui, file, font_size, dark, pane);
@@ -310,7 +314,7 @@ pub fn show(
     let line_count = file.line_count().max(1);
     let font_id = FontId::monospace(font_size);
     // 与 theme 保持一致的固定行高，避免中英文混排时行高抖动
-    let row_height = theme::mono_row_height(font_size);
+    let row_height = theme::mono_row_height(font_size, ui.ctx().pixels_per_point());
     let char_width = ui.fonts_mut(|f| f.glyph_width(&font_id, '0')).max(1.0);
 
     let digits = line_count.to_string().len().max(2);
@@ -400,27 +404,29 @@ pub fn show(
     // 选中一个词就把全文的相同词一起标出来，方便肉眼定位
     sync_occurrences(ui, file, edit_id);
 
-    let mut scroll_offset = None;
-    if let Some(line) = jump_line {
-        let target = (line as f32) * row_height - ui.available_height() * 0.4;
-        scroll_offset = Some(target.max(0.0));
-    }
+    // 折行之后一个逻辑行会占好几视觉行，行号和当前行底色都得按视觉行重新对齐。
+    // 这张 (每行起始 y, 正文总高) 的表由排版器每帧从排好的 galley 里抽出来。
+    let row_tops: RefCell<(Vec<f32>, f32)> = RefCell::new((Vec::new(), 0.0));
 
-    let mut area = ScrollArea::vertical()
-        .id_salt(scroll_id)
-        .auto_shrink([false, false]);
-    if let Some(off) = scroll_offset {
-        area = area.vertical_scroll_offset(off);
-    }
+    // 不折行时长行会比面板还宽，这时候要能横向滚出去；行号栏在滚动区外面，
+    // 滚多远都钉在左边不动。折行时正文铺满视口宽度就不会超出，横向条自己不会出现。
+    let mut area = if wrap {
+        ScrollArea::vertical()
+    } else {
+        ScrollArea::both()
+    };
+    area = area.id_salt(scroll_id).auto_shrink([false, false]);
 
     let mut changed = false;
 
-    area.show(ui, |ui| {
-        ui.spacing_mut().item_spacing.y = 0.0;
-        ui.horizontal_top(|ui| {
-            let gutter_height = row_height * line_count as f32 + 8.0;
-            let (gutter_rect, _) =
-                ui.allocate_exact_size(Vec2::new(gutter_width, gutter_height), Sense::hover());
+    ui.spacing_mut().item_spacing.y = 0.0;
+    ui.horizontal_top(|ui| {
+        // 行号栏先占掉左边那一格，剩下的整块都给滚动区
+        let (gutter_rect, _) =
+            ui.allocate_exact_size(Vec2::new(gutter_width, ui.available_height()), Sense::hover());
+
+        let out = area.show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
 
             let fg = hl.fg;
             let path = file.path.clone();
@@ -430,7 +436,7 @@ pub fn show(
             let matches = file.matches.clone();
             let occurrences = file.occurrences.clone();
             let current_match = file.current_match;
-            let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, _wrap: f32| -> Arc<Galley> {
+            let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| -> Arc<Galley> {
                 let text = buf.as_str();
                 let spans = hl.highlight(Some(&path), text);
                 let overlay = merge_overlay(
@@ -441,7 +447,9 @@ pub fn show(
                     cur_match_bg,
                     occ_bg,
                 );
-                build_galley(
+                // wrap_width 是 TextEdit 这一帧真正能给到文字的宽度：开了横向滚动它是
+                // 无穷大（不折行时本来就要保持原样），折行时正好就是视口宽度。
+                let galley = build_galley(
                     ui,
                     text,
                     &spans,
@@ -449,7 +457,10 @@ pub fn show(
                     &font_id,
                     fg,
                     row_height,
-                )
+                    if wrap { wrap_width } else { f32::INFINITY },
+                );
+                *row_tops.borrow_mut() = (line_row_tops(&galley), galley.rect.height());
+                galley
             };
 
             let editor = TextEdit::multiline(&mut file.text)
@@ -463,36 +474,33 @@ pub fn show(
                 .layouter(&mut layouter);
 
             let response = ui.add(editor);
-            changed = response.changed();
 
-            let text_top = response.rect.top() + 4.0;
-            let painter = ui.painter_at(gutter_rect);
+            // TextEdit 的 response.rect 已经是去掉 margin 的文字区，
+            // 不能再加 4.0，否则行号/当前行底色会比文字低 4pt。
+            let text_top = response.rect.top();
+            let (tops, text_height) = &*row_tops.borrow();
 
-            // 只绘制可视范围内的行号
-            let clip = ui.clip_rect();
-            let first = (((clip.top() - text_top) / row_height).floor().max(0.0)) as usize;
-            let last = ((((clip.bottom() - text_top) / row_height).ceil()) as usize).min(line_count);
-
-            for i in first..last {
-                let y = text_top + i as f32 * row_height;
-                let is_current = i + 1 == file.line;
-                painter.text(
-                    egui::pos2(gutter_rect.right() - 8.0, y + row_height * 0.5),
-                    egui::Align2::RIGHT_CENTER,
-                    (i + 1).to_string(),
-                    FontId::monospace(font_size * 0.88),
-                    if is_current { active_num_color } else { num_color },
-                );
-            }
-
-            // 当前行底色
+            // 当前行底色画在滚动区里面，这样它才跟着正文一起滚、被视口裁掉。
+            // 折行时这一行可能占了三四视觉行，底色要一起盖住。
             if file.line >= 1 && file.line <= line_count {
-                let y = text_top + (file.line - 1) as f32 * row_height;
+                let i = file.line - 1;
+                let y = line_top(tops, i, line_count, row_height);
+                let h = line_bottom(tops, i, line_count, row_height, *text_height) - y;
                 let rect = Rect::from_min_size(
-                    egui::pos2(response.rect.left(), y),
-                    Vec2::new(response.rect.width(), row_height),
+                    egui::pos2(response.rect.left(), text_top + y),
+                    Vec2::new(response.rect.width(), h),
                 );
                 ui.painter().rect_filled(rect, 0.0, current_line_bg);
+            }
+
+            // 外部跳转：滚到目标行。折行后行与行的间距不一样，只能查刚排好的表。
+            // 横向范围直接给当前视口，等于不动，免得跳一次行把水平位置也甩掉。
+            if let Some(line) = jump_line {
+                let y = text_top + line_top(tops, line, line_count, row_height);
+                ui.scroll_to_rect(
+                    Rect::from_x_y_ranges(ui.clip_rect().x_range(), y..=y + row_height),
+                    Some(egui::Align::Center),
+                );
             }
 
             // 同步光标行列到状态栏
@@ -521,7 +529,31 @@ pub fn show(
                     }
                 }
             }
+
+            (response.changed(), text_top)
         });
+        changed = out.inner.0;
+
+        // 行号画在滚动区外面，可见范围得自己按视口算；clip 也收到视口那一格，
+        // 不然最下面半行数字会印到横向滚动条上去。
+        let (tops, _) = std::mem::take(&mut *row_tops.borrow_mut());
+        let view = Rect::from_x_y_ranges(gutter_rect.x_range(), out.inner_rect.y_range());
+        let painter = ui.painter_at(view);
+        // 正文顶边是带滚动偏移的绝对 y，从滚动区里面带出来，行号照它对齐
+        let text_top = out.inner.1;
+        let (first, last) = visible_lines(&tops, line_count, text_top, view, row_height);
+
+        for i in first..last {
+            let y = text_top + line_top(&tops, i, line_count, row_height);
+            let is_current = i + 1 == file.line;
+            painter.text(
+                egui::pos2(gutter_rect.right() - 8.0, y + row_height * 0.5),
+                egui::Align2::RIGHT_CENTER,
+                (i + 1).to_string(),
+                FontId::monospace(font_size * 0.88),
+                if is_current { active_num_color } else { num_color },
+            );
+        }
     });
 
     if changed {
@@ -534,6 +566,74 @@ pub fn show(
     EditorOutput { changed }
 }
 
+/// 从排好的 galley 里抽出每个逻辑行的起始 y（相对正文顶边）。
+///
+/// `ends_with_newline` 正好标在段落（也就是逻辑行）的最后一视觉行上，
+/// 顺着它切段就能把「第 i 行折成了哪几视觉行」还原出来。
+fn line_row_tops(galley: &Galley) -> Vec<f32> {
+    let mut tops = Vec::new();
+    let mut starts_line = true;
+    for row in &galley.rows {
+        if starts_line {
+            tops.push(row.pos.y);
+            starts_line = false;
+        }
+        if row.ends_with_newline {
+            starts_line = true;
+        }
+    }
+    tops
+}
+
+/// 逻辑行 `i` 的起始 y。表和行数对不上（刚改完文本、还没重排）就退回一行一视觉行。
+fn line_top(tops: &[f32], i: usize, line_count: usize, row_height: f32) -> f32 {
+    if tops.len() != line_count {
+        return i as f32 * row_height;
+    }
+    tops[i.min(line_count - 1)]
+}
+
+/// 逻辑行 `i` 的下边界：下一行的起点，最后一行接到正文底部。
+fn line_bottom(
+    tops: &[f32],
+    i: usize,
+    line_count: usize,
+    row_height: f32,
+    text_height: f32,
+) -> f32 {
+    if tops.len() != line_count {
+        return line_top(tops, i, line_count, row_height) + row_height;
+    }
+    if i + 1 < line_count {
+        tops[i + 1]
+    } else {
+        text_height.max(tops[i] + row_height)
+    }
+}
+
+/// 视口里能看到哪些逻辑行 `[first, last)`。
+///
+/// 折行后行距不一样，不能再拿「偏移 ÷ 行高」当行号，得在表上找；
+/// 表对不上时才退回等距算法。
+fn visible_lines(
+    tops: &[f32],
+    line_count: usize,
+    text_top: f32,
+    view: Rect,
+    row_height: f32,
+) -> (usize, usize) {
+    if tops.len() != line_count {
+        let first = ((view.top() - text_top) / row_height).floor().max(0.0) as usize;
+        let last = (((view.bottom() - text_top) / row_height).ceil()).max(0.0) as usize;
+        return (first.min(line_count), last.min(line_count));
+    }
+    let top = (view.top() - text_top).max(0.0);
+    let bottom = view.bottom() - text_top;
+    let first = tops.partition_point(|t| *t <= top).saturating_sub(1);
+    let last = tops.partition_point(|t| *t < bottom).min(line_count);
+    (first, last.max(first))
+}
+
 /// 大文件：只读虚拟渲染，只画可见行，内存和耗时都与文件大小无关。
 fn show_large(
     ui: &mut Ui,
@@ -543,7 +643,7 @@ fn show_large(
     pane: egui::Id,
 ) -> EditorOutput {
     let font_id = FontId::monospace(font_size);
-    let row_height = theme::mono_row_height(font_size);
+    let row_height = theme::mono_row_height(font_size, ui.ctx().pixels_per_point());
     let char_width = ui.fonts_mut(|f| f.glyph_width(&font_id, '0')).max(1.0);
     let line_count = file.line_count();
     let digits = line_count.to_string().len().max(2);
@@ -631,9 +731,12 @@ fn build_galley(
     font_id: &FontId,
     fallback: Color32,
     line_height: f32,
+    max_width: f32,
 ) -> Arc<Galley> {
     let mut job = LayoutJob::default();
-    job.wrap.max_width = f32::INFINITY;
+    // 横向滚动的代价是不折行：这里给无穷大，一行就排一个视觉行；
+    // 折行时给的是 TextEdit 实际可用的视口宽度。
+    job.wrap.max_width = max_width;
 
     let base = TextFormat {
         font_id: font_id.clone(),
@@ -648,6 +751,17 @@ fn build_galley(
     let mut line_start = 0usize;
     // 着色区间按起点升序，用游标推进避免逐行扫描
     let mut seg_cursor = 0usize;
+
+    // 等宽字体里 ASCII 一格约 0.55em，而 CJK 字形按 1em 排，中文只占 1.82 格，
+    // 后面的英文列就会整体前移。给每个双宽字符补一点前导空白，让它正好占两格；
+    // leading_space 不占字符，光标和选区的下标不受影响。
+    let (cell_width, wide_advance) = ui.fonts_mut(|f| {
+        (
+            f.glyph_width(font_id, '0'),
+            f.glyph_width(font_id, '中'),
+        )
+    });
+    let wide_pad = (2.0 * cell_width - wide_advance).max(0.0);
 
     for (i, line) in text.split('\n').enumerate() {
         let line_end = line_start + line.len();
@@ -671,6 +785,7 @@ fn build_galley(
                         &base,
                         overlay,
                         seg_cursor,
+                        wide_pad,
                     );
                 }
                 // 高亮结果可能丢掉了行尾空白，补齐保证行宽正确
@@ -684,6 +799,7 @@ fn build_galley(
                         &base,
                         overlay,
                         seg_cursor,
+                        wide_pad,
                     );
                 }
             }
@@ -698,6 +814,7 @@ fn build_galley(
                         &base,
                         overlay,
                         seg_cursor,
+                        wide_pad,
                     );
                 }
             }
@@ -723,6 +840,7 @@ fn append_segments(
     base: &TextFormat,
     overlay: &[Seg],
     cursor: usize,
+    wide_pad: f32,
 ) {
     // 找出与本片段相交的所有着色区间
     let mut local: Vec<(usize, usize, Color32)> = Vec::new();
@@ -743,7 +861,7 @@ fn append_segments(
     if local.is_empty() {
         let mut f = base.clone();
         f.color = color;
-        job.append(piece, 0.0, f);
+        append_piece(job, piece, &f, wide_pad);
         return;
     }
 
@@ -758,7 +876,7 @@ fn append_segments(
         if a > pos {
             let mut f = base.clone();
             f.color = color;
-            job.append(&piece[pos..a], 0.0, f);
+            append_piece(job, &piece[pos..a], &f, wide_pad);
         }
         let s = a.max(pos);
         let e = b.min(piece.len());
@@ -766,15 +884,45 @@ fn append_segments(
             let mut f = base.clone();
             f.color = color;
             f.background = bg;
-            job.append(&piece[s..e], 0.0, f);
+            append_piece(job, &piece[s..e], &f, wide_pad);
         }
         pos = pos.max(e);
     }
     if pos < piece.len() {
         let mut f = base.clone();
         f.color = color;
-        job.append(&piece[pos..], 0.0, f);
+        append_piece(job, &piece[pos..], &f, wide_pad);
     }
+}
+
+/// 写入一段文本。含双宽字符时把它们各自切成一段并补前导空白，
+/// 使中文、全角标点都正好占两个等宽格。
+fn append_piece(job: &mut LayoutJob, text: &str, format: &TextFormat, wide_pad: f32) {
+    if wide_pad <= 0.0 || !text.chars().any(is_wide) {
+        job.append(text, 0.0, format.clone());
+        return;
+    }
+
+    let mut run_start = 0usize;
+    for (i, ch) in text.char_indices() {
+        if !is_wide(ch) {
+            continue;
+        }
+        if run_start < i {
+            job.append(&text[run_start..i], 0.0, format.clone());
+        }
+        let end = i + ch.len_utf8();
+        job.append(&text[i..end], wide_pad, format.clone());
+        run_start = end;
+    }
+    if run_start < text.len() {
+        job.append(&text[run_start..], 0.0, format.clone());
+    }
+}
+
+/// East Asian Wide / Fullwidth 字符（中文、全角标点、日韩文等）。
+fn is_wide(ch: char) -> bool {
+    ch.width() == Some(2)
 }
 
 /// 向后落到最近的字符边界（越界则停在末尾）。
