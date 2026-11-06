@@ -5,3 +5,6 @@
 # F12 截图和打包产物落在源码树里时，别混进提交
 *.bmp
 /dist/
+
+# 图标中间产物（母图、裸像素），需要时跑 tools/render-icon.ps1 重新生成
+assets/build/

@@ -32,7 +32,7 @@ cargo run -- src\app.rs                 # 启动并打开文件
 
 ```bash
 cargo check                             # 只做类型检查，最快
-cargo test                              # 87 个单元测试（面板树 / 快捷键 / 日志块解析 / 格式化 / 无头界面行为）
+cargo test                              # 89 个单元测试（面板树 / 快捷键 / 日志块解析 / 格式化 / 无头界面行为）
 cargo build                             # 调试构建 → target\debug\easy-editor.exe
 cargo build --release                   # 发布构建 → target\release\EasyEditor.exe
 ```
@@ -60,6 +60,25 @@ powershell -NoProfile -Command "Compress-Archive -Path dist\EasyEditor -Destinat
 cargo clippy --all-targets              # 需要 rustup component add clippy
 cargo fmt --check                       # 需要 rustup component add rustfmt
 ```
+
+## 应用图标
+
+唯一源文件是 `assets/easy-editor.svg`（1024 栅格，配色跟着编辑器的 base16-ocean 深色主题）。改完重新生成：
+
+```bash
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/render-icon.ps1
+```
+
+脚本用本机 Chrome/Edge 无头截图把 SVG 渲成 1024 母图和 256 档，`tools/make-ico.mjs` 再从母图按面积加权缩小出 16/24/32/48/64/128 拼成 `assets/easy-editor.ico`（小尺寸是传统 32bpp DIB + 1bpp AND 掩码，256 那档直接塞 PNG）。中间产物落在 `assets/build/`，不进版本库；`.ico` 和 `easy-editor-256.png` 要提交。
+
+不逐档找 Chrome 要图，是因为它在 `--window-size=128,128`、`160,160` 这两档会稳定截出全透明的空图。
+
+两份图标管的地方不一样：
+
+- `assets/easy-editor.ico` 由 `build.rs`（build 依赖 `winresource`）编进 exe 的 PE 资源，管资源管理器、快捷方式；
+- `assets/easy-editor-256.png` 由 `src/main.rs` 用 `include_bytes!` 打进去，运行时交给 `ViewportBuilder::with_icon`，管标题栏和任务栏按钮。
+
+`winresource` 只有显式调用才写 manifest，这里没调用，所以 DPI 感知和链接期默认值跟加图标之前一致；它顺带把 `Cargo.toml` 的版本号写进 exe 属性页。资源管理器换图标靠图标缓存，本机看不到变化时可以 `ie4uinit.exe -show` 或换个文件名试。
 
 ## 功能
 

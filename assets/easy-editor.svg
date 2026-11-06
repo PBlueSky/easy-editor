@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- EasyEditor 应用图标源文件。改完跑 tools/render-icon.ps1 重新出 .ico。
+       配色跟着编辑器自己的 base16-ocean 深色主题；16px 下只剩这几个形状，所以别加细节。 -->
+  <defs>
+    <linearGradient id="badge" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4E5C6B" />
+      <stop offset="0.5" stop-color="#343D48" />
+      <stop offset="1" stop-color="#2A313B" />
+    </linearGradient>
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.13" />
+      <stop offset="0.48" stop-color="#FFFFFF" stop-opacity="0" />
+    </linearGradient>
+  </defs>
+
+  <rect x="32" y="32" width="960" height="960" rx="212" fill="url(#badge)" />
+  <rect x="32" y="32" width="960" height="960" rx="212" fill="url(#gloss)" />
+  <rect x="34" y="34" width="956" height="956" rx="210" fill="none" stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="4" />
+
+  <path d="M270 346 L470 512 L270 678" fill="none" stroke="#A9C98E" stroke-width="124"
+        stroke-linecap="round" stroke-linejoin="round" />
+  <rect x="570" y="650" width="244" height="100" rx="24" fill="#E8EDF4" />
+</svg>
