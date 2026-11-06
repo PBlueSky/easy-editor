@@ -456,7 +456,7 @@ impl EasyEditorApp {
         }
         match std::fs::write(&file.path, file.text.as_bytes()) {
             Ok(_) => {
-                file.dirty = false;
+                file.mark_saved();
                 file.mtime = std::fs::metadata(&file.path)
                     .ok()
                     .and_then(|m| m.modified().ok());
@@ -475,7 +475,7 @@ impl EasyEditorApp {
             }
             match std::fs::write(&file.path, file.text.as_bytes()) {
                 Ok(_) => {
-                    file.dirty = false;
+                    file.mark_saved();
                     file.mtime = std::fs::metadata(&file.path)
                         .ok()
                         .and_then(|m| m.modified().ok());
@@ -675,7 +675,7 @@ impl EasyEditorApp {
         let caret = self.find.replace_current(&mut text);
         self.tabs[idx].text = text;
         self.tabs[idx].reindex();
-        self.tabs[idx].dirty = true;
+        self.tabs[idx].refresh_dirty();
         if let Some(c) = caret {
             self.tabs[idx].pending_jump = Some(c);
             self.tabs[idx].jump_without_focus = true;
@@ -694,7 +694,7 @@ impl EasyEditorApp {
         let n = self.find.replace_all(&mut text);
         self.tabs[idx].text = text;
         self.tabs[idx].reindex();
-        self.tabs[idx].dirty = true;
+        self.tabs[idx].refresh_dirty();
         self.sync_find_to_file();
         self.status = format!("已替换 {n} 处");
     }
@@ -1150,7 +1150,7 @@ impl EasyEditorApp {
                 let caret = file.caret_byte.min(formatted.len());
                 file.text = formatted;
                 file.reindex();
-                file.dirty = true;
+                file.refresh_dirty();
                 file.caret_byte = caret;
                 self.status = "已格式化，Ctrl+S 保存".into();
                 self.revalidate_find();
@@ -3026,7 +3026,7 @@ impl EasyEditorApp {
             Some(0) => {
                 if let Some(file) = self.tabs.get_mut(idx) {
                     let _ = std::fs::write(&file.path, file.text.as_bytes());
-                    file.dirty = false;
+                    file.mark_saved();
                 }
                 self.force_close_tab(idx);
                 self.pending_close = None;
@@ -4751,6 +4751,76 @@ mod tests {
             frame(&mut app, &ctx, vec![]);
         }
         assert_eq!(count(), back, "回到宽窗口后还在反复要重绘：会空转");
+    }
+
+    /// 刚打开、没动过的文件不该挂未保存标记（标签、面板标题、状态栏都不该出现 ●）。
+    #[test]
+    fn freshly_opened_file_shows_no_unsaved_marker() {
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-clean-marker", "hello\nworld\n");
+        app.open_file(dir.join("a.txt"), None);
+        let mut out = frame_time(&mut app, &ctx, 0.0, vec![]);
+        for i in 1..6 {
+            out = frame_time(&mut app, &ctx, i as f64, vec![]);
+        }
+        assert!(!app.tabs[0].dirty, "刚打开的文件被标成了已修改");
+        assert!(
+            !texts(&out).iter().any(|t| t.contains('●')),
+            "没改过的文件上方出现了修改标记：{:?}",
+            texts(&out)
+        );
+    }
+
+    /// 输入一个字再撤销回原样，内容又和磁盘一致了，标记要跟着消失。
+    #[test]
+    fn undo_back_to_saved_text_clears_unsaved_marker() {
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-undo-marker", "hello\nworld\n");
+        app.open_file(dir.join("a.txt"), None);
+        let mut t = 0.0;
+        let out = frame_time(&mut app, &ctx, t, vec![]);
+        let p = text_rect_where(&out, |s| s.contains("hello"))
+            .map(|r| r.center())
+            .expect("没找到正文");
+        for pressed in [true, false] {
+            t += 0.1;
+            frame_time(
+                &mut app,
+                &ctx,
+                t,
+                pointer(p, egui::PointerButton::Primary, pressed),
+            );
+        }
+        t += 0.1;
+        frame_time(&mut app, &ctx, t, vec![egui::Event::Text("x".into())]);
+        assert!(app.tabs[0].dirty, "输入内容后没有标记为已修改");
+
+        // egui 的撤销点要等输入稳定 1 秒才落，先空跑几帧
+        for _ in 0..4 {
+            t += 0.4;
+            frame_time(&mut app, &ctx, t, vec![]);
+        }
+
+        // 真实键盘事件里 Ctrl 同时带 ctrl/command 两个位，只写 CTRL 匹配不上 COMMAND
+        let cmd = Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        t += 0.1;
+        frame_time(
+            &mut app,
+            &ctx,
+            t,
+            vec![
+                egui::Event::ModifiersChanged(cmd),
+                key_press(Key::Z, cmd),
+            ],
+        );
+        assert_eq!(
+            app.tabs[0].text, "hello\nworld\n",
+            "撤销没有恢复原内容：{:?}",
+            app.tabs[0].text
+        );
+        assert!(!app.tabs[0].dirty, "撤销回原样后仍挂着未保存标记");
     }
 
     /// 窗口拖窄时顶栏按钮换排，不能挤成一团把字叠着画；够宽时仍然是一排。

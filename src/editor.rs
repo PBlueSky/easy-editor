@@ -68,6 +68,8 @@ pub struct OpenFile {
     pub selection: String,
     /// 最近一次加载/保存时的修改时间，用于外部改动检测
     pub mtime: Option<std::time::SystemTime>,
+    /// 上次打开/保存时的内容指纹。`dirty` 按它算，撤销回原样后标记会自己消失。
+    saved_hash: u64,
 }
 
 impl OpenFile {
@@ -75,6 +77,7 @@ impl OpenFile {
         let bytes_len = text.len();
         let line_offsets = compute_line_offsets(&text);
         let large = bytes_len > LARGE_FILE_BYTES || line_offsets.len() > LARGE_FILE_LINES;
+        let saved_hash = text_hash(&text);
         Self {
             path,
             text,
@@ -95,7 +98,21 @@ impl OpenFile {
             caret_byte: 0,
             selection: String::new(),
             mtime: None,
+            saved_hash,
         }
+    }
+
+    /// 按「当前内容是否和上次打开/保存时一致」重算 `dirty`。
+    /// 撤销回原样、替换 0 处这类操作虽然会触发 TextEdit 的 changed，
+    /// 但文件其实没变，不该继续挂着未保存标记。
+    pub fn refresh_dirty(&mut self) {
+        self.dirty = text_hash(&self.text) != self.saved_hash;
+    }
+
+    /// 落盘成功后调用：记下新内容，清掉未保存标记。
+    pub fn mark_saved(&mut self) {
+        self.saved_hash = text_hash(&self.text);
+        self.dirty = false;
     }
 
     pub fn title(&self) -> String {
@@ -147,7 +164,7 @@ impl OpenFile {
         let (start, end) = if start <= end { (start, end) } else { (end, start) };
         self.text.replace_range(start..end, &edit.insert);
         self.reindex();
-        self.dirty = true;
+        self.refresh_dirty();
         self.matches = Arc::new(Vec::new());
         self.current_match = None;
         if let Some(caret) = edit.caret {
@@ -156,6 +173,14 @@ impl OpenFile {
             self.pending_jump = Some(caret);
         }
     }
+}
+
+/// 内容指纹。只用来和「上次保存的内容」比较，碰撞概率可以忽略。
+fn text_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
 }
 
 pub fn compute_line_offsets(text: &str) -> Vec<usize> {
@@ -557,7 +582,7 @@ pub fn show(
     });
 
     if changed {
-        file.dirty = true;
+        file.refresh_dirty();
         file.reindex();
         file.matches = Arc::new(Vec::new());
         file.current_match = None;
