@@ -34,7 +34,7 @@ cargo run -- src\app.rs                 # 启动并打开文件
 cargo check                             # 只做类型检查，最快
 cargo test                              # 94 个单元测试（面板树 / 快捷键 / 日志块解析 / 格式化 / 标题栏配色 / 图标构图 / 无头界面行为）
 cargo build                             # 调试构建 → target\debug\easy-editor.exe
-cargo build --release                   # 发布构建 → target\release\EasyEditor.exe
+cargo build --release                   # 发布构建 → target\release\easy-editor.exe
 ```
 
 发布构建走 `windows_subsystem = "windows"`（见 `src/main.rs` 首行），双击运行不会带控制台窗口。
@@ -44,11 +44,13 @@ cargo build --release                   # 发布构建 → target\release\EasyEd
 ```bash
 mkdir -p dist/EasyEditor
 cp target/release/easy-editor.exe dist/EasyEditor/EasyEditor.exe   # 和窗口标题保持一致
-cp README.md dist/EasyEditor/
-powershell -NoProfile -Command "Compress-Archive -Path dist\EasyEditor -DestinationPath dist\EasyEditor-0.1.0-windows-x64.zip -Force"
+cp README.md LICENSE dist/EasyEditor/
+powershell -NoProfile -Command "Compress-Archive -Path dist\EasyEditor -DestinationPath dist\EasyEditor-0.2.0-windows-x64.zip -Force"
 ```
 
-产物 `dist/EasyEditor-0.1.0-windows-x64.zip` 约 4.4 MB（解压后单 exe 10.5 MB）。
+产物 `dist/EasyEditor-0.2.0-windows-x64.zip` 约 4.5 MB（解压后单 exe 约 11 MB）。
+带 `rg.exe` 的那档把 `rg.exe` 和 `THIRD-PARTY-NOTICES.txt` 也放进 `dist\EasyEditor\` 再压一次，
+后缀写 `-with-rg`。两个包各配一份 `.sha256.txt`。
 别用 `tar -a -cf xxx.zip`：Git Bash 里那个 `tar` 是 GNU tar，`-a` 只认 gzip/bzip2/xz，
 后缀写 `.zip` 也只会吐一个纯 tar 包（实测前 4 个字节是文件名字面量），Windows 双击打不开。
 
