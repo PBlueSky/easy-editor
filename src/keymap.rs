@@ -221,21 +221,17 @@ impl Keymap {
     }
 
     /// 这个组合是否已经被**别的**动作占用，返回占用者的说明文字。
+    ///
+    /// 按物理键比，不按字符串比：`Ctrl+=` 和 `Ctrl+Plus` 写法不同，按下去却是同一个键，
+    /// 真挂上两个动作时只有一个会生效（归属见 [`Keymap::owns`]），这种撞车得在这儿提示出来。
     pub fn owner_of(&self, action: &str, binding: &str) -> Option<&'static str> {
-        let binding = normalize(binding);
-        if binding.is_empty() {
-            return None;
-        }
+        let (mods, key) = parse(&normalize(binding))?;
         ACTIONS.iter().find_map(|a| {
             if a.id == action {
                 return None;
             }
-            let other = normalize(self.get(a.id));
-            if !other.is_empty() && other == binding {
-                Some(a.label)
-            } else {
-                None
-            }
+            let (other_mods, other_key) = parse(&normalize(self.get(a.id)))?;
+            (other_mods == mods && same_physical_key(other_key, key)).then_some(a.label)
         })
     }
 
@@ -256,16 +252,14 @@ impl Keymap {
         let Some((mods, key)) = parse(binding) else {
             return false;
         };
-        if self.take(ctx, action, mods, key) {
-            return true;
+        // 键盘上 `Ctrl+=` 和 `Ctrl++` 是同一个物理键，两种写法都认。
+        // 但摘事件时要用真正按下的那个键名，所以两个候选各试一次。
+        for pressed in [key, key_twin(key)] {
+            if self.take(ctx, action, mods, pressed) {
+                return true;
+            }
         }
-        // 键盘上 `Ctrl+=` 和 `Ctrl++` 是同一个物理键，两种写法都认
-        let twin = match key {
-            Key::Plus => Key::Equals,
-            Key::Equals => Key::Plus,
-            _ => return false,
-        };
-        self.take(ctx, action, mods, twin)
+        false
     }
 
     fn take(&self, ctx: &egui::Context, action: &str, mods: Modifiers, key: Key) -> bool {
@@ -288,7 +282,7 @@ impl Keymap {
             let Some((mods, k)) = parse(binding) else {
                 continue;
             };
-            if k != key || !pressed.matches_logically(mods) {
+            if !same_physical_key(k, key) || !pressed.matches_logically(mods) {
                 continue;
             }
             let exact = pressed.matches_exact(mods);
@@ -299,6 +293,19 @@ impl Keymap {
         }
         best.is_some_and(|owner| owner == action)
     }
+}
+
+/// `+` 和 `=` 在键盘上是同一个物理键（打 `+` 要按 Shift），两种写法算同一个快捷键。
+fn key_twin(key: Key) -> Key {
+    match key {
+        Key::Plus => Key::Equals,
+        Key::Equals => Key::Plus,
+        other => other,
+    }
+}
+
+fn same_physical_key(a: Key, b: Key) -> bool {
+    a == b || key_twin(a) == b
 }
 
 #[cfg(test)]
@@ -376,5 +383,27 @@ mod tests {
         assert!(km.owns("pane_next", Key::Tab, ctrl_shift));
         assert!(km.owns("global_search", Key::F, ctrl_shift));
         assert!(!km.owns("find", Key::F, ctrl_shift));
+    }
+
+    /// `+` 和 `=` 是同一个物理键（打 `+` 要按 Shift），两种写法都得归「放大字号」。
+    /// 之前只认 `Key::Plus`，`Ctrl+=` 判成「不归我管」，漏给了 egui 的整窗缩放。
+    #[test]
+    fn plus_and_equals_are_the_same_key() {
+        let km = Keymap::default();
+        let ctrl = Modifiers::CTRL;
+        assert!(km.owns("font_inc", Key::Plus, ctrl));
+        assert!(km.owns("font_inc", Key::Equals, ctrl));
+        assert!(km.owns("font_dec", Key::Minus, ctrl));
+        // 反向也要成立：把动作绑成 `Ctrl+=` 时，按 `Ctrl++` 同样归它
+        let mut km = Keymap::default();
+        km.set("font_inc", "Ctrl+=");
+        assert!(km.owns("font_inc", Key::Plus, ctrl));
+
+        // 冲突检测同样按物理键认，否则用户把别的动作绑到 `Ctrl+=` 上不会报警，
+        // 而两个动作里只有一个拿得到这一下按键。
+        let mut km = Keymap::default();
+        km.set("save", "Ctrl+=");
+        assert_eq!(km.conflict_of("save"), Some("放大字号"));
+        assert_eq!(km.conflict_of("font_inc"), Some("保存"));
     }
 }

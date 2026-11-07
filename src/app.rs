@@ -158,6 +158,11 @@ impl EasyEditorApp {
         theme::install_fonts(ctx);
         theme::apply_style(ctx, dark);
 
+        // egui 自带一套「像浏览器那样缩放整个界面」的快捷键（Ctrl+= / Ctrl+- / Ctrl+0），
+        // 它改的是 zoom_factor，菜单、侧栏、编辑器会一起变大。本应用的字号快捷键和它撞车，
+        // 撞车后放大走整窗缩放、缩小走字号，只放不缩，所以整窗缩放关掉，字号缩放自己管。
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
+
         let keymap = Keymap::from_config(&config.data.keymap);
 
         let mut app = Self {
@@ -3605,6 +3610,13 @@ mod tests {
         frame_at(app, ctx, SCREEN, events)
     }
 
+    /// 按一下键，再多跑两帧。`zoom_factor` 是下一趟 pass 才生效的，当场量看不出来。
+    fn press_key(app: &mut EasyEditorApp, ctx: &egui::Context, key: Key, mods: Modifiers) {
+        frame(app, ctx, vec![key_press(key, mods)]);
+        frame(app, ctx, vec![]);
+        frame(app, ctx, vec![]);
+    }
+
     /// 同上，但自己指定屏幕尺寸——窗口挤到多窄就得量多窄。
     fn frame_at(
         app: &mut EasyEditorApp,
@@ -4870,5 +4882,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 字号快捷键只动编辑器和终端的字号，不能把整个界面的缩放带跑偏。
+    ///
+    /// 曾经 `Ctrl+=` 漏给了 egui 内置的整窗缩放（菜单、侧栏跟着变大），而 `Ctrl+-`
+    /// 被本应用消费掉（只缩字号）——只放不缩，界面卡在放大状态回不去。
+    #[test]
+    fn font_shortcuts_scale_only_the_editor_font() {
+        let (ctx, mut app, _dir) = app_in_folder("easy-editor-app-font-keys", "a\n");
+        app.font_size = 14.0;
+        // 真实键盘事件里 Ctrl 同时带 ctrl/command 两个位，只写 CTRL 匹配不上 COMMAND
+        let ctrl = Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+
+        // 不带 Shift 的 `Ctrl+=` 才是日常按「+」的方式
+        press_key(&mut app, &ctx, Key::Equals, ctrl);
+        assert_eq!(app.font_size, 15.0, "Ctrl+= 没放大编辑器字号");
+        assert_eq!(ctx.zoom_factor(), 1.0, "Ctrl+= 把整个界面缩放了");
+
+        // 带 Shift 的那一下是 Key::Plus，egui 的 ZOOM_IN 认的就是它
+        press_key(
+            &mut app,
+            &ctx,
+            Key::Plus,
+            Modifiers { shift: true, ..ctrl },
+        );
+        assert_eq!(app.font_size, 16.0, "Ctrl+Shift+= 没放大编辑器字号");
+        assert_eq!(ctx.zoom_factor(), 1.0, "Ctrl+Shift+= 把整个界面缩放了");
+
+        for _ in 0..2 {
+            press_key(&mut app, &ctx, Key::Minus, ctrl);
+        }
+        assert_eq!(app.font_size, 14.0, "Ctrl+- 没缩回编辑器字号");
+        assert_eq!(ctx.zoom_factor(), 1.0, "Ctrl+- 把整个界面缩放了");
+
+        // egui 的缩放复位键（本应用没绑定）也该被关掉，别留下半放大的界面
+        press_key(&mut app, &ctx, Key::Num0, ctrl);
+        assert_eq!(ctx.zoom_factor(), 1.0, "Ctrl+0 动了整窗缩放");
     }
 }

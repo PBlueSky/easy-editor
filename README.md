@@ -32,7 +32,7 @@ cargo run -- src\app.rs                 # 启动并打开文件
 
 ```bash
 cargo check                             # 只做类型检查，最快
-cargo test                              # 89 个单元测试（面板树 / 快捷键 / 日志块解析 / 格式化 / 无头界面行为）
+cargo test                              # 91 个单元测试（面板树 / 快捷键 / 日志块解析 / 格式化 / 无头界面行为）
 cargo build                             # 调试构建 → target\debug\easy-editor.exe
 cargo build --release                   # 发布构建 → target\release\EasyEditor.exe
 ```
@@ -268,7 +268,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/render-icon.ps1
 | `Ctrl+Shift+`` ` | 新建终端面板 |
 | `Ctrl+B` | 显示 / 隐藏侧栏 |
 | `Ctrl+W` | 关闭标签 |
-| `Ctrl+加号 / 减号` | 字号 |
+| `Ctrl+加号 / 减号` | 字号（只动编辑器 / 终端正文） |
 | `Alt+Z` | 切换自动换行（关着时长行横向滚动） |
 | `Alt+Shift+D` | 自动拆分当前面板（宽则左右、高则上下） |
 | `Alt+Shift++` / `Alt+Shift+-` | 向右 / 向下拆分当前面板 |
@@ -278,6 +278,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/render-icon.ps1
 | `Alt+Shift+F` | 格式化（JSON / XML，只改 buffer） |
 | `F1` | 快捷键设置 |
 | `F12` | 截图（存到 `%APPDATA%\easy-editor\screenshot.bmp`） |
+
+`+` 和 `=` 在键盘上是同一个物理键，所以 `Ctrl+=`、`Ctrl++` 都算「放大字号」，归属判断按物理键走（见 `keymap::same_physical_key`）。
+
+egui 自带一套改**整窗缩放**的同名快捷键（`Ctrl+=` / `Ctrl+-` / `Ctrl+0`，缩放的是 `zoom_factor`，菜单侧栏会跟着一起变大），和本应用的字号快捷键撞车：撞车时放大走了整窗缩放、缩小只动字号，界面就卡在放大状态回不去。所以 `bootstrap` 里把 `Options::zoom_with_keyboard` 关了，字号缩放只影响编辑器和终端正文，整窗缩放交给系统 DPI。
 
 ## 中英文对齐
 
