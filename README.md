@@ -32,7 +32,7 @@ cargo run -- src\app.rs                 # 启动并打开文件
 
 ```bash
 cargo check                             # 只做类型检查，最快
-cargo test                              # 91 个单元测试（面板树 / 快捷键 / 日志块解析 / 格式化 / 无头界面行为）
+cargo test                              # 93 个单元测试（面板树 / 快捷键 / 日志块解析 / 格式化 / 标题栏配色 / 无头界面行为）
 cargo build                             # 调试构建 → target\debug\easy-editor.exe
 cargo build --release                   # 发布构建 → target\release\EasyEditor.exe
 ```
@@ -84,6 +84,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/render-icon.ps1
 
 ### 顶部工具栏
 窗口拖窄到一排装不下时，剩下的按钮换到第二排继续排，不会被挤成一团、也不会把字叠着画；右侧那组（工作区名 / 字号 / shell / 主题）换排后照旧从右边往左钉。工作区名排不下就截断，鼠标悬浮看完整路径。顶栏高度是照上一帧的内容量的，换行后会自己补一帧重绘，把第二排露出来。
+
+### 系统标题栏
+最小化 / 最大化 / 关闭那一行由 Windows 的 DWM 画，egui 管不到它。`winit` 只在**建窗时**按当时的主题给 uxtheme 打标记，用的又不是 DWM 认的那个属性，于是标题栏底色和按钮字形会各跟一套配色：浅色底压白字时，按钮就整个看不见，切换深浅主题后标题栏也不会跟着变。
+
+所以 `src/titlebar.rs` 在启动和每次切主题时补发三个 `DwmSetWindowAttribute`：`USE_IMMERSIVE_DARK_MODE`（决定按钮字形取亮色还是暗色）、`CAPTION_COLOR`、`TEXT_COLOR`。底色取 `theme::panel_fill`，和顶栏同一个值，标题栏与工具栏之间看不出接缝。后两个属性要 Windows 11 22000+，老系统调用失败就忽略，只留深色开关。
 
 ### 文件树
 `walkdir` 懒加载，默认隐藏 `.` 开头的条目（右键可切换「显示隐藏文件」）。新建文件/文件夹有三个入口：工具栏按钮、文件树顶部按钮、任意条目（含根目录）右键菜单。

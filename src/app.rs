@@ -19,6 +19,7 @@ use crate::search::SearchState;
 use crate::syntax::Highlighter;
 use crate::terminal::{TerminalPanel, TerminalSettings};
 use crate::theme;
+use crate::titlebar;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum SideTab {
@@ -103,6 +104,8 @@ pub struct EasyEditorApp {
     hl: Highlighter,
     font_size: f32,
     dark: bool,
+    /// 主窗口的原生句柄，用来把系统标题栏刷成当前主题；无头测试里是 `None`
+    hwnd: Option<isize>,
     /// 编辑器自动换行：开着长行折进面板，关着长行横向滚出去
     word_wrap: bool,
     /// 顶栏内容上一帧的高度（取整）。面板高度是照上一帧量的，换行后旧高度会把第二排裁掉
@@ -140,9 +143,27 @@ pub struct EasyEditorApp {
     verify_stage: usize,
 }
 
+/// 主窗口的原生句柄（`HWND`）。非 Windows 和 eframe 拿不到句柄时返回 `None`。
+#[cfg(windows)]
+fn native_hwnd(cc: &eframe::CreationContext<'_>) -> Option<isize> {
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    match cc.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+        _ => None,
+    }
+}
+
+#[cfg(not(windows))]
+fn native_hwnd(_cc: &eframe::CreationContext<'_>) -> Option<isize> {
+    None
+}
+
 impl EasyEditorApp {
     pub fn new(cc: &eframe::CreationContext<'_>, target: Option<PathBuf>) -> Self {
-        Self::bootstrap(&cc.egui_ctx, target)
+        let mut app = Self::bootstrap(&cc.egui_ctx, target);
+        app.hwnd = native_hwnd(cc);
+        titlebar::apply(app.hwnd, app.dark);
+        app
     }
 
     /// 不碰 `eframe` 上下文的构造入口：测试里没有真实的窗口和 GL 上下文，
@@ -182,6 +203,7 @@ impl EasyEditorApp {
             hl: Highlighter::new(dark),
             font_size,
             dark,
+            hwnd: None,
             word_wrap,
             toolbar_h: 0,
             status: "Ctrl+O 打开文件夹 · Ctrl+P 快速打开 · Ctrl+` 终端".into(),
@@ -1903,6 +1925,7 @@ impl EasyEditorApp {
                 {
                     self.dark = !self.dark;
                     theme::apply_style(ui.ctx(), self.dark);
+                    titlebar::apply(self.hwnd, self.dark);
                     self.hl.set_theme(if self.dark {
                         crate::syntax::DARK_THEME
                     } else {

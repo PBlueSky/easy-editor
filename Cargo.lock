@@ -691,6 +691,7 @@ dependencies = [
  "egui_extras",
  "memchr",
  "portable-pty",
+ "raw-window-handle",
  "regex",
  "rfd",
  "serde",

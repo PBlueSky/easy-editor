@@ -147,6 +147,15 @@ pub fn mono_row_height(font_size: f32, pixels_per_point: f32) -> f32 {
     (raw * pixels_per_point).round() / pixels_per_point
 }
 
+/// 面板底色。系统标题栏要和它取同一个值，顶栏才连成一片（见 `titlebar::palette`）。
+pub fn panel_fill(dark: bool) -> Color32 {
+    if dark {
+        Color32::from_rgb(30, 32, 36)
+    } else {
+        Color32::from_rgb(249, 250, 251)
+    }
+}
+
 /// 应用整体视觉风格。
 pub fn apply_style(ctx: &egui::Context, dark: bool) {
     ctx.set_theme(if dark {
@@ -162,14 +171,14 @@ pub fn apply_style(ctx: &egui::Context, dark: bool) {
     };
 
     if dark {
-        visuals.panel_fill = Color32::from_rgb(30, 32, 36);
+        visuals.panel_fill = panel_fill(true);
         visuals.window_fill = Color32::from_rgb(34, 37, 42);
         visuals.faint_bg_color = Color32::from_rgb(38, 41, 46);
         visuals.extreme_bg_color = Color32::from_rgb(24, 26, 30);
         visuals.widgets.noninteractive.bg_stroke =
             egui::Stroke::new(1.0, Color32::from_rgb(48, 52, 58));
     } else {
-        visuals.panel_fill = Color32::from_rgb(249, 250, 251);
+        visuals.panel_fill = panel_fill(false);
         visuals.window_fill = Color32::from_rgb(255, 255, 255);
         visuals.faint_bg_color = Color32::from_rgb(243, 244, 246);
         visuals.extreme_bg_color = Color32::from_rgb(255, 255, 255);

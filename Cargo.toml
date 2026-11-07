@@ -25,6 +25,10 @@ regex = "1"
 memchr = "2"
 unicode-width = "0.2"
 
+# 取主窗口的 HWND，用来把系统标题栏刷成当前主题（见 src/titlebar.rs）
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+
 # 依赖库用 O2 编译，自身代码保持快速迭代
 [profile.dev]
 opt-level = 1

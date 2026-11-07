@@ -14,6 +14,7 @@ mod search;
 mod syntax;
 mod terminal;
 mod theme;
+mod titlebar;
 
 fn main() -> eframe::Result<()> {
     let target = std::env::args().nth(1).map(std::path::PathBuf::from);
