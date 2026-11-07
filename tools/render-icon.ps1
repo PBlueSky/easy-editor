@@ -16,10 +16,13 @@ $root  = Split-Path -Parent $PSScriptRoot
 $svg   = Join-Path $root 'assets\easy-editor.svg'
 $build = Join-Path $root 'assets\build'
 
-# 只渲两张：1024 母图给 node 缩小成 16..128，256 直接当 PNG 塞进 .ico。
-# 不逐档找 Chrome 要图——它在 window-size=128/160 会稳定截出全透明的空图。
+# 只渲 1024 母图，其余档位（含运行时用的 256）全由 node 从母图缩小。
+# 不找 Chrome 要小图：无头截图在小窗口上不可靠，128/160 稳定截出全透明的空图，
+# 256 会把整张画往右推、右边裁掉，图标看着就只剩一半。
 $masterSize = 1024
 $pngSize    = 256
+# SVG 里徽章留的边距是 1024 格上的 32，即 1/32；出图后不透明区应当按这个居中留边。
+$marginDiv = 32
 
 if (-not (Test-Path $svg)) { throw "找不到图标源文件：$svg" }
 New-Item -ItemType Directory -Force -Path $build | Out-Null
@@ -53,6 +56,54 @@ function Test-Painted($path, $size) {
         return $hit
     }
     finally { $bmp.Dispose() }
+}
+
+# 量一下不透明区域的包围盒（alpha > 8）。用来确认画面没有整体偏移或被裁掉。
+function Get-OpaqueBox($path, $size) {
+    $bmp = New-Object System.Drawing.Bitmap($path)
+    try {
+        if ($bmp.Width -ne $size -or $bmp.Height -ne $size) {
+            throw "$path 尺寸不对：$($bmp.Width)x$($bmp.Height)，应为 ${size}x${size}"
+        }
+        $rect = New-Object System.Drawing.Rectangle 0, 0, $size, $size
+        $data = $bmp.LockBits($rect, [System.Drawing.Imaging.ImageLockMode]::ReadOnly,
+                              [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+        try {
+            $stride = $data.Stride
+            $bytes = New-Object byte[] ($stride * $size)
+            [System.Runtime.InteropServices.Marshal]::Copy($data.Scan0, $bytes, 0, $bytes.Length)
+        }
+        finally { $bmp.UnlockBits($data) }
+        $minX = $size; $maxX = -1; $minY = $size; $maxY = -1
+        for ($y = 0; $y -lt $size; $y++) {
+            for ($x = 0; $x -lt $size; $x++) {
+                if ($bytes[$y * $stride + $x * 4 + 3] -gt 8) {
+                    if ($x -lt $minX) { $minX = $x }
+                    if ($x -gt $maxX) { $maxX = $x }
+                    if ($y -lt $minY) { $minY = $y }
+                    if ($y -gt $maxY) { $maxY = $y }
+                }
+            }
+        }
+        return [pscustomobject]@{ MinX = $minX; MaxX = $maxX; MinY = $minY; MaxY = $maxY }
+    }
+    finally { $bmp.Dispose() }
+}
+
+# 出图后必须居中留边、四边都不贴到画布边缘。左边距和上边距差太多就是整体偏移，
+# 某一边贴到 0 或 size-1 就是被裁了——这两种都是「图标只剩一半」的成因。
+function Assert-Centered($path, $size) {
+    $want = [math]::Floor($size / $marginDiv)
+    $box = Get-OpaqueBox $path $size
+    $tol = [math]::Max(2, [math]::Ceiling($size / 64))
+    $edges = @($box.MinX, $box.MinY, ($size - 1 - $box.MaxX), ($size - 1 - $box.MaxY))
+    Write-Host ("  {0,5}px 不透明区 x={1}..{2} y={3}..{4}，四边留边 {5}（应约 {6}）" -f `
+        $size, $box.MinX, $box.MaxX, $box.MinY, $box.MaxY, ($edges -join '/'), $want)
+    foreach ($e in $edges) {
+        if ([math]::Abs($e - $want) -gt $tol) {
+            throw "$path 构图不对：四边留边 $($edges -join '/')，应约 $want（±$tol）。"
+        }
+    }
 }
 
 function Render-Png($browser, $profile, $html, $size, $png) {
@@ -91,19 +142,18 @@ $htmlPath = (Get-Item $html).FullName
 
 $profile = Join-Path $env:TEMP ("easy-editor-icon-" + [guid]::NewGuid().ToString('N'))
 try {
-    foreach ($size in @($masterSize, $pngSize)) {
-        $png = Join-Path $build "$size.png"
-        $hit = 0
-        for ($try = 1; $try -le 3; $try++) {
-            Render-Png $browser $profile $htmlPath $size $png
-            if (-not (Test-Path $png)) { Write-Warning "$size.png 第 $try 次没写出文件，重试"; continue }
-            $hit = Test-Painted $png $size
-            if ($hit -gt 0) { break }
-            Write-Warning "$size.png 第 $try 次是全透明的，重画"
-        }
-        if ($hit -le 0) { throw "$size.png 渲染不出东西（抽样命中 $hit 个不透明像素）。" }
-        Write-Host ("  {0,5}px -> {1,8} bytes, 抽样不透明点 {2}" -f $size, (Get-Item $png).Length, $hit)
+    $png = Join-Path $build "$masterSize.png"
+    $hit = 0
+    for ($try = 1; $try -le 3; $try++) {
+        Render-Png $browser $profile $htmlPath $masterSize $png
+        if (-not (Test-Path $png)) { Write-Warning "母图第 $try 次没写出文件，重试"; continue }
+        $hit = Test-Painted $png $masterSize
+        if ($hit -gt 0) { break }
+        Write-Warning "母图第 $try 次是全透明的，重画"
     }
+    if ($hit -le 0) { throw "母图渲染不出东西（抽样命中 $hit 个不透明像素）。" }
+    Write-Host ("  {0,5}px -> {1,8} bytes, 抽样不透明点 {2}" -f $masterSize, (Get-Item $png).Length, $hit)
+    Assert-Centered $png $masterSize
 }
 finally {
     if (Test-Path $profile) { Remove-Item $profile -Recurse -Force -ErrorAction SilentlyContinue }
@@ -125,9 +175,11 @@ try {
 }
 finally { $bmp.Dispose() }
 
-Copy-Item (Join-Path $build "$pngSize.png") (Join-Path $root 'assets\easy-editor-256.png') -Force
-
 & node (Join-Path $root 'tools\make-ico.mjs') $build (Join-Path $root 'assets\easy-editor.ico')
 if ($LASTEXITCODE -ne 0) { throw "make-ico.mjs 失败，退出码 $LASTEXITCODE" }
+
+# node 从母图缩出 assets/build/256.png，这份同时进 .ico 和当运行时窗口图标用。
+Assert-Centered (Join-Path $build "$pngSize.png") $pngSize
+Copy-Item (Join-Path $build "$pngSize.png") (Join-Path $root 'assets\easy-editor-256.png') -Force
 
 Write-Host "完成：assets/easy-editor.ico + assets/easy-editor-256.png"

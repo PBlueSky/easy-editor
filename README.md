@@ -32,7 +32,7 @@ cargo run -- src\app.rs                 # 启动并打开文件
 
 ```bash
 cargo check                             # 只做类型检查，最快
-cargo test                              # 93 个单元测试（面板树 / 快捷键 / 日志块解析 / 格式化 / 标题栏配色 / 无头界面行为）
+cargo test                              # 94 个单元测试（面板树 / 快捷键 / 日志块解析 / 格式化 / 标题栏配色 / 图标构图 / 无头界面行为）
 cargo build                             # 调试构建 → target\debug\easy-editor.exe
 cargo build --release                   # 发布构建 → target\release\EasyEditor.exe
 ```
@@ -69,9 +69,9 @@ cargo fmt --check                       # 需要 rustup component add rustfmt
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/render-icon.ps1
 ```
 
-脚本用本机 Chrome/Edge 无头截图把 SVG 渲成 1024 母图和 256 档，`tools/make-ico.mjs` 再从母图按面积加权缩小出 16/24/32/48/64/128 拼成 `assets/easy-editor.ico`（小尺寸是传统 32bpp DIB + 1bpp AND 掩码，256 那档直接塞 PNG）。中间产物落在 `assets/build/`，不进版本库；`.ico` 和 `easy-editor-256.png` 要提交。
+脚本只用本机 Chrome/Edge 无头截图渲一张 1024 母图，其余档位（16/24/32/48/64/128 和运行时用的 256）都由 `tools/make-ico.mjs` 从母图按面积加权缩小，再拼成 `assets/easy-editor.ico`（小尺寸是传统 32bpp DIB + 1bpp AND 掩码，256 那档塞 PNG，由脚本自己编码，不依赖任何库）。中间产物落在 `assets/build/`，不进版本库；`.ico` 和 `easy-editor-256.png` 要提交。
 
-不逐档找 Chrome 要图，是因为它在 `--window-size=128,128`、`160,160` 这两档会稳定截出全透明的空图。
+不逐档找 Chrome 要图，是因为它的小窗口截图不可靠：`--window-size=128,128`、`160,160` 稳定截出全透明的空图，`256,256` 会把整张画往右推、右边裁掉——标题栏和任务栏拿到这种图就是「图标只剩一半」。`tools/render-icon.ps1` 出图后量不透明区的四边留边，`src/main.rs` 里 `window_icon_is_centered_and_not_clipped` 再盯一遍嵌入的那份，构图歪了或被裁了就报错。
 
 两份图标管的地方不一样：
 

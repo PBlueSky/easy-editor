@@ -44,3 +44,47 @@ fn window_icon() -> eframe::egui::IconData {
     eframe::icon_data::from_png_bytes(png)
         .expect("assets/easy-editor-256.png 不是能解码的 PNG，重新跑 tools/render-icon.ps1")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 出过一档「图标只剩一半」：无头 Chrome 在 `--window-size=256` 下把整张画往右推、
+    /// 右边裁掉，标题栏和任务栏拿到的就是那张半截图。现在 256 由 tools/make-ico.mjs
+    /// 从 1024 母图缩小，这里兜底盯住构图：四边留边要相等且不贴到画布边缘。
+    #[test]
+    fn window_icon_is_centered_and_not_clipped() {
+        let icon = window_icon();
+        let size = icon.width as usize;
+        assert_eq!((size, icon.height as usize), (256, 256));
+
+        let (mut min_x, mut min_y) = (size, size);
+        let (mut max_x, mut max_y) = (0usize, 0usize);
+        for y in 0..size {
+            for x in 0..size {
+                if icon.rgba[(y * size + x) * 4 + 3] > 8 {
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                    min_y = min_y.min(y);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+
+        // SVG 的徽章在 1024 格上留 32 的边，等比到这张图就是 size / 32。
+        let want = size / 32;
+        let sides = [
+            ("左", min_x),
+            ("上", min_y),
+            ("右", size - 1 - max_x),
+            ("下", size - 1 - max_y),
+        ];
+        for (side, got) in sides {
+            assert!(
+                got.abs_diff(want) <= 2,
+                "图标{side}边留了 {got}px，应为 {want}±2（构图整体偏移或被裁切，重跑 tools/render-icon.ps1）；\
+                 不透明区 x={min_x}..{max_x} y={min_y}..{max_y}"
+            );
+        }
+    }
+}

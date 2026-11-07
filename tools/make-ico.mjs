@@ -6,11 +6,16 @@
 // （32bpp BGRA + 1bpp AND 掩码，行倒序自下而上），256 直接塞整张 PNG——
 // Vista 之后的外壳都认这种条目，省掉一个巨大的位图。
 //
-// 小尺寸不找 Chrome 单独渲染：无头截图在 window-size=128/160 这两档会稳定截出
-// 全透明的空图，别的档位正常。这里改成从 1024 那张母图按面积加权缩小，
-// 结果可控，而且 alpha 是预乘后再平均的，边缘不会发暗。
+// 所有档位都从 1024 那张母图按面积加权缩小，一张都不找 Chrome 单独渲染：
+// 无头截图在小窗口上不可靠（128/160 稳定截成全透明的空图，256 会把画面
+// 整体往右推、右边裁掉），而缩小这一步的结果是可控的。alpha 预乘后再平均，
+// 边缘不会发暗。
+//
+// 256 这张除了进 .ico，还会写回 <buildDir>/256.png 给 render-icon.ps1
+// 拷成 assets/easy-editor-256.png——运行时窗口/任务栏图标用的就是它。
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { deflateSync } from 'node:zlib';
 
 const [buildDir, outPath] = process.argv.slice(2);
 if (!buildDir || !outPath) {
@@ -20,7 +25,7 @@ if (!buildDir || !outPath) {
 
 const MASTER = 1024;
 const dibSizes = [16, 24, 32, 48, 64, 128];
-const pngSizes = [256];
+const pngSize = 256;
 
 // 面积加权盒式缩小。源是 BGRA（直通 alpha），目标是同样 BGRA。
 function resample(src, sw, sh, dw, dh) {
@@ -72,7 +77,64 @@ function readMaster() {
   return src;
 }
 
+const crcTable = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+
+function crc32(buf) {
+  let c = 0xffffffff;
+  for (const b of buf) c = crcTable[(c ^ b) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type, data) {
+  const head = Buffer.alloc(4);
+  head.writeUInt32BE(data.length, 0);
+  const name = Buffer.from(type, 'ascii');
+  const tail = Buffer.alloc(4);
+  tail.writeUInt32BE(crc32(Buffer.concat([name, data])), 0);
+  return Buffer.concat([head, name, data, tail]);
+}
+
+// 最小 PNG 编码器：8 位、颜色类型 6（RGBA）、不交叉、每行 filter 0。
+// 输入是 GDI 那套直通 BGRA，这里顺手换成 PNG 要的 RGBA。
+function encodePng(bgra, size) {
+  const rowBytes = size * 4 + 1;
+  const raw = Buffer.alloc(size * rowBytes);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const i = (y * size + x) * 4;
+      const o = y * rowBytes + 1 + x * 4;
+      raw[o] = bgra[i + 2];
+      raw[o + 1] = bgra[i + 1];
+      raw[o + 2] = bgra[i];
+      raw[o + 3] = bgra[i + 3];
+    }
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(size, 0);
+  ihdr.writeUInt32BE(size, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', deflateSync(raw, { level: 9 })),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
 const master = readMaster();
+const png256 = encodePng(resample(master, MASTER, MASTER, pngSize, pngSize), pngSize);
+// 运行时窗口图标（src/main.rs 里 include_bytes! 的那份）也出自这里，
+// 保证 exe 资源图标和任务栏图标是同一张画。
+writeFileSync(join(buildDir, `${pngSize}.png`), png256);
 
 // 传统 DIB 条目。alpha 为 0 的圆角要落进 AND 掩码，否则有些外壳组件会把它涂黑。
 function dibEntry(size) {
@@ -103,7 +165,7 @@ function dibEntry(size) {
 
 const images = [
   ...dibSizes.map((s) => ({ size: s, data: dibEntry(s) })),
-  ...pngSizes.map((s) => ({ size: s, data: readFileSync(join(buildDir, `${s}.png`)) })),
+  { size: pngSize, data: png256 },
 ];
 
 const dirSize = 6 + 16 * images.length;
