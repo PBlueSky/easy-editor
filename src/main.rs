@@ -6,6 +6,7 @@ mod editor;
 mod filetree;
 mod find;
 mod format;
+mod ime;
 mod journal;
 mod keymap;
 mod nav;

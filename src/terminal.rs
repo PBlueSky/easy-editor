@@ -26,6 +26,17 @@ struct Dims {
     rows: usize,
 }
 
+/// 滚轮一格滚几行终端历史。
+const WHEEL_LINES_PER_NOTCH: f32 = 3.0;
+/// 触控板按像素上报滚动量时，多少像素折算成一行。
+const WHEEL_PIXELS_PER_LINE: f32 = 14.0;
+/// 滚动条可见部分的宽度。
+const SB_BAR_W: f32 = 6.0;
+/// 滚动条可点范围的宽度（比可见部分宽，好瞄准）。
+const SB_HIT_W: f32 = 12.0;
+/// 滑块最短高度：历史再长也留一块点得到的地方。
+const SB_MIN_THUMB: f32 = 24.0;
+
 /// 终端里的一个格子位置。行号是**绝对行**（含回滚历史），
 /// 这样滚动之后选区不会跟着屏幕跑。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -48,6 +59,52 @@ impl Selection {
             (self.end, self.anchor)
         }
     }
+}
+
+/// 一次滚轮/触控板事件折算成多少行。
+///
+/// 正方向是「往回滚」（Windows 上滚轮向上为正值），和 `Scroll::Delta` 一致：
+/// 行数加到 `display_offset` 上，也就是往回滚历史的方向走。
+fn wheel_delta_lines(unit: egui::MouseWheelUnit, delta_y: f32, rows: usize) -> f32 {
+    match unit {
+        egui::MouseWheelUnit::Line => delta_y * WHEEL_LINES_PER_NOTCH,
+        egui::MouseWheelUnit::Point => delta_y / WHEEL_PIXELS_PER_LINE,
+        egui::MouseWheelUnit::Page => delta_y * rows as f32,
+    }
+}
+
+/// 攒够一整行才滚：返回（这一帧滚几行，留下多少零头）。
+fn take_lines(acc: f32) -> (i32, f32) {
+    let steps = acc.trunc() as i32;
+    (steps, acc - steps as f32)
+}
+
+/// 滚动条滑块的位置和长度。
+///
+/// 长度按「可见行 / 总行」比例算，位置按回滚进度算：
+/// `offset == history` 滚到最上面（滑块贴轨道顶），`offset == 0` 是最新输出（贴轨道底）。
+fn thumb_rect(track: Rect, history: usize, offset: usize, rows: usize) -> Rect {
+    let total = (history + rows).max(1) as f32;
+    let height = (track.height() * (rows as f32 / total))
+        .max(SB_MIN_THUMB)
+        .min(track.height());
+    let span = (track.height() - height).max(0.0);
+    let progress = if history == 0 {
+        1.0
+    } else {
+        (history - offset.min(history)) as f32 / history as f32
+    };
+    Rect::from_min_size(
+        egui::pos2(track.center().x - SB_BAR_W * 0.5, track.top() + progress * span),
+        Vec2::new(SB_BAR_W, height),
+    )
+}
+
+/// 把滑块的顶边 y 换回 `display_offset`，和 [`thumb_rect`] 互为逆运算。
+fn offset_from_thumb_top(track: Rect, history: usize, thumb_h: f32, top: f32) -> usize {
+    let span = (track.height() - thumb_h).max(1.0);
+    let progress = ((top - track.top()) / span).clamp(0.0, 1.0);
+    ((1.0 - progress) * history as f32).round() as usize
 }
 
 impl Dimensions for Dims {
@@ -331,7 +388,10 @@ pub struct Terminal {
     rx: Receiver<Msg>,
     dims: Dims,
     pub exited: bool,
+    /// 滚轮攒下的不足一行的零头
     scroll_acc: f32,
+    /// 正在拖滚动条时，指针相对滑块顶边的位置；没拖是 None
+    sb_grab: Option<f32>,
     /// 鼠标拖选的范围（绝对行坐标）
     selection: Option<Selection>,
     /// 下一帧请求焦点（新建终端后自动聚焦，省得用户还要点一下）
@@ -412,6 +472,7 @@ impl Terminal {
             dims,
             exited: false,
             scroll_acc: 0.0,
+            sb_grab: None,
             selection: None,
             focus_requested: false,
         })
@@ -527,6 +588,78 @@ impl Terminal {
 
         let painter = ui.painter_at(rect);
 
+        // 滚动：滚轮一格几行、滚动条拖到哪，都在这里落进 display_offset，
+        // 下面才开始照着新的偏移量画，所以同一帧就见效。
+        let history = self.term.grid().history_size();
+        let wheel = ui.input(|i| {
+            let mut lines = 0.0f32;
+            for event in &i.events {
+                if let egui::Event::MouseWheel { unit, delta, .. } = event {
+                    lines += wheel_delta_lines(*unit, delta.y, rows);
+                }
+            }
+            lines
+        });
+        let mut scroll_to: Option<usize> = None;
+        if resp.hovered() && wheel != 0.0 {
+            let (steps, rest) = take_lines(self.scroll_acc + wheel);
+            self.scroll_acc = rest;
+            if steps != 0 {
+                let cur = self.term.grid().display_offset() as i32;
+                scroll_to = Some((cur + steps).clamp(0, history as i32) as usize);
+            }
+        }
+
+        // 滚动条：只在真有回滚历史时出现
+        let track = (history > 0).then(|| {
+            Rect::from_min_max(
+                egui::pos2(rect.right() - SB_HIT_W, rect.top()),
+                egui::pos2(rect.right(), rect.bottom()),
+            )
+        });
+        // 这一下按没按在滚动条上：按了就不该顺手清掉选区
+        let mut bar_press = false;
+        if let Some(t) = track {
+            let cur = self.term.grid().display_offset();
+            let thumb = thumb_rect(t, history, cur, rows);
+            let thumb_h = thumb.height();
+            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                if t.contains(pos) && resp.drag_started() {
+                    // 按在滑块上就记住手指落在滑块的哪一节，拖动时不跳；
+                    // 按在轨道别处则把滑块中心挪到手指下面
+                    self.sb_grab = Some(if thumb.contains(pos) {
+                        pos.y - thumb.top()
+                    } else {
+                        thumb_h * 0.5
+                    });
+                    bar_press = true;
+                } else if resp.clicked() && t.contains(pos) && !thumb.contains(pos) {
+                    // 单点轨道：滚到那一段。点在滑块上就不动，免得跳半格
+                    scroll_to = Some(offset_from_thumb_top(
+                        t,
+                        history,
+                        thumb_h,
+                        pos.y - thumb_h * 0.5,
+                    ));
+                    bar_press = true;
+                }
+            }
+            if let Some(grab) = self.sb_grab {
+                if ui.input(|i| !i.pointer.button_down(egui::PointerButton::Primary)) {
+                    self.sb_grab = None;
+                } else if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                    bar_press = true;
+                    scroll_to = Some(offset_from_thumb_top(t, history, thumb_h, pos.y - grab));
+                }
+            }
+        }
+        if let Some(to) = scroll_to {
+            let cur = self.term.grid().display_offset() as i32;
+            if to as i32 != cur {
+                self.term.scroll_display(Scroll::Delta(to as i32 - cur));
+            }
+        }
+
         let display_offset = self.term.renderable_content().display_offset;
         let grid = self.term.grid();
         let topmost = grid.topmost_line().0;
@@ -544,14 +677,17 @@ impl Terminal {
             }
         };
 
-        if resp.clicked() {
+        if resp.clicked() && !bar_press {
             self.selection = None;
         } else if resp.drag_started() {
             if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                let p = point_at(pos);
-                self.selection = Some(Selection { anchor: p, end: p });
+                // 按在滚动条上那一下是拿来拖滑块的，不开选区
+                if !bar_press {
+                    let p = point_at(pos);
+                    self.selection = Some(Selection { anchor: p, end: p });
+                }
             }
-        } else if resp.dragged() {
+        } else if resp.dragged() && !bar_press {
             if let (Some(pos), Some(sel)) = (
                 ui.input(|i| i.pointer.interact_pos()),
                 self.selection.as_mut(),
@@ -724,17 +860,27 @@ impl Terminal {
             }
         }
 
-        // 滚动
-        if resp.hovered() {
-            let delta = ui.input(|i| i.smooth_scroll_delta.y);
-            if delta != 0.0 {
-                self.scroll_acc += delta;
-                let steps = (self.scroll_acc / 30.0) as i32;
-                if steps != 0 {
-                    self.scroll_acc -= steps as f32 * 30.0;
-                    self.term.scroll_display(Scroll::Delta(steps));
-                }
+        // 滚动条画在文字和光标之上：有回滚历史就一直在，指针靠过去才垫一层轨道底色
+        if let Some(t) = track {
+            let thumb = thumb_rect(t, history, display_offset, rows);
+            let dragging = self.sb_grab.is_some();
+            let over = dragging
+                || ui.input(|i| i.pointer.hover_pos().is_some_and(|p| t.contains(p)));
+            if over {
+                let track_bg = if dark {
+                    Color32::from_rgba_unmultiplied(255, 255, 255, 14)
+                } else {
+                    Color32::from_rgba_unmultiplied(0, 0, 0, 12)
+                };
+                painter.rect_filled(t, 0.0, track_bg);
             }
+            let alpha = if over { 205 } else { 120 };
+            let thumb_bg = if dark {
+                Color32::from_rgba_unmultiplied(178, 186, 198, alpha)
+            } else {
+                Color32::from_rgba_unmultiplied(88, 98, 112, alpha)
+            };
+            painter.rect_filled(thumb, SB_BAR_W * 0.5, thumb_bg);
         }
 
         // 键盘输入：只在有焦点时接管，并把文本类事件从队列里摘掉，
@@ -1255,5 +1401,108 @@ mod tests {
             end: SelPoint { line: 0, col: 1 },
         };
         assert!(extract_selection(term.grid(), dims.cols, selection).is_none());
+    }
+
+    /// 屏幕上现在看得见的那几行文字。
+    fn visible_lines(term: &Term<Listener>, rows: usize, cols: usize) -> Vec<String> {
+        let offset = term.grid().display_offset();
+        (0..rows)
+            .map(|row| {
+                let line = &term.grid()[Line(row as i32 - offset as i32)];
+                (0..cols)
+                    .map(|col| {
+                        let c = line[Column(col)].c;
+                        if c == '\0' { ' ' } else { c }
+                    })
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// 滚轮一格 3 行；触控板按像素折算；页单位按屏幕行数。
+    /// 正值是「往回滚」，和 Windows 上滚轮向上报正值对上。
+    #[test]
+    fn wheel_units_become_lines() {
+        let line = egui::MouseWheelUnit::Line;
+        let point = egui::MouseWheelUnit::Point;
+        let page = egui::MouseWheelUnit::Page;
+        assert_eq!(wheel_delta_lines(line, 1.0, 28), 3.0);
+        assert_eq!(wheel_delta_lines(line, -2.0, 28), -6.0);
+        assert_eq!(wheel_delta_lines(point, 28.0, 28), 2.0);
+        assert_eq!(wheel_delta_lines(point, -7.0, 28), -0.5);
+        assert_eq!(wheel_delta_lines(page, 1.0, 28), 28.0);
+    }
+
+    /// 凑不满一行的零头要攒着：高分辨率滚轮一格只有 0.2，
+    /// 直接截断就永远滚不动。
+    #[test]
+    fn partial_wheel_notches_accumulate() {
+        // 数值都取二进制精确的，免得拿 f32 舍入当断言
+        assert_eq!(take_lines(2.25), (2, 0.25));
+        assert_eq!(take_lines(-2.25), (-2, -0.25));
+        assert_eq!(take_lines(0.5), (0, 0.5));
+        assert_eq!(take_lines(0.75 + 0.25), (1, 0.0));
+    }
+
+    /// 滚动方向和 alacritty 的 display_offset 约定对齐：正 delta 往回滚历史。
+    /// 这条一旦反过来，滚轮就会变成「想往上翻却往下跑」。
+    #[test]
+    fn positive_scroll_goes_back_in_history() {
+        let mut feed = String::new();
+        for i in 0..12 {
+            feed.push_str(&format!("line{i}\r\n"));
+        }
+        let (mut term, dims) = term_with(&feed);
+        assert!(term.grid().history_size() > 0, "喂了 12 行却没有回滚历史");
+
+        let at_bottom = visible_lines(&term, dims.rows, dims.cols);
+        term.scroll_display(Scroll::Delta(2));
+        assert_eq!(term.grid().display_offset(), 2);
+        let scrolled = visible_lines(&term, dims.rows, dims.cols);
+        // 往回滚两行，原来顶上的那行应该掉到第 3 格上
+        assert_eq!(scrolled[2], at_bottom[0]);
+        assert_ne!(scrolled[0], at_bottom[0]);
+
+        term.scroll_display(Scroll::Delta(-2));
+        assert_eq!(visible_lines(&term, dims.rows, dims.cols), at_bottom);
+    }
+
+    /// 滑块位置 ↔ 回滚行数互为反函数，否则拖起来会一跳一跳。
+    #[test]
+    fn scrollbar_maps_both_ways() {
+        let track = Rect::from_min_max(egui::pos2(100.0, 0.0), egui::pos2(112.0, 400.0));
+        let history = 300usize;
+        let rows = 28usize;
+        for offset in [0usize, 7, 150, history] {
+            let thumb = thumb_rect(track, history, offset, rows);
+            assert!(
+                thumb.top() >= track.top() - 0.01 && thumb.bottom() <= track.bottom() + 0.01,
+                "滑块跑出轨道了：{thumb:?}"
+            );
+            let back = offset_from_thumb_top(track, history, thumb.height(), thumb.top());
+            assert!(back.abs_diff(offset) <= 1, "{offset} 绕一圈变成 {back}");
+        }
+        // 轨道顶 = 回滚到底，轨道底 = 最新输出
+        assert_eq!(thumb_rect(track, history, history, rows).top(), track.top());
+        assert_eq!(
+            thumb_rect(track, history, 0, rows).bottom(),
+            track.bottom(),
+            "最新输出时滑块该贴着轨道底"
+        );
+    }
+
+    /// 滑块长度按「可见行 / 总行」算，两端都要兜住。
+    #[test]
+    fn scrollbar_thumb_size() {
+        let track = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(12.0, 400.0));
+        // 没有回滚历史（轨道本来就不显示）时滑块铺满整条轨道
+        assert_eq!(thumb_rect(track, 0, 0, 28).height(), track.height());
+        // 历史很长时也要留一块点得到的地方
+        assert!(thumb_rect(track, 100_000, 0, 28).height() >= SB_MIN_THUMB);
+        // 常规比例：28 行可见 / 128 行总共
+        let h = thumb_rect(track, 100, 0, 28).height();
+        assert!((h - track.height() * 28.0 / 128.0).abs() < 0.01, "{h}");
     }
 }

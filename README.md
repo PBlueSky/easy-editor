@@ -32,7 +32,7 @@ cargo run -- src\app.rs                 # 启动并打开文件
 
 ```bash
 cargo check                             # 只做类型检查，最快
-cargo test                              # 94 个单元测试（面板树 / 快捷键 / 日志块解析 / 格式化 / 标题栏配色 / 图标构图 / 无头界面行为）
+cargo test                              # 105 个单元测试（面板树 / 快捷键 / 日志块解析 / 格式化 / 标题栏配色 / 图标构图 / 终端滚动 / 无头界面行为）
 cargo build                             # 调试构建 → target\debug\easy-editor.exe
 cargo build --release                   # 发布构建 → target\release\easy-editor.exe
 ```
@@ -99,6 +99,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/render-icon.ps1
 
 新建对话框弹出后输入框立刻拿到键盘焦点，可以直接敲文件名：`Enter` 创建、`Esc` 取消，不需要先用鼠标点一下输入框。
 
+拼音 / 日文这类输入法也能正常打：对话框和「快速打开」只在输入框**没焦点**时才 `request_focus`（egui 的 `request_focus` 会顺手打断输入法组字，每帧无脑调用会让拼音候选串刚出来就被清空），而且组字期间的 `Enter` / `Esc` 归输入法（确认候选词 / 撤销组字），不会误当成「创建文件」。判定集中在 `src/ime.rs`，快速打开的上下键同样让位给候选词翻页。
+
 配色跟 shell 里 `ls --color` 一个思路，一眼能分清类型：
 
 | 类型 | 浅色主题 | 深色主题 |
@@ -122,6 +124,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/render-icon.ps1
 - 右键菜单里也有「复制」「粘贴」，`Ctrl+Insert` / `Shift+Insert` 同样可用
 
 选区按绝对行坐标记录，滚动回滚历史后仍然指向原来的文字；复制中文等宽字符时不会把占位格算进去，行尾空白会裁掉。
+
+回滚历史的滚动：鼠标滚轮**一格 3 行**（走的是原始滚轮事件，不是 egui 那套按像素平滑的滚动，触控板按 14 px 一行折算，`Page` 单位一整屏），不再是要狂拨好几下才挪一行。只要有过期的输出（`history_size > 0`），面板右缘就有一条悬浮滚动条：拖滑块、单点轨道任意位置直接跳过去、滚轮都能用；滑块高度按可见行占总行数的比例算，最短 24 pt 保证还能抓得住。它画在文字之上、不占排版宽度，按住滚动条的那一下不会被当成「清空选区」。
 
 自动探测不一定找得到（比如 Git Bash 没进 PATH）。工具栏的 `⚙` 按钮打开「终端设置」，给当前选中的 shell 单独指定**程序路径**和**启动参数**，留空就回到自动探测 / 内置参数，改动直接写进 `config.json`：
 

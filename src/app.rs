@@ -11,6 +11,7 @@ use crate::editor::{self, OpenFile, PendingEdit};
 use crate::filetree::{self, FileTree, TreeAction};
 use crate::find::FindState;
 use crate::format;
+use crate::ime;
 use crate::journal;
 use crate::keymap::{self, Keymap};
 use crate::nav::{CaretHistory, NavPoint};
@@ -2948,20 +2949,25 @@ impl EasyEditorApp {
                         .hint_text("输入文件名，回车打开")
                         .desired_width(f32::INFINITY),
                 );
-                resp.request_focus();
+                // 每帧无条件 request_focus 会把输入法组字打断，中文填不进来（见 src/ime.rs）
+                ime::focus_input_box(&resp);
                 if resp.changed() {
                     query_changed = true;
                 }
-                if ui.input(|i| i.key_pressed(Key::Escape)) {
-                    close = true;
+                // 组字期间方向键在选候选词、回车在确认候选，都归输入法，别当成界面操作
+                let mut enter = false;
+                if !ime::composing(ui) {
+                    if ui.input(|i| i.key_pressed(Key::Escape)) {
+                        close = true;
+                    }
+                    if ui.input(|i| i.key_pressed(Key::ArrowDown)) {
+                        state.sel = (state.sel + 1).min(state.matches.len().saturating_sub(1));
+                    }
+                    if ui.input(|i| i.key_pressed(Key::ArrowUp)) {
+                        state.sel = state.sel.saturating_sub(1);
+                    }
+                    enter = ui.input(|i| i.key_pressed(Key::Enter));
                 }
-                if ui.input(|i| i.key_pressed(Key::ArrowDown)) {
-                    state.sel = (state.sel + 1).min(state.matches.len().saturating_sub(1));
-                }
-                if ui.input(|i| i.key_pressed(Key::ArrowUp)) {
-                    state.sel = state.sel.saturating_sub(1);
-                }
-                let enter = ui.input(|i| i.key_pressed(Key::Enter));
                 ui.separator();
 
                 egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
@@ -4946,5 +4952,111 @@ mod tests {
         // egui 的缩放复位键（本应用没绑定）也该被关掉，别留下半放大的界面
         press_key(&mut app, &ctx, Key::Num0, ctrl);
         assert_eq!(ctx.zoom_factor(), 1.0, "Ctrl+0 动了整窗缩放");
+    }
+
+    /// 输入法组字能不能活过对话框刷新的每一帧。
+    ///
+    /// 之前输入框每帧无条件 `request_focus()`，egui 把
+    /// `should_interrupt_composition` 置真发给后端，winit 当场取消合成，
+    /// 拼音还没挑完候选词就被清空，中文永远填不进「新建文件/文件夹」。
+    #[test]
+    fn new_file_dialog_survives_ime_composition() {
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-ime-test", "a\n");
+        let out = frame(&mut app, &ctx, vec![]);
+        let row = find_text(&out, "a.txt")
+            .expect("文件树里没画出 a.txt")
+            .center();
+        open_new_dialog(&mut app, &ctx, row);
+
+        // 拿到焦点的那一帧 egui 还没有光标 range，输入法要到下一帧才申请
+        let out = frame(&mut app, &ctx, vec![]);
+        let ime = out
+            .platform_output
+            .ime
+            .expect("输入框拿到焦点后没向系统申请输入法");
+        assert!(
+            !ime.should_interrupt_composition,
+            "对话框还在每帧打断输入法组字"
+        );
+
+        // 打「ceshi」出候选串，再空跑几帧：真人打输入法的速度比一帧慢得多，
+        // 组字期间应用照样会刷好几帧，每一帧都不能打断
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "测试".into(),
+                active_range_chars: Some(0..2),
+            })],
+        );
+        assert_eq!(
+            app.tree.as_ref().unwrap().new_name,
+            "测试",
+            "输入法候选串没进新建对话框"
+        );
+        for _ in 0..3 {
+            let out = frame(&mut app, &ctx, vec![]);
+            let ime = out
+                .platform_output
+                .ime
+                .expect("组字途中输入法申请被撤掉了");
+            assert!(
+                !ime.should_interrupt_composition,
+                "组字途中被打断，候选串会被清空"
+            );
+        }
+
+        // 挑定候选词：提交后回车才该建文件
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Ime(egui::ImeEvent::Commit("测试".into()))],
+        );
+        assert_eq!(app.tree.as_ref().unwrap().new_name, "测试");
+        frame(&mut app, &ctx, vec![key_press(Key::Enter, Modifiers::NONE)]);
+        assert!(dir.join("测试").is_file(), "输入法提交的中文名没能建出文件");
+    }
+
+    /// 候选串还挂在输入框里时，同一帧进来的回车是给输入法的，不是「创建」。
+    #[test]
+    fn enter_during_composition_does_not_create_file() {
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-ime-enter-test", "a\n");
+        let out = frame(&mut app, &ctx, vec![]);
+        let row = find_text(&out, "a.txt")
+            .expect("文件树里没画出 a.txt")
+            .center();
+        open_new_dialog(&mut app, &ctx, row);
+        frame(&mut app, &ctx, vec![]);
+
+        let out = frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "测试".into(),
+                    active_range_chars: Some(0..2),
+                }),
+                key_press(Key::Enter, Modifiers::NONE),
+            ],
+        );
+        assert_eq!(
+            app.tree.as_ref().unwrap().new_name,
+            "测试",
+            "前置条件不成立：候选串没进框"
+        );
+        assert!(
+            find_text(&out, "新建文件").is_some(),
+            "组字里的回车把对话框当「创建」关掉了"
+        );
+        assert!(!dir.join("测试").exists(), "组字中的回车提前建了文件");
+
+        // 提交候选词之后的回车才真的建文件
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Ime(egui::ImeEvent::Commit("测试".into()))],
+        );
+        frame(&mut app, &ctx, vec![key_press(Key::Enter, Modifiers::NONE)]);
+        assert!(dir.join("测试").is_file(), "提交之后的回车没能建文件");
     }
 }

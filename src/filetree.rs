@@ -7,6 +7,7 @@ use eframe::egui::{self, Align2, Color32, FontId, Rect, RichText, Sense, Ui, Vec
 use walkdir::WalkDir;
 
 use crate::format;
+use crate::ime;
 
 /// 遍历搜索时跳过的重型 / 版本控制目录。
 const SKIP_DIRS: [&str; 9] = [
@@ -553,12 +554,16 @@ impl FileTree {
                         .hint_text(if is_dir { "文件夹名称" } else { "文件名，如 main.rs" })
                         .desired_width(300.0),
                 );
-                resp.request_focus();
-                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    close = true;
-                }
-                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    create = true;
+                // 每帧无条件 request_focus 会把输入法组字打断，中文填不进来（见 src/ime.rs）
+                ime::focus_input_box(&resp);
+                // 组字期间的回车/Esc 是输入法在用（确认候选词 / 撤销组字），别当成建文件
+                if !ime::composing(ui) {
+                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        close = true;
+                    }
+                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        create = true;
+                    }
                 }
                 ui.horizontal(|ui| {
                     if ui.button("创建").clicked() {
