@@ -5059,4 +5059,119 @@ mod tests {
         frame(&mut app, &ctx, vec![key_press(Key::Enter, Modifiers::NONE)]);
         assert!(dir.join("测试").is_file(), "提交之后的回车没能建文件");
     }
+
+    /// Ctrl+J 插日志块时，长文档不能因为排版表对不上被甩回文件顶部。
+    ///
+    /// 折行的文件里一个逻辑行占好几视觉行，跳转只能查刚排好的那张表；
+    /// 表还没重建就去量行数，就只能按「行号 × 行高」粗算，能差出上百行。
+    #[test]
+    fn journal_insert_keeps_the_view_on_wrapped_lines() {
+        let long = "一二三四五六七八九十".repeat(12);
+        let body: String = (1..=300).map(|i| format!("L{i} {long}\n")).collect();
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-journal-wrap", "seed\n");
+        std::fs::write(dir.join("j.txt"), &body).unwrap();
+        app.open_file(dir.join("j.txt"), None);
+        app.word_wrap = true;
+
+        let mut t = 1.0;
+        let mut next = |app: &mut EasyEditorApp, ctx: &egui::Context, n: usize| {
+            let mut out = None;
+            for _ in 0..n {
+                out = Some(frame_time(app, ctx, t, vec![]));
+                t += 0.1;
+            }
+            out.unwrap()
+        };
+
+        // 先把光标送到第 200 行并滚过去
+        let byte = line_start_offset(&app.tabs[0].text, 200);
+        app.tabs[0].caret_byte = byte;
+        app.tabs[0].pending_jump = Some(byte);
+        let pane = {
+            let _ = next(&mut app, &ctx, 2);
+            app.pane_layout
+                .pane_rect(app.panes.focus().unwrap())
+                .unwrap()
+        };
+        let from = {
+            let out = next(&mut app, &ctx, 20);
+            let first = gutter(&out, pane)
+                .first()
+                .expect("跳转后一行号都没画出来")
+                .0
+                .clone();
+            first.parse::<usize>().expect("行号不是数字")
+        };
+        assert!(from > 150, "跳到第 200 行没滚到位：从第 {from} 行开始");
+
+        app.insert_journal_block();
+        let out = next(&mut app, &ctx, 20);
+        let to = gutter(&out, pane)
+            .first()
+            .expect("插入后一行号都没画出来")
+            .0
+            .parse::<usize>()
+            .expect("行号不是数字");
+        assert!(
+            to.abs_diff(from) <= 20,
+            "插完日志块视图被甩走了：第 {from} 行 -> 第 {to} 行"
+        );
+        assert!(
+            app.tabs[0].line > 190,
+            "光标跟着视图一起跑了：第 {} 行",
+            app.tabs[0].line
+        );
+    }
+
+    /// 不折行的长行：按住左键拖到视口右边缘，正文要自己往左走，选区跟着往右长。
+    ///
+    /// egui 的选区只跟着指针走，指针又出不了视口，所以一超出屏幕就圈不到外面的字。
+    #[test]
+    fn dragging_to_the_viewport_edge_auto_scrolls_horizontally() {
+        let long = "abcdefghij".repeat(60);
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-edgedrag", "seed\n");
+        std::fs::write(dir.join("e.txt"), format!("{long}\nlast\n")).unwrap();
+        app.open_file(dir.join("e.txt"), None);
+        app.word_wrap = false;
+
+        let pane = {
+            frame(&mut app, &ctx, vec![]);
+            app.pane_layout
+                .pane_rect(app.panes.focus().unwrap())
+                .unwrap()
+        };
+        // 正文只有两行高，指针得落在字上才按得到 TextEdit
+        let before = {
+            let out = frame(&mut app, &ctx, vec![]);
+            body(&out, 'a').expect("正文没画出来")
+        };
+        let start = egui::pos2(before.left() + 120.0, before.top() + 10.0);
+        frame(
+            &mut app,
+            &ctx,
+            pointer(start, egui::PointerButton::Primary, true),
+        );
+        frame(&mut app, &ctx, vec![]);
+        let col0 = app.tabs[0].col;
+
+        // 停在右边缘上不动：指针不发事件也得接着滚，所以每帧补一个 move
+        let edge = egui::pos2(pane.right() - 3.0, start.y);
+        let mut out = frame(&mut app, &ctx, vec![egui::Event::PointerMoved(edge)]);
+        for _ in 0..10 {
+            out = frame(&mut app, &ctx, vec![egui::Event::PointerMoved(edge)]);
+        }
+
+        let after = body(&out, 'a').expect("滚动后正文没画出来");
+        assert!(
+            after.left() < before.left() - 40.0,
+            "拖到右边缘没自动横向滚动：{:.0} -> {:.0}",
+            before.left(),
+            after.left()
+        );
+        assert!(
+            app.tabs[0].col > col0 + 5,
+            "滚过去了但选区没跟着长：第 {col0} 列 -> 第 {} 列",
+            app.tabs[0].col
+        );
+    }
 }

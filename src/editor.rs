@@ -4,8 +4,11 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use eframe::egui::text::{LayoutJob, TextFormat};
-use eframe::egui::{self, Color32, FontId, Galley, Rect, ScrollArea, Sense, TextEdit, Ui, Vec2};
+use eframe::egui::epaint::text::Row;
+use eframe::egui::text::{CCursor, LayoutJob, TextFormat};
+use eframe::egui::{
+    self, pos2, Color32, FontId, Galley, Rect, ScrollArea, Sense, TextEdit, Ui, Vec2,
+};
 use unicode_width::UnicodeWidthChar as _;
 
 use crate::syntax::{Highlighter, LineSpans};
@@ -336,6 +339,14 @@ pub fn show(
         return show_large(ui, file, font_size, dark, pane);
     }
 
+    // 外部编辑（插入日志块 / 替换）先落地，再量行数。
+    // 顺序反了的话，这一帧的行数还是旧文本的，而排版表已经按新文本排好了，
+    // 两边对不上，跳转只能退回「行号 × 行高」的粗算——折行的文件里能差出上百行，
+    // 插完日志块就被甩回文件上面去。
+    if let Some(edit) = file.pending_edit.take() {
+        file.apply_edit(edit);
+    }
+
     let line_count = file.line_count().max(1);
     let font_id = FontId::monospace(font_size);
     // 与 theme 保持一致的固定行高，避免中英文混排时行高抖动
@@ -379,11 +390,6 @@ pub fn show(
 
     let scroll_id = ui.make_persistent_id(("editor_scroll", pane, file.path.clone()));
     let edit_id = ui.make_persistent_id(("editor_text", pane, file.path.clone()));
-
-    // 外部编辑（插入日志块 / 替换）
-    if let Some(edit) = file.pending_edit.take() {
-        file.apply_edit(edit);
-    }
 
     // 外部跳转：设置光标位置并滚动到对应行。
     // 注意首帧 TextEdit 还没有 state，此时不能把 pending_jump 丢掉，
@@ -499,6 +505,11 @@ pub fn show(
                 .layouter(&mut layouter);
 
             let response = ui.add(editor);
+
+            // 按住左拖到视口左右边缘时把内容横向推过去，不然选区永远圈不出屏幕。
+            if !wrap {
+                auto_scroll_x(ui, &response);
+            }
 
             // TextEdit 的 response.rect 已经是去掉 margin 的文字区，
             // 不能再加 4.0，否则行号/当前行底色会比文字低 4pt。
@@ -748,6 +759,36 @@ pub fn human_size(bytes: usize) -> String {
     }
 }
 
+/// 拖选靠近视口左右边缘时自动横向滚动。
+///
+/// egui 的选区只跟着指针走，而指针出不了视口，所以长行一超出屏幕就没法继续往外面圈。
+/// 这里在按住不放且指针贴边时逐帧推一格，并且主动要下一帧——指针停在边上是不发事件的。
+fn auto_scroll_x(ui: &Ui, response: &egui::Response) {
+    /// 离边缘多近开始滚（pt）
+    const EDGE: f32 = 28.0;
+    /// 每帧滚多少（pt）
+    const STEP: f32 = 14.0;
+
+    if !response.is_pointer_button_down_on() {
+        return;
+    }
+    let Some(pos) = ui.input(|i| i.pointer.interact_pos()) else {
+        return;
+    };
+    let clip = ui.clip_rect();
+    // 已经滚到头就别再刷帧了：正文右缘抵着视口右缘时，没有东西可以再滚出来
+    let dx = if pos.x >= clip.right() - EDGE && response.rect.right() > clip.right() + STEP {
+        -STEP
+    } else if pos.x <= clip.left() + EDGE && response.rect.left() < clip.left() - STEP {
+        STEP
+    } else {
+        return;
+    };
+    // scroll_with_delta 给的是「内容往哪儿挪」，符号和偏移量是反的
+    ui.scroll_with_delta_animation(Vec2::new(dx, 0.0), egui::style::ScrollAnimation::none());
+    ui.ctx().request_repaint();
+}
+
 fn build_galley(
     ui: &Ui,
     text: &str,
@@ -774,8 +815,6 @@ fn build_galley(
 
     let total_lines = text.split('\n').count();
     let mut line_start = 0usize;
-    // 着色区间按起点升序，用游标推进避免逐行扫描
-    let mut seg_cursor = 0usize;
 
     // 等宽字体里 ASCII 一格约 0.55em，而 CJK 字形按 1em 排，中文只占 1.82 格，
     // 后面的英文列就会整体前移。给每个双宽字符补一点前导空白，让它正好占两格；
@@ -790,57 +829,27 @@ fn build_galley(
 
     for (i, line) in text.split('\n').enumerate() {
         let line_end = line_start + line.len();
-        while seg_cursor < overlay.len() && overlay[seg_cursor].1 <= line_start {
-            seg_cursor += 1;
-        }
 
         match spans.get(i) {
             Some(parts) if !parts.is_empty() => {
                 let mut offset = line_start;
                 for (color, piece) in parts {
-                    let piece_start = offset;
-                    let piece_end = offset + piece.len();
-                    offset = piece_end;
-                    append_segments(
-                        &mut job,
-                        piece,
-                        piece_start,
-                        piece_end,
-                        *color,
-                        &base,
-                        overlay,
-                        seg_cursor,
-                        wide_pad,
-                    );
+                    append_piece(&mut job, piece, &colored(&base, *color), wide_pad);
+                    offset += piece.len();
                 }
                 // 高亮结果可能丢掉了行尾空白，补齐保证行宽正确
                 if offset < line_end {
-                    append_segments(
+                    append_piece(
                         &mut job,
                         &text[offset..line_end],
-                        offset,
-                        line_end,
-                        fallback,
-                        &base,
-                        overlay,
-                        seg_cursor,
+                        &colored(&base, fallback),
                         wide_pad,
                     );
                 }
             }
             _ => {
                 if !line.is_empty() {
-                    append_segments(
-                        &mut job,
-                        line,
-                        line_start,
-                        line_end,
-                        fallback,
-                        &base,
-                        overlay,
-                        seg_cursor,
-                        wide_pad,
-                    );
+                    append_piece(&mut job, line, &colored(&base, fallback), wide_pad);
                 }
             }
         }
@@ -851,73 +860,125 @@ fn build_galley(
         line_start = line_end + 1;
     }
 
-    ui.fonts_mut(|f| f.layout_job(job))
+    let mut galley = ui.fonts_mut(|f| f.layout_job(job));
+    paint_overlay(&mut galley, text, overlay);
+    galley
 }
 
-/// 把 `piece`（原文里 `[piece_start, piece_end)` 这一段）按着色区间切开写进 job。
-#[allow(clippy::too_many_arguments)]
-fn append_segments(
-    job: &mut LayoutJob,
-    piece: &str,
-    piece_start: usize,
-    piece_end: usize,
-    color: Color32,
-    base: &TextFormat,
-    overlay: &[Seg],
-    cursor: usize,
-    wide_pad: f32,
-) {
-    // 找出与本片段相交的所有着色区间
-    let mut local: Vec<(usize, usize, Color32)> = Vec::new();
-    let mut idx = cursor;
-    while idx < overlay.len() {
-        let (ms, me, bg) = overlay[idx];
-        if ms >= piece_end {
-            break;
-        }
-        if me > piece_start {
-            let a = ms.max(piece_start) - piece_start;
-            let b = me.min(piece_end) - piece_start;
-            local.push((a, b, bg));
-        }
-        idx += 1;
-    }
+fn colored(base: &TextFormat, color: Color32) -> TextFormat {
+    let mut f = base.clone();
+    f.color = color;
+    f
+}
 
-    if local.is_empty() {
-        let mut f = base.clone();
-        f.color = color;
-        append_piece(job, piece, &f, wide_pad);
+/// 把命中底色画进每一行的字形网格里。
+///
+/// 不用 `TextFormat::background`：egui 那个矩形是「基线减主字体 ascent」往下数一个
+/// 行高，而我们的行高是硬指定的，主字体（Consolas）又比中文矮一截。实测 14 号字，
+/// 英文行底色比正文低 0.9pt，中文行直接低 4.9pt——高亮整条压在下一行头上。
+/// 自己按视觉行画就没有这个问题，次序上也和 egui 的选区一样排在字形之前，不会盖字。
+fn paint_overlay(galley: &mut Arc<Galley>, text: &str, overlay: &[Seg]) {
+    let ranges = char_ranges(text, overlay);
+    if ranges.is_empty() {
         return;
     }
+    let galley = Arc::make_mut(galley);
+    for (from, to, color) in ranges {
+        let min = galley.layout_from_cursor(CCursor::new(from));
+        let max = galley.layout_from_cursor(CCursor::new(to));
+        for ri in min.row..=max.row {
+            let placed = &mut galley.rows[ri];
+            let row = Arc::make_mut(&mut placed.row);
+            // 中间几行是被折出来的，整行都要上色
+            let left = if ri == min.row {
+                row.x_offset(min.column)
+            } else {
+                0.0
+            };
+            let right = if ri == max.row {
+                row.x_offset(max.column)
+            } else {
+                row.size.x
+            };
+            let y = row.size.y;
+            if right <= left || y <= 0.0 {
+                continue;
+            }
+            insert_rect(row, Rect::from_min_max(pos2(left, 0.0), pos2(right, y)), color);
+        }
+    }
+}
 
-    // 按区间边界切分，保证 UTF-8 边界安全；区间起点相同则保持插入次序，
-    // 于是先入队的查找命中会赢过选词高亮，后一段只补没覆盖到的部分。
-    // 着色区间来自上一帧的查找/选区，文本可能已经变了，偏移要先夹回并落到字符边界上。
-    local.sort_by_key(|x| x.0);
-    let mut pos = 0usize;
-    for (a, b, bg) in local {
-        let a = snap_up(piece, a);
-        let b = snap_down(piece, b);
-        if a > pos {
-            let mut f = base.clone();
-            f.color = color;
-            append_piece(job, &piece[pos..a], &f, wide_pad);
-        }
-        let s = a.max(pos);
-        let e = b.min(piece.len());
-        if s < e {
-            let mut f = base.clone();
-            f.color = color;
-            f.background = bg;
-            append_piece(job, &piece[s..e], &f, wide_pad);
-        }
-        pos = pos.max(e);
+/// 往一行的网格里插一个底色矩形，插在最靠前的字形三角形之前，这样它压在文字底下。
+fn insert_rect(row: &mut Row, rect: Rect, color: Color32) {
+    let mesh = &mut row.visuals.mesh;
+    let start = row.visuals.glyph_index_start;
+    let before = mesh.indices.len();
+    mesh.add_colored_rect(rect, color);
+    if mesh.indices.len() != before + 6 {
+        // 不是「一个矩形 6 个索引」的网格（换了 epaint 版本才会这样），放弃这块底色
+        return;
     }
-    if pos < piece.len() {
-        let mut f = base.clone();
-        f.color = color;
-        append_piece(job, &piece[pos..], &f, wide_pad);
+    let tri: Vec<u32> = mesh.indices[before..before + 6].to_vec();
+
+    for i in (start..before).rev() {
+        mesh.indices.swap(i, i + 6);
     }
+    mesh.indices[start..start + 6].clone_from_slice(&tri);
+    row.visuals.mesh_bounds = mesh.calc_bounds();
+}
+
+/// 字节区间 -> 字符区间：epaint 的游标数的是字符，不是字节。
+///
+/// 端点先夹回字符边界（区间来自上一帧，文本可能已经变了），再一遍扫描全文换算，
+/// 避免每个命中都从头数一遍字符。
+fn char_ranges(text: &str, overlay: &[Seg]) -> Vec<(usize, usize, Color32)> {
+    let mut clipped: Vec<(usize, usize, Color32)> = Vec::with_capacity(overlay.len());
+    let mut marks: Vec<usize> = Vec::with_capacity(overlay.len() * 2);
+    for &(a, b, color) in overlay {
+        let (a, b) = (snap_up(text, a), snap_down(text, b));
+        if a >= b {
+            continue;
+        }
+        clipped.push((a, b, color));
+        marks.push(a);
+        marks.push(b);
+    }
+    if clipped.is_empty() {
+        return Vec::new();
+    }
+    marks.sort_unstable();
+    marks.dedup();
+    let offsets = char_offsets(text, &marks);
+    let at = |byte: usize| -> usize {
+        marks
+            .binary_search(&byte)
+            .map(|k| offsets[k])
+            .unwrap_or_default()
+    };
+    clipped
+        .into_iter()
+        .map(|(a, b, color)| (at(a), at(b), color))
+        .collect()
+}
+
+/// `marks` 里每个字节位置对应的字符下标（调用方保证都已落在字符边界上）。
+fn char_offsets(text: &str, marks: &[usize]) -> Vec<usize> {
+    let mut out = vec![0usize; marks.len()];
+    let mut k = 0usize;
+    let mut chars = 0usize;
+    for (byte, _) in text.char_indices() {
+        while k < marks.len() && marks[k] <= byte {
+            out[k] = chars;
+            k += 1;
+        }
+        chars += 1;
+    }
+    // 剩下的都是 text.len() 这类「文末」位置
+    for slot in out.iter_mut().skip(k) {
+        *slot = chars;
+    }
+    out
 }
 
 /// 写入一段文本。含双宽字符时把它们各自切成一段并补前导空白，
@@ -975,6 +1036,95 @@ pub fn cursor_text(file: &OpenFile) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 查找/选词高亮的底色必须严丝合缝盖住自己那一视觉行。
+    ///
+    /// 以前用 `TextFormat::background`，egui 那个矩形是从「基线减去主字体 ascent」
+    /// 往下数一个行高，行高又是我们硬指定的：实测 14 号字英文行低 0.9pt，中文行低
+    /// 4.9pt，整条底色压在下一行头上。改成自己往行网格里插矩形之后，矩形就该正好是
+    /// `[0, 行高]`——旧实现里根本不会在网格里出现这块颜色，所以断言能挡住回归。
+    #[test]
+    fn overlay_highlight_covers_exactly_its_visual_row() {
+        let ctx = egui::Context::default();
+        let bg = Color32::from_rgb(9, 8, 7);
+        let text = "aaa find aaa\n中文 查找 命中\n";
+        let overlay = vec![
+            (4usize, 8usize, bg),
+            (text.find("查找").unwrap(), text.find("查找").unwrap() + "查找".len(), bg),
+        ];
+        let font_id = FontId::monospace(14.0);
+        let line_height = theme::mono_row_height(14.0, 1.0);
+
+        let mut captured: Option<Arc<Galley>> = None;
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            ..Default::default()
+        };
+        let mut out = ctx.run_pass(raw, |ctx| {
+            ctx.root_ui(|ui| {
+                captured = Some(build_galley(
+                    ui,
+                    text,
+                    &[],
+                    &overlay,
+                    &font_id,
+                    Color32::LIGHT_GRAY,
+                    line_height,
+                    f32::INFINITY,
+                ));
+            });
+        });
+        // 没有真的渲染器消费字体图集的增量，epaint 会在 drop 时断言
+        out.textures_delta.clear();
+        let galley = captured.expect("跑了一帧就有 galley");
+
+        for (from, to, _) in &overlay {
+            let min = galley.layout_from_cursor(CCursor::new(text[..*from].chars().count()));
+            let max = galley.layout_from_cursor(CCursor::new(text[..*to].chars().count()));
+            assert_eq!(min.row, max.row, "命中不该跨行");
+            let placed = &galley.rows[min.row];
+            let row = &placed.row;
+
+            let hit: Vec<egui::Pos2> = row
+                .visuals
+                .mesh
+                .vertices
+                .iter()
+                .filter(|v| v.color == bg)
+                .map(|v| v.pos)
+                .collect();
+            assert_eq!(hit.len(), 4, "底色矩形的四个角");
+            let left = hit.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+            let right = hit.iter().map(|p| p.x).fold(f32::MIN, f32::max);
+            let top = hit.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+            let bottom = hit.iter().map(|p| p.y).fold(f32::MIN, f32::max);
+
+            // 行内坐标：上沿贴着行顶，下沿正好一个行高
+            assert!(top.abs() < 0.01, "底色顶边偏了 {top}");
+            assert!((bottom - row.size.y).abs() < 0.01, "底色底边偏了");
+            assert!(
+                (left - row.x_offset(min.column)).abs() < 0.01,
+                "底色左边偏了 {left}"
+            );
+            assert!(
+                (right - row.x_offset(max.column)).abs() < 0.01,
+                "底色右边偏了 {right}"
+            );
+
+            // 排在字形三角形之前，才不会盖住文字
+            let idx = &row.visuals.mesh.indices;
+            let start = row.visuals.glyph_index_start;
+            let corners = row.visuals.mesh.vertices.len() - 4;
+            assert!(
+                idx[start..start + 6].iter().all(|i| *i as usize >= corners),
+                "底色没有画在字形底下"
+            );
+            assert!(
+                row.visuals.mesh_bounds.top() <= 0.01,
+                "mesh_bounds 把底色裁掉了"
+            );
+        }
+    }
 
     #[test]
     fn whole_word_selection_matches_whole_words() {
