@@ -13,6 +13,22 @@ pub(crate) fn composing(ui: &egui::Ui) -> bool {
     })
 }
 
+/// 鼠标按住的那几帧，把这一帧的输入法锚点撤掉。
+///
+/// egui 在拖选的每一帧都会对已聚焦的 TextEdit 调 `request_focus`，而
+/// `request_focus` 会顺带置位「打断组字」；egui-winit 看到它就
+/// `set_ime_allowed(false)` 紧跟 `set_ime_allowed(true)`，等于一帧一次把
+/// 输入法上下文从窗口卸下再挂回来，输入法图标跟着一闪一闪。
+///
+/// 按住鼠标这段时间本来也不打字，锚点干脆不给：整段拖动只剩「卸下 / 挂回」
+/// 各一次，松手那一帧锚点自己就回来了。
+pub(crate) fn hide_ime_anchor_while_pointer_held(ctx: &egui::Context) {
+    if !ctx.input(|i| i.pointer.any_down()) {
+        return;
+    }
+    ctx.output_mut(|o| o.ime = None);
+}
+
 /// 给浮层输入框要焦点，只在它确实没焦点时要。
 ///
 /// `Response::request_focus` 会顺带打断输入法组字（egui 的

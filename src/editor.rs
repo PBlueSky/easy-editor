@@ -395,6 +395,8 @@ pub fn show(
     // 注意首帧 TextEdit 还没有 state，此时不能把 pending_jump 丢掉，
     // 否则「查找跳到首个匹配」这类刚打开就发起的跳转会静默失效。
     let mut jump_line: Option<usize> = None;
+    // 焦点要等 TextEdit 自己 interact 完再要：见下面 `want_focus` 的注释。
+    let mut want_focus = false;
     if let Some(byte) = file.pending_jump {
         let byte = byte.min(file.text.len());
         let char_idx = byte_to_char_index(&file.text, byte);
@@ -407,9 +409,7 @@ pub fn show(
             file.caret_byte = byte;
             jump_line = Some(file.line_of_byte(byte));
             // 查找时不能抢焦点，否则用户打第二个字符就被弹回编辑器
-            if !std::mem::take(&mut file.jump_without_focus) {
-                ui.memory_mut(|m| m.request_focus(edit_id));
-            }
+            want_focus = !std::mem::take(&mut file.jump_without_focus);
         }
     }
 
@@ -427,7 +427,7 @@ pub fn show(
                 egui::text::CCursor::new(ca),
             )));
             state.store(ui.ctx(), edit_id);
-            ui.memory_mut(|m| m.request_focus(edit_id));
+            want_focus = true;
             file.pending_select = None;
         }
     }
@@ -505,6 +505,15 @@ pub fn show(
                 .layouter(&mut layouter);
 
             let response = ui.add(editor);
+
+            // 焦点只能在 TextEdit 自己 interact 之后再要。
+            // 点顶栏「日志块」这类按钮时，这一帧既有鼠标点击、鼠标又不在正文上，
+            // egui 的 interact 会对「点了别处」的那个已聚焦控件 surrender_focus；
+            // 在 add 之前要来的焦点会被它当场抹掉，表现为插完块光标不见了、字也打不了。
+            // 已经有焦点就不要再要：`request_focus` 顺带打断输入法组字。
+            if want_focus && !ui.memory(|m| m.has_focus(edit_id)) {
+                ui.memory_mut(|m| m.request_focus(edit_id));
+            }
 
             // 按住左拖到视口左右边缘时把内容横向推过去，不然选区永远圈不出屏幕。
             if !wrap {

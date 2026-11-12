@@ -3394,6 +3394,9 @@ impl EasyEditorApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
 
+        // 输入法锚点要最后处理：前面画完才知道这一帧谁拿到了锚点
+        ime::hide_ime_anchor_while_pointer_held(&ctx);
+
         self.sync_config();
     }
 }
@@ -5172,6 +5175,110 @@ mod tests {
             app.tabs[0].col > col0 + 5,
             "滚过去了但选区没跟着长：第 {col0} 列 -> 第 {} 列",
             app.tabs[0].col
+        );
+    }
+
+    #[test]
+    fn toolbar_journal_button_keeps_caret_and_focus() {
+        // 点顶栏「日志块」的那一帧：有鼠标点击、鼠标又不在正文上。
+        // egui 会对「点了别处」的已聚焦控件 surrender_focus，
+        // 早于 TextEdit::interact 要来的焦点会被当场抹掉，表现为插完块光标没了、字也打不了。
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-journal-click", "seed\n");
+        std::fs::write(dir.join("j.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        app.open_file(dir.join("j.txt"), None);
+        let _ = frame(&mut app, &ctx, vec![]);
+        let out = frame(&mut app, &ctx, vec![]);
+        let pane = app
+            .pane_layout
+            .pane_rect(app.panes.focus().unwrap())
+            .unwrap();
+        let row2 = gutter(&out, pane)
+            .into_iter()
+            .find(|(s, _)| s == "2")
+            .map(|(_, r)| r.center())
+            .expect("行号 2 没找到");
+        let spot = egui::pos2(pane.min.x + 150.0, row2.y);
+        let _ = frame(&mut app, &ctx, pointer(spot, egui::PointerButton::Primary, true));
+        let _ = frame(&mut app, &ctx, pointer(spot, egui::PointerButton::Primary, false));
+        let _ = frame(&mut app, &ctx, vec![]);
+        let focus_before = ctx.memory(|m| m.focused());
+        assert!(focus_before.is_some(), "点正文后编辑器没拿到焦点");
+
+        let out = frame(&mut app, &ctx, vec![]);
+        let btn = find_text(&out, "日志块")
+            .expect("顶栏「日志块」按钮没画出来")
+            .center();
+        let _ = frame(&mut app, &ctx, pointer(btn, egui::PointerButton::Primary, true));
+        let _ = frame(&mut app, &ctx, pointer(btn, egui::PointerButton::Primary, false));
+        for _ in 0..4 {
+            let _ = frame(&mut app, &ctx, vec![]);
+        }
+
+        let text = app.tabs[0].text.clone();
+        let new_row = text
+            .lines()
+            .position(|l| l.trim() == "1、")
+            .expect("没有新建出「1、」任务行");
+        assert_eq!(app.tabs[0].line, new_row + 1, "光标没停在新任务行上");
+        assert_eq!(
+            app.tabs[0].caret_byte,
+            line_start_offset(&text, new_row + 1) + "1、".len(),
+            "光标没停在新任务行末尾：{text:?}"
+        );
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            focus_before,
+            "点顶栏按钮后编辑器焦点被抢走了，中文输入和打字都会失效"
+        );
+    }
+
+    /// 用鼠标拖选正文时，输入法图标不能一帧一闪。
+    ///
+    /// egui 每帧都会对拖选中的 TextEdit 调 `request_focus`，那会顺带置位
+    /// 「打断组字」；后端收到就 `set_ime_allowed(false)`+`(true)`，把输入法
+    /// 上下文一帧一次卸下再挂回，屏幕上就是输入法图标在闪。
+    #[test]
+    fn dragging_a_selection_does_not_thrash_the_ime() {
+        let long = "abcdefghij".repeat(60);
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-ime-drag", "seed\n");
+        std::fs::write(dir.join("d.txt"), format!("{long}\nlast\n")).unwrap();
+        app.open_file(dir.join("d.txt"), None);
+        app.word_wrap = false;
+        frame(&mut app, &ctx, vec![]);
+        let out = frame(&mut app, &ctx, vec![]);
+        let before = body(&out, 'a').expect("正文没画出来");
+        let start = egui::pos2(before.left() + 40.0, before.top() + 10.0);
+        let _ = frame(&mut app, &ctx, pointer(start, egui::PointerButton::Primary, true));
+
+        let mut col_last = app.tabs[0].col;
+        for i in 0..6 {
+            let pos = egui::pos2(start.x + 20.0 * (i as f32 + 1.0), start.y);
+            let out = frame(&mut app, &ctx, vec![egui::Event::PointerMoved(pos)]);
+            if let Some(ime) = &out.platform_output.ime {
+                assert!(
+                    !ime.should_interrupt_composition,
+                    "拖选第 {i} 帧还在打断输入法组字，图标会跟着闪"
+                );
+            }
+            let col = app.tabs[0].col;
+            assert!(
+                col > col_last,
+                "撤掉锚点把拖选也弄坏了：第 {col_last} 列 -> 第 {col} 列"
+            );
+            col_last = col;
+        }
+
+        // 松手后锚点必须自己回来，否则中文输入法就再也挂不上这个窗口了
+        let end = egui::pos2(start.x + 160.0, start.y);
+        let _ = frame(&mut app, &ctx, pointer(end, egui::PointerButton::Primary, false));
+        let out = frame(&mut app, &ctx, vec![]);
+        let ime = out
+            .platform_output
+            .ime
+            .expect("松手后没把输入法锚点还回来");
+        assert!(
+            !ime.should_interrupt_composition,
+            "拖选结束那一帧还在打断输入法"
         );
     }
 }

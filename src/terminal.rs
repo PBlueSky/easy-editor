@@ -531,6 +531,7 @@ impl Terminal {
     /// 直接向终端写入文本（供自检与「运行命令」使用）。
     pub fn send_text(&mut self, text: &str) {
         self.write(text.as_bytes());
+        snap_to_bottom(&mut self.term);
     }
 
     /// 取出当前选区覆盖的文字（按屏幕顺序，行尾空格裁掉）。
@@ -858,6 +859,25 @@ impl Terminal {
                     cursor_color.gamma_multiply(0.75),
                 );
             }
+
+            // 光标格同时也是输入法锚点。不报给系统的话，winit 压根不把输入法
+            // 上下文关联到这个窗口，中文输入直接退化成一个个原始拼音字母。
+            // 滚回历史时光标在屏幕外，锚点就钉回可视区，别顺手把输入法卸了。
+            let anchor = Rect::from_min_size(
+                egui::pos2(
+                    rect.left() + col.clamp(0.0, cols as f32 - 1.0) * char_w,
+                    rect.top() + row.clamp(0.0, rows as f32 - 1.0) * row_h,
+                ),
+                Vec2::new(char_w, row_h),
+            );
+            ui.output_mut(|o| {
+                o.ime = Some(egui::output::IMEOutput {
+                    purpose: egui::IMEPurpose::Terminal,
+                    rect,
+                    cursor_rect: anchor,
+                    should_interrupt_composition: false,
+                })
+            });
         }
 
         // 滚动条画在文字和光标之上：有回滚历史就一直在，指针靠过去才垫一层轨道底色
@@ -922,12 +942,20 @@ impl Terminal {
                             typed = true;
                             false
                         }
+                        // 输入法挑定候选词后整串递交过来，直接写进 PTY。
+                        // 组字中的 Preedit 原样留在队列里，候选窗由系统自己画。
+                        egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
+                            out.extend_from_slice(text.as_bytes());
+                            typed = true;
+                            false
+                        }
                         _ => true,
                     }
                 });
             });
             if typed {
                 self.selection = None;
+                snap_to_bottom(&mut self.term);
             }
             if copy {
                 match self.selection_text() {
@@ -951,6 +979,17 @@ impl Terminal {
                 Color32::from_rgb(200, 120, 120),
             );
         }
+    }
+}
+
+/// 用户一往 PTY 里写东西，就把视口拉回最新一行。
+///
+/// alacritty 在 `display_offset > 0` 时会把屏幕钉在回滚历史里：新输出全进滚动
+/// 缓冲，可视区一个字都不动。不主动归位的话，翻过历史的人会发现屏幕上一直杵着
+/// 旧内容，敲了命令也不消失。
+fn snap_to_bottom(term: &mut Term<Listener>) {
+    if term.grid().display_offset() != 0 {
+        term.scroll_display(Scroll::Bottom);
     }
 }
 
@@ -1504,5 +1543,125 @@ mod tests {
         // 常规比例：28 行可见 / 128 行总共
         let h = thumb_rect(track, 100, 0, 28).height();
         assert!((h - track.height() * 28.0 / 128.0).abs() < 0.01, "{h}");
+    }
+
+    /// 终端的中文输入要起真实 shell 才算验证过，所以默认忽略：
+    /// `cargo test -- --ignored --nocapture pty_terminal`
+    ///
+    /// 两件事：向系统报出光标格当输入法锚点（不报窗口就不关联输入法，
+    /// 打进去的只剩原始拼音字母），以及把候选词提交的那一整串写进 PTY。
+    #[test]
+    #[ignore = "要起真实 PTY 进程，手动跑：cargo test -- --ignored --nocapture pty_terminal"]
+    fn pty_terminal_publishes_ime_anchor_and_routes_commit() {
+        let mut panel = TerminalPanel::new(std::env::temp_dir(), TerminalSettings::default());
+        panel.shell = ShellKind::Cmd;
+        let term_id = panel.create().unwrap();
+        let wait = |ms: u64| std::thread::sleep(std::time::Duration::from_millis(ms));
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let draw = |panel: &mut TerminalPanel, events: Vec<egui::Event>| -> egui::FullOutput {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(900.0, 500.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_pass(raw, |ctx| {
+                ctx.root_ui(|ui| {
+                    panel.get_mut(term_id).unwrap().focus_requested = true;
+                    panel.ui_leaf(ui, term_id, 14.0, true);
+                });
+            });
+            // 没有渲染器消费字体图集的增量，epaint 会在 drop 时断言
+            out.textures_delta.clear();
+            out
+        };
+
+        wait(1500);
+        panel.pump();
+        // 第一帧只是要焦点，`has_focus` 要下一帧才为真
+        let _ = draw(&mut panel, vec![]);
+        let out = draw(&mut panel, vec![]);
+        let ime = out.platform_output.ime.expect("终端没向系统报输入法锚点");
+        assert_eq!(ime.purpose, egui::IMEPurpose::Terminal);
+        assert!(ime.cursor_rect.is_positive(), "锚点格子面积为空：{ime:?}");
+
+        // 提交给 PTY 的中文会被 shell 回显到屏幕上
+        let _ = draw(
+            &mut panel,
+            vec![egui::Event::Ime(egui::ImeEvent::Commit("中文".into()))],
+        );
+        wait(800);
+        panel.pump();
+        let out = draw(&mut panel, vec![]);
+        assert!(
+            out.platform_output.ime.is_some(),
+            "提交中文后输入法锚点反而没了"
+        );
+        let t = panel.get_mut(term_id).unwrap();
+        // 宽字符占两格，第二格是空的占位格，拼回一行时得把它剔掉
+        let screen = visible_lines(&t.term, t.dims.rows, t.dims.cols);
+        let flat: String = screen.iter().flat_map(|l| l.chars().filter(|c| *c != ' ')).collect();
+        assert!(
+            flat.contains("中文"),
+            "输入法提交的中文没写进 PTY，屏幕是：{screen:?}"
+        );
+
+        // 先攒出回滚历史，才有「钉在历史里」这回事。
+        // 前面提交的「中文」还挂在命令行上，先回车把它清掉再发命令。
+        panel.send_text(term_id, "\rfor /L %i in (1,1,60) do @echo L%i\r");
+        wait(1500);
+        panel.pump();
+        let _ = draw(&mut panel, vec![]);
+        let scrolled = {
+            let t = panel.get_mut(term_id).unwrap();
+            t.term.scroll_display(Scroll::Delta(3));
+            t.term.grid().display_offset()
+        };
+        assert_ne!(scrolled, 0, "没能滚回历史，后面没法验");
+        let _ = draw(&mut panel, vec![key_event(egui::Key::Enter)]);
+        let offset = panel.get_mut(term_id).unwrap().term.grid().display_offset();
+        assert_eq!(offset, 0, "敲了键盘却还钉在历史里，屏幕上一直是不动的旧内容");
+
+        panel.remove(term_id);
+    }
+
+    fn key_event(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn typing_snaps_the_pinned_view_back_to_the_bottom() {
+        let (mut term, dims) = term_with("A1\r\nA2\r\nA3\r\nA4\r\nA5\r\n");
+        term.scroll_display(Scroll::Delta(2));
+        let pinned = visible_lines(&term, dims.rows, dims.cols);
+        assert_ne!(term.grid().display_offset(), 0, "没能滚回历史");
+
+        // alacritty 会钉屏：新输出只进滚动缓冲，可视区不动
+        let mut p: Processor = Processor::new();
+        p.advance(&mut term, b"B1\r\nB2\r\nB3\r\n");
+        assert_eq!(
+            visible_lines(&term, dims.rows, dims.cols),
+            pinned,
+            "alacritty 的钉屏行为变了，这个测试的前提不成立了"
+        );
+
+        snap_to_bottom(&mut term);
+        assert_eq!(term.grid().display_offset(), 0, "归位后 display_offset 没清零");
+        let after = visible_lines(&term, dims.rows, dims.cols);
+        assert_ne!(after, pinned, "归位后屏幕上还是旧的那几行");
+        assert!(
+            after.iter().any(|l| l.trim_end() == "B3"),
+            "归位后没看到最新输出：{after:?}"
+        );
     }
 }
