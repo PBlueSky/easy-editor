@@ -32,7 +32,7 @@ cargo run -- src\app.rs                 # 启动并打开文件
 
 ```bash
 cargo check                             # 只做类型检查，最快
-cargo test                              # 108 个单元测试（面板树 / 快捷键 / 日志块解析 / 格式化 / 标题栏配色 / 图标构图 / 终端滚动 / 高亮底色对齐 / 边缘自动横向滚动 / 无头界面行为）
+cargo test                              # 111 个单元测试（面板树 / 快捷键 / 日志块解析 / 格式化 / 标题栏配色 / 图标构图 / 终端滚动 / 高亮底色对齐 / 边缘自动横向滚动 / 输入法锚点 / 无头界面行为）
 cargo build                             # 调试构建 → target\debug\easy-editor.exe
 cargo build --release                   # 发布构建 → target\release\easy-editor.exe
 ```
@@ -45,10 +45,10 @@ cargo build --release                   # 发布构建 → target\release\easy-e
 mkdir -p dist/EasyEditor
 cp target/release/easy-editor.exe dist/EasyEditor/EasyEditor.exe   # 和窗口标题保持一致
 cp README.md LICENSE dist/EasyEditor/
-powershell -NoProfile -Command "Compress-Archive -Path dist\EasyEditor -DestinationPath dist\EasyEditor-0.2.0-windows-x64.zip -Force"
+powershell -NoProfile -Command "Compress-Archive -Path dist\EasyEditor -DestinationPath dist\EasyEditor-0.2.1-windows-x64.zip -Force"
 ```
 
-产物 `dist/EasyEditor-0.2.0-windows-x64.zip` 约 4.5 MB（解压后单 exe 约 11 MB）。
+产物 `dist/EasyEditor-0.2.1-windows-x64.zip` 约 4.5 MB（解压后单 exe 约 11 MB）。
 带 `rg.exe` 的那档把 `rg.exe` 和 `THIRD-PARTY-NOTICES.txt` 也放进 `dist\EasyEditor\` 再压一次，
 后缀写 `-with-rg`。两个包各配一份 `.sha256.txt`。
 别用 `tar -a -cf xxx.zip`：Git Bash 里那个 `tar` 是 GNU tar，`-a` 只认 gzip/bzip2/xz，
