@@ -1487,9 +1487,7 @@ impl EasyEditorApp {
                     match self.verify_stage {
                         0 => {
                             // 打开第一个文件
-                            let p = std::path::PathBuf::from(
-                                "C:/Users/blues/AppData/Local/Temp/ee-split/data.json",
-                            );
+                            let p = std::env::temp_dir().join("ee-split").join("data.json");
                             self.open_file(p, None);
                         }
                         1 => {
@@ -1503,9 +1501,7 @@ impl EasyEditorApp {
                         }
                         2 => {
                             // 在新面板里打开第二个文件
-                            let p = std::path::PathBuf::from(
-                                "C:/Users/blues/AppData/Local/Temp/ee-split/data.xml",
-                            );
+                            let p = std::env::temp_dir().join("ee-split").join("data.xml");
                             self.open_file(p, None);
                             let shown: Vec<Option<usize>> = self
                                 .panes
@@ -1596,9 +1592,7 @@ impl EasyEditorApp {
                     match self.verify_stage {
                         0 => {
                             // id 既独立出现 3 次，也藏在 width 里两次
-                            let dir = std::path::PathBuf::from(
-                                "C:/Users/blues/AppData/Local/Temp/ee-word",
-                            );
+                            let dir = std::env::temp_dir().join("ee-word");
                             let _ = std::fs::create_dir_all(&dir);
                             let p = dir.join("sample.rs");
                             let _ = std::fs::write(
@@ -1649,9 +1643,7 @@ impl EasyEditorApp {
                 if self.verify_stage < STAGES.len() && ms >= STAGES[self.verify_stage] {
                     match self.verify_stage {
                         0 => {
-                            let dir = std::path::PathBuf::from(
-                                "C:/Users/blues/AppData/Local/Temp/ee-new",
-                            );
+                            let dir = std::env::temp_dir().join("ee-new");
                             let _ = std::fs::create_dir_all(&dir);
                             let _ = std::fs::write(dir.join("a.txt"), "a\n");
                             self.open_workspace(dir);
