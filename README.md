@@ -1,5 +1,7 @@
 # EasyEditor
 
+**中文** | [English](README.en-US.md)
+
 一个用 **Rust + egui** 写的 Windows 桌面编辑器。功能不多，但每一样都能天天用：文件树、多终端、递归分屏、文本内工作日志块、光标位置前后跳转、全局搜索、查找替换、语法高亮，快捷键全部可改。
 
 **当前版本** v0.2.2 ｜ **平台** Windows 10 / 11 x64 ｜ **许可** MIT
@@ -46,7 +48,7 @@
 
 | 包 | 内容 | 适合谁 |
 |---|---|---|
-| `EasyEditor-<版本>-windows-x64.zip` | 单 exe + README + LICENSE | 大多数人 |
+| `EasyEditor-<版本>-windows-x64.zip` | 单 exe + 中英两份 README + LICENSE | 大多数人 |
 | `EasyEditor-<版本>-windows-x64-with-rg.zip` | 上面这些，外加 `rg.exe` 和 `THIRD-PARTY-NOTICES.txt` | 想要全局搜索跑满速 |
 
 两个包都能用：没带 `rg.exe` 时全局搜索自动回退到内置扫描，只是大仓里慢一些。每个包旁边有同名 `.sha256.txt`，校验一下：
@@ -323,7 +325,7 @@ cargo run -- src\app.rs                 # 启动并打开某个文件
 
 ## 代码结构
 
-约 12800 行 Rust，单个 binary crate，17 个模块：
+约 13200 行 Rust，单个 binary crate，17 个模块：
 
 | 文件 | 职责 |
 |---|---|
@@ -372,7 +374,7 @@ cargo test -- --ignored --nocapture     # 附带一个真起 cmd.exe PTY 的终�
 ```bash
 mkdir -p dist/EasyEditor
 cp target/release/easy-editor.exe dist/EasyEditor/EasyEditor.exe   # 和窗口标题保持一致
-cp README.md LICENSE dist/EasyEditor/
+cp README.md README.en-US.md LICENSE dist/EasyEditor/
 powershell -NoProfile -Command "Compress-Archive -Path dist\EasyEditor -DestinationPath dist\EasyEditor-0.2.2-windows-x64.zip -Force"
 ```
 
