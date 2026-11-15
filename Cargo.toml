@@ -25,6 +25,15 @@ regex = "1"
 memchr = "2"
 unicode-width = "0.2"
 
+# SQL 块执行用。特意选 mysql 而不是 sqlx：sqlx 拖着 tokio，而这个程序里所有并发
+# 都是 std::thread + mpsc，为一个同步调用引入整套异步运行时不值当。
+# 关掉默认的 derive（会拉进 frunk 那套过程宏）。压缩后端用纯 Rust 的：
+# `minimal` 走 flate2/zlib，要求构建机器上有 C 工具链和 cmake，别人 clone 下来就编不动了。
+mysql = { version = "28", default-features = false, features = [
+    "buffer-pool",
+    "minimal-rust",
+] }
+
 # 取主窗口的 HWND，用来把系统标题栏刷成当前主题（见 src/titlebar.rs）
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"
