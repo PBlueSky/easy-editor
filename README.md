@@ -2,11 +2,11 @@
 
 **English** | [中文](README.zh-CN.md)
 
-A Windows desktop editor written in **Rust + egui**. It does not have many features — it has the ones you use every day: file tree, multiple terminals, recursive split panes, journal blocks inside plain text files, cursor position back/forward, project-wide search, find and replace, syntax highlighting, and every keybinding is yours to change.
+A Windows desktop editor written in **Rust + egui**. It does not have many features — it has the ones you use every day: file tree, multiple terminals, recursive split panes, journal blocks inside plain text files, SQL blocks that run against MySQL with the results sitting right under the text, cursor position back/forward, project-wide search, find and replace, syntax highlighting, and every keybinding is yours to change.
 
-**Current version** v0.2.2 | **Platform** Windows 10 / 11 x64 | **License** MIT
+**Current version** v0.3.0 | **Platform** Windows 10 / 11 x64 | **License** MIT
 
-The release package is a **single exe** (about 11 MB, 4.7 MB zipped). No .NET, no Electron, no runtime of any kind.
+The release package is a **single exe** (about 12 MB, 5.2 MB zipped). No .NET, no Electron, no runtime of any kind.
 
 ## Table of contents
 
@@ -29,6 +29,9 @@ The release package is a **single exe** (about 11 MB, 4.7 MB zipped). No .NET, n
 | Multiple terminals | Real PTYs via `portable-pty`, VT parsing via `alacritty_terminal`; open several and let each run its own thing | [Terminal](#terminal) |
 | Recursive split panes | The tmux / i3 binary pane tree — split as deep as you like, default keys match Windows Terminal | [Split panes](#split-panes) |
 | Journal blocks | Task blocks written directly into ordinary text files, mixed with prose and versioned with git | [Journal blocks](#journal-blocks) |
+| SQL blocks | Jupyter-style: the query lives in a plain text file, `Ctrl+Enter` runs it and the result lands below the editor | [SQL blocks](#sql-blocks) |
+| Multiple results at once | One panel per statement, so a broken second query does not throw away the first result; pop a panel out into its own window, export it as CSV | [Results dock](#results-dock) |
+| MySQL connections | Named connections in `config.json`, browsed as connection → database → table, passwords via `env:` so no secret sits on disk | [Connections](#connections) |
 | Cursor position history | Like IDEA's Navigate Back / Forward; a position only counts as a stop after the cursor sits there for 350 ms | [Cursor position history](#cursor-position-history) |
 | Find and replace | Case sensitivity, regex, all matches highlighted, hands stay in the input box | [Find and replace](#find-and-replace) |
 | Project-wide search | Streams `rg --json` first, falls back to a built-in byte-level scanner when ripgrep is absent | [Project-wide search](#project-wide-search) |
@@ -54,7 +57,7 @@ Grab one of the packages from the [Releases](https://github.com/PBlueSky/easy-ed
 Both packages work: without `rg.exe`, project-wide search silently falls back to the built-in scanner — a bit slower on large repos. Each package ships with a matching `.sha256.txt`; verify it:
 
 ```powershell
-Get-FileHash .\EasyEditor-0.2.2-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\EasyEditor-0.3.0-windows-x64.zip -Algorithm SHA256
 ```
 
 ### Run from source
@@ -86,14 +89,15 @@ With no arguments, the startup folder is chosen by: **command-line argument > cu
 ┌──────────────── Top toolbar (wraps to a second row when it runs out of room) ─────────┐
 ├──────────┬──────────────────── Centre: pane tree (recursively splittable) ───────────┤
 │ Sidebar  │  Tab strip + editor / terminal panes…                                      │
-│ Files    │                                                                            │
+│ Files    ├──────────────────── Bottom: results dock (SQL) ────────────────────────────┤
 │ Search   ├──────────────────── Bottom: status bar + find/replace bar ─────────────────┤
 │ Journal  │                                                                            │
+│ Database │                                                                            │
 └──────────┴───────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Top toolbar**, left to right: `Open folder` `Save` `←` `→` (cursor history back / forward) `New file` `New folder` `Sidebar` `Wrap` `Terminal` `+Terminal` `‖ Split` `═ Split` `Quick open` `Project search` `Find` `Journal block`. The right-hand group is `Dark` / `Light` (theme), `?` (keybinding settings), the `shell:` dropdown, `⚙` (terminal settings), font size `- 14 +`, and the workspace name.
-- **Sidebar** has three tabs: `Files` (the tree), `Search` (project-wide results), `Journal` (blocks in the current file). `Ctrl+B` shows or hides it.
+- **Top toolbar**, left to right: `Open folder` `Save` `←` `→` (cursor history back / forward) `New file` `New folder` `Sidebar` `Wrap` `Terminal` `+Terminal` `‖ Split` `═ Split` `Quick open` `Project search` `Find` `Journal block` `Database`. The `Database` entry is a dropdown (`insert SQL block` / `run SQL` / `results dock` / `connection manager…` / `sidebar database tree`) — that is the only new button the whole database feature costs. The right-hand group is `Dark` / `Light` (theme), `?` (keybinding settings), the `shell:` dropdown, `⚙` (terminal settings), font size `- 14 +`, and the workspace name.
+- **Sidebar** has four tabs: `Files` (the tree), `Search` (project-wide results), `Journal` (blocks in the current file), `Database` (connections → databases → tables → columns). `Ctrl+B` shows or hides it.
 - Narrow the window until one row no longer fits and the remaining buttons wrap onto a second row — they never squash together and text is never overdrawn. The right-hand group still anchors right-to-left after wrapping. A workspace name that is too long gets truncated; hover it for the full path.
 
 ### File tree
@@ -172,6 +176,75 @@ The header is 51 `=` characters + title + space + `YYYY-MM-DD HH:MM` + space + `
 - `Ctrl+Alt+↑` / `Ctrl+Alt+↓` jump between blocks
 - `Ctrl+Alt+D` toggles the current block between `[待处理]` (open) and `[已完成]` (done)
 - The sidebar's `Journal` tab lists every block in the current file; click one to jump
+
+### SQL blocks
+
+The same convention applied to queries, so a saved piece of SQL is still just a text file. The header is a legal MySQL comment, which means the whole file can be piped into the `mysql` client unchanged:
+
+```text
+-- sql 活跃用户 2026-11-15 14:03 [待执行] conn=demo
+SELECT id, name FROM users
+WHERE status = 1
+LIMIT 50;
+```
+
+Header = `-- sql` + title + `YYYY-MM-DD HH:MM` + `[status]` + tail keys. Two tail keys are recognised today: `conn=<name>` binds the block to a named connection, and a bare `auto` allows automatic execution. Anything unrecognised in the tail is ignored, so adding a field later cannot break old files.
+
+- `Ctrl+Shift+J` (or `Database ▸ Insert SQL block`) drops a block at the cursor, already carrying today's date / time and the default connection
+- `Ctrl+Enter` runs **the selection if there is one, otherwise the whole block the cursor is in**. The status bar says how many statements were handed over
+- Statements are split by a scanner that knows `'…'`, `"…"`, `` `…` ``, `--`, `#` and `/* … */`, so a semicolon inside a string or a comment does not cut a statement in half; the same scanner produces both the panel titles and the byte spans, which is why the two can never disagree
+- Once every statement of a **whole-block** run is back, the header status is rewritten `[待执行]` → `[已执行]` / `[失败]` (pending → done / failed). Running a selection deliberately leaves the block status alone — a piece of the block finishing is not the block finishing
+- A statement that the server rejects gets a translucent red background **in the file itself**, so you can see which one to fix instead of counting panels. The span is validated against the text before it is painted (a mark whose bytes no longer match that statement is dropped rather than placed somewhere wrong), it slides along when the header write-back shortens the block, and typing clears it
+- `Ctrl+Shift+R` shows or hides the results dock; `Database ▸ Results dock (n)` does the same
+
+### Results dock
+
+**One statement, one panel**, and several panels stay on screen at once. That is deliberate: in a block with three `SELECT`s where the second one is broken, the first result is still worth reading, so it is not thrown away with the error. Statements queued behind a failure are marked `未执行` ("not run") instead of spinning forever, and the dock keeps the last 6 panels — the oldest are evicted.
+
+- Each panel header carries `回块` (jump back to the block it came from), `放大` / `收起` (put *this* result into its own resizable window — the way to read a wide table that the bottom strip cannot stretch to fit), `导出` (CSV), `关掉整块` (close every panel of this submission) and `✕`; clicking the header row itself collapses just that panel
+- The dock bar has `全部收起 / 全部展开`, `清空` (closes finished panels and keeps the ones still waiting for a reply) and `关闭`
+- A query prints `connection · N 行 · M ms` above a scrollable grid — the dock gives it 120 pt, the popped-out window gives it whatever it asks for. Writes print `影响 N 行` plus the last insert id and the warning count when MySQL reports them
+- More than 1000 rows are cut off on purpose and labelled `（截断）`: a forgotten `LIMIT` on a big table should not pin a thread and a few hundred megabytes to a side panel. A read-only statement also carries a 30 s server-side cap and connections a 5 s TCP timeout, so a typo in the host field does not hang for two minutes
+
+`导出` writes RFC 4180 CSV: CRLF line endings, fields containing `,` `"` CR or LF quoted with inner quotes doubled, `NULL` as an empty field, BLOBs as lowercase hex, and a UTF-8 BOM so Excel reads Chinese correctly. Fields that Excel would *execute* — a leading `=`, `@` or tab, or `+` / `-` followed by anything that is not a number — get a `'` prefix deliberately; real negative numbers are left numeric. The file name comes from the block title (illegal characters replaced), falling back to `result_<id>.csv`.
+
+### Auto-execution
+
+Put `auto` in the header and stop typing: 700 ms after the last keystroke the block runs by itself, which is the Jupyter part of the brief. Three gates keep it from biting:
+
+- only blocks explicitly marked `auto`, and **only when every statement in the body is read-only** — `INSERT` / `UPDATE` / `DELETE` / `DROP` and friends never run themselves, whatever the header says
+- one body runs once: the pair (block, text) is remembered, so you have to change the SQL to get another pass; there is no polling loop
+- nothing new is submitted while the dock is still waiting for replies, so a slow server cannot stack batches
+
+Writes still need a human `Ctrl+Enter`.
+
+### Connections
+
+Everything database-related hangs off the single `Database` dropdown in the toolbar — inserting and running blocks, the results dock, the connection manager and the sidebar tree.
+
+**`Database ▸ Connection manager…`** (window title 数据库连接) lists every saved connection: `新建` to add, click a row to edit it, `删除` to drop it, and `测试连接` in the form to really open the server and read back its version. Renaming clears the cached tree and the worker thread of both the old and the new name and keeps the default marker on the renamed connection — but a block still written `conn=旧名` does **not** follow, so edit the header too. A connection is `name` / `kind` / `host` / `port` / `user` / `password` / `database`, and it is stored verbatim in `config.json`:
+
+```json
+{
+  "db_connections": [
+    {
+      "name": "demo",
+      "kind": "mysql",
+      "host": "127.0.0.1",
+      "port": 3306,
+      "user": "root",
+      "password": "env:DEMO_PW",
+      "database": "shop"
+    }
+  ]
+}
+```
+
+`password` accepts `env:VAR`, resolved from `VAR` and then from `EASY_EDITOR_VAR` when the connection is actually opened, so the config file does not have to hold the secret. A literal password works too — remember that `config.json` is readable by your Windows account.
+
+**`Database ▸ Sidebar database tree`** opens the `Database` tab: connection → databases → tables, each level fetched lazily the first time you expand it, with a `重试` (retry) button on the row that failed. Clicking a connection row makes it the default, which is where a block with no `conn=` goes. Double-click a table to copy its qualified name; its context menu also copies a ready-made `SELECT * FROM db.table LIMIT 100;`.
+
+**Adding another engine** is meant to be a small change: `src/db/mod.rs` is the engine-agnostic protocol (spec → driver, statements in, events out) and `src/db/mysql.rs` is the only file that knows MySQL. A new database means one `DbKind` variant, one branch in `connect()` and one driver module — the block parser, the results dock and the CSV layer do not change. Everything runs on a background thread per connection and reports through a channel; this program has no async runtime and gets none from this feature.
 
 ### Terminal
 
@@ -256,6 +329,9 @@ Everything below is the default and everything is rebindable in `F1`.
 | `Ctrl+J` | Insert a journal block |
 | `Ctrl+Alt+↑` / `Ctrl+Alt+↓` | Previous / next journal block |
 | `Ctrl+Alt+D` | Toggle the journal block's done state |
+| `Ctrl+Shift+J` | Insert a SQL block at the cursor |
+| `Ctrl+Enter` | Run the selected statement, or the whole block the cursor is in |
+| `Ctrl+Shift+R` | Show / hide the results dock |
 | `` Ctrl+` `` | Focus a terminal pane, opening one if needed |
 | `` Ctrl+Shift+` `` | New terminal pane |
 | `Ctrl+B` | Show / hide the sidebar |
@@ -282,7 +358,7 @@ Everything below is the default and everything is rebindable in `F1`.
 
 ## Configuration
 
-Font size, theme, sidebar visibility, active sidebar tab, hidden-file visibility, word wrap, last workspace, terminal preferences and your keybinding changes are stored automatically in `%APPDATA%\easy-editor\config.json` and restored on the next start. Fields that are not written fall back to defaults (`word_wrap: false`, i.e. long lines scroll sideways). Writes are debounced by 600 ms (so dragging the font size does not hammer the disk) and flushed once more on exit.
+Font size, theme, sidebar visibility, active sidebar tab, hidden-file visibility, word wrap, last workspace, terminal preferences, database connections and your keybinding changes are stored automatically in `%APPDATA%\easy-editor\config.json` and restored on the next start. Fields that are not written fall back to defaults (`word_wrap: false`, i.e. long lines scroll sideways; `db_connections: []`). Writes are debounced by 600 ms (so dragging the font size does not hammer the disk) and flushed once more on exit.
 
 ```json
 {
@@ -313,6 +389,7 @@ Font size, theme, sidebar visibility, active sidebar tab, hidden-file visibility
 | Windowing | `eframe` 0.37 (default wgpu disabled, `glow` backend) |
 | UI | `egui` 0.37 / `egui_extras` 0.37 |
 | Syntax highlighting | `syntect` 5.3 |
+| MySQL client | `mysql` 28, with the default `derive` and C compression backends switched off — every query is a plain synchronous call from a worker thread, so there is no tokio anywhere in this program |
 | File tree | `walkdir` 2.5 |
 | Terminal | `alacritty_terminal` 0.26 + `portable-pty` 0.9 |
 | Project search | External `ripgrep` binary, falling back to `regex` 1 + `memchr` 2 |
@@ -327,12 +404,12 @@ Everything is immediate-mode GUI: no QSS, no CSS, no webview. Widget state lives
 
 ## Code layout
 
-About 13,000 lines of Rust in a single binary crate, 17 modules:
+About 18,800 lines of Rust in a single binary crate, 22 source files:
 
 | File | Responsibility |
 |---|---|
 | `src/main.rs` | Entry point, `windows_subsystem`, window builder and icon |
-| `src/app.rs` | The application itself: layout, keybindings, open/save, project search, find/replace, journal blocks, terminal dispatch |
+| `src/app.rs` | The application itself: layout, keybindings, open/save, project search, find/replace, journal blocks, terminal dispatch, SQL submitting |
 | `src/pane.rs` | tmux-style recursive binary pane tree (`Leaf` / `Split`); layout only, no content |
 | `src/editor.rs` | The editor widget: line numbers + highlighting + editing + jumping + read-only virtual rendering for large files + overlay painting |
 | `src/terminal.rs` | PTY I/O, VT parsing, keyboard/mouse routing, selection and scrollbar |
@@ -340,6 +417,11 @@ About 13,000 lines of Rust in a single binary crate, 17 modules:
 | `src/find.rs` | Find/replace within the current file (match positions are byte offsets) |
 | `src/search.rs` | Project-wide search: ripgrep first, built-in scanner as the fallback |
 | `src/journal.rs` | Journal block parsing and insertion |
+| `src/sql.rs` | SQL block text layer: scan and build blocks, split statements **with byte spans**, decide what is read-only. Touches neither database nor UI |
+| `src/database.rs` | Sidebar `Database` tab and the connection manager window: cached tree, in-flight requests, the connection draft |
+| `src/db/mod.rs` | Engine-agnostic protocol: `ConnectionSpec` → `Driver`, one worker thread per connection, events back out, plus `MockDriver` so the UI is testable without a server |
+| `src/db/mysql.rs` | The only file that knows MySQL: connect options, the text protocol → cells, one statement per call |
+| `src/results.rs` | Results dock: one panel per statement, pop-out window, status write-back, RFC 4180 CSV formatting |
 | `src/nav.rs` | Cursor position history |
 | `src/format.rs` | JSON / XML formatting |
 | `src/keymap.rs` | Configurable keybindings: action ids, serialization, conflict detection |
@@ -355,7 +437,7 @@ About 13,000 lines of Rust in a single binary crate, 17 modules:
 
 ```bash
 cargo check                             # type checking only, fastest
-cargo test                              # 118 unit tests
+cargo test                              # 215 unit tests
 cargo build                             # debug build → target/debug/easy-editor.exe
 cargo build --release                   # release build → target/release/easy-editor.exe
 cargo clippy --all-targets              # requires rustup component add clippy
@@ -364,7 +446,7 @@ cargo fmt --check                       # requires rustup component add rustfmt
 
 Release builds use `windows_subsystem = "windows"` (first line of `src/main.rs`), so double-clicking the exe does not spawn a console.
 
-Tests cover the pane tree, keybinding parsing, journal block parsing, formatting, title bar colours, icon composition, terminal scrolling and selection, highlight background alignment, edge auto-scroll, IME anchors and more. A batch of them are **headless UI tests**: they feed a constructed sequence of input events through `Context::run_pass` and inspect the resulting layers and `PlatformOutput`. No window is ever opened, so the whole suite runs unattended in one go.
+Tests cover the pane tree, keybinding parsing, journal and SQL block parsing, statement splitting, the database protocol and results dock, CSV quoting, formatting, title bar colours, icon composition, terminal scrolling and selection, highlight background alignment, edge auto-scroll, IME anchors and more. A batch of them are **headless UI tests**: they feed a constructed sequence of input events through `Context::run_pass` and inspect the resulting layers and `PlatformOutput`. No window is ever opened, so the whole suite runs unattended in one go. Everything database-related is tested against a `MockDriver`, so `cargo test` needs no MySQL server.
 
 ```bash
 cargo test --bin easy-editor            # this is a binary crate, there is no lib target
@@ -377,7 +459,7 @@ cargo test -- --ignored --nocapture     # one end-to-end terminal test that real
 mkdir -p dist/EasyEditor
 cp target/release/easy-editor.exe dist/EasyEditor/EasyEditor.exe   # keep it identical to the window title
 cp README.md README.zh-CN.md LICENSE dist/EasyEditor/
-powershell -NoProfile -Command "Compress-Archive -Path dist\EasyEditor -DestinationPath dist\EasyEditor-0.2.2-windows-x64.zip -Force"
+powershell -NoProfile -Command "Compress-Archive -Path dist\EasyEditor -DestinationPath dist\EasyEditor-0.3.0-windows-x64.zip -Force"
 ```
 
 For the `-with-rg` variant, drop `rg.exe` and `THIRD-PARTY-NOTICES.txt` into `dist\EasyEditor\` and compress again. Each package gets its own `.sha256.txt`.
@@ -408,6 +490,10 @@ The two icons cover different surfaces:
 - Large files rendered in read-only virtual mode (> 1 MB or > 20,000 lines) neither wrap nor scroll horizontally — widen the pane to see a long line. These files also refuse formatting.
 - Files over 16 MB are refused outright, with a message in the status bar.
 - CJK glyph widths depend on `unicode-width` plus Microsoft YaHei; switch fonts and the baseline alignment parameters (see [CJK baseline](#cjk-baseline)) probably need recomputing.
+- **MySQL is the only engine** that has a driver, and the sidebar tree speaks `SHOW DATABASES` / `SHOW TABLES`. The connection form has no TLS, SSH-tunnel or `init_connect` settings either, so what you get on the wire is whatever the `mysql` crate defaults to.
+- A statement is capped at 1000 rows and the dock at 6 panels; the cap is labelled `（截断）` rather than hidden. `DELIMITER` blocks (stored procedures) are out of scope — the splitter cuts on `;`, so split those by hand.
+- Automatic execution only ever runs blocks marked `auto` **and** read-only; anything that writes needs a deliberate `Ctrl+Enter`.
+- A literal password in `config.json` is readable by anyone with your Windows account — write `env:VAR` instead if that matters.
 - No plugin system, no LSP, no Git integration. Deliberately so: this is an editor someone uses every day, not a platform.
 
 ## Implementation notes
@@ -476,6 +562,14 @@ Executables are decided by extension (`.exe` `.bat` `.cmd` `.com` `.ps1` `.msi` 
 ### Small icon sizes cannot be captured by Chrome directly
 
 Headless Chrome is unreliable at small window sizes: `--window-size=128,128` and `160,160` consistently produce fully transparent output, and `256,256` shifts the whole drawing right and clips it — hand the title bar or taskbar such an image and you get "half an icon". So Chrome renders only the 1024 master and every other size is scaled locally. `tools/render-icon.ps1` measures the opaque region's margins after rendering, and `window_icon_is_centered_and_not_clipped` in `src/main.rs` re-checks the copy embedded in the binary — off-centre composition or clipping turns the test red.
+
+### A red statement has to survive the header write-back
+
+The byte spans painted in the editor come from the same scan that produced the statements (`sql::split_ranges`), so panel *N* and span *N* cannot disagree. They are measured against the text at submit time, and that text then changes twice: the `[待执行]` → `[失败]` write-back makes the block three bytes shorter, and the user starts editing. `OpenFile::apply_edit` therefore shifts every stored span by the edit's delta and drops the ones the edit cut through, and the app re-checks a span against the text before painting it (`&text[a..b]` has to *be* that statement) — a mark that no longer matches is thrown away rather than guessed at. Error segments go at the **front** of the overlay list because `paint_overlay` is first-wins and a find highlight must not cover the line you are about to fix.
+
+### A freshly opened egui window paints nothing
+
+`Window::show` spends its first frames measuring and placing itself; content only appears once the size has settled. That is egui's business, but it is a trap for headless tests: the pop-out result window test has to burn two frames after the click before asserting that the grid text is on screen.
 
 ## Contributing and license
 
