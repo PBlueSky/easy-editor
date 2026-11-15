@@ -7,6 +7,7 @@ use eframe::egui::{self, Color32, Key, Modifiers, RichText, Ui};
 use egui_extras::{Column, TableBuilder};
 
 use crate::config::{self, ConfigStore};
+use crate::database::DatabasePanel;
 use crate::editor::{self, OpenFile, PendingEdit};
 use crate::filetree::{self, FileTree, TreeAction};
 use crate::find::FindState;
@@ -27,6 +28,7 @@ enum SideTab {
     Files,
     Search,
     Journal,
+    Database,
 }
 
 impl SideTab {
@@ -35,6 +37,7 @@ impl SideTab {
             Self::Files => "files",
             Self::Search => "search",
             Self::Journal => "journal",
+            Self::Database => "database",
         }
     }
 
@@ -42,6 +45,7 @@ impl SideTab {
         match key {
             "search" => Self::Search,
             "journal" => Self::Journal,
+            "database" => Self::Database,
             _ => Self::Files,
         }
     }
@@ -134,6 +138,8 @@ pub struct EasyEditorApp {
     center_terminal_settings: bool,
     /// 中央区域的面板树（tmux 式：一块块面板递归切分，编辑器与终端共用一棵树）
     panes: PaneTree<PaneKind>,
+    /// 数据库连接：侧栏「数据库」页签 + 连接管理窗口，SQL 块也从这里取连接
+    database: DatabasePanel,
     /// 上一帧算出的面板矩形，方位键找邻居时要用
     pane_layout: TreeLayout,
     /// 最后一次聚焦过的编辑面板。焦点切到终端时，文本类操作还是落在这块上
@@ -176,6 +182,8 @@ impl EasyEditorApp {
         let show_side = config.data.show_side;
         let word_wrap = config.data.word_wrap;
         let side = SideTab::from_key(&config.data.side_tab);
+        // 后面 `config` 整个挪进 Self，所以要读的字段先在这儿取出来
+        let db_connections = config.data.db_connections.clone();
 
         theme::install_fonts(ctx);
         theme::apply_style(ctx, dark);
@@ -222,6 +230,7 @@ impl EasyEditorApp {
             show_terminal_settings: false,
             center_terminal_settings: false,
             panes: PaneTree::new(),
+            database: DatabasePanel::new(db_connections),
             pane_layout: TreeLayout::default(),
             last_editor_pane: None,
             boot: std::time::Instant::now(),
@@ -330,6 +339,11 @@ impl EasyEditorApp {
             self.config.data.terminal_args = args;
             changed = true;
         }
+        // 连接列表整份比：条目不多，而「少存了一条连接」比多写几字节贵得多
+        if self.config.data.db_connections != self.database.connections() {
+            self.config.data.db_connections = self.database.connections().to_vec();
+            changed = true;
+        }
         if changed {
             self.config.touch();
         }
@@ -361,6 +375,11 @@ impl EasyEditorApp {
             Some("journal") => {
                 self.side = SideTab::Journal;
                 self.show_side = true;
+            }
+            Some("database") => {
+                self.side = SideTab::Database;
+                self.show_side = true;
+                self.database.open_manager();
             }
             Some("search") => {
                 self.side = SideTab::Search;
@@ -1918,11 +1937,36 @@ impl EasyEditorApp {
                 self.insert_journal_block();
             }
 
+            // 顶栏只多这一个入口：连接相关的操作都在这个下拉里，不再摊开一排按钮
+            let menu = ui.menu_button(RichText::new("数据库").size(12.5), |ui| {
+                if ui
+                    .button("连接管理…")
+                    .on_hover_text("增删改数据库连接，配置写在 config.json")
+                    .clicked()
+                {
+                    self.database.open_manager();
+                    ui.close();
+                }
+                if ui
+                    .button("侧栏数据库树")
+                    .on_hover_text("在侧栏里按 连接 → 库 → 表 浏览")
+                    .clicked()
+                {
+                    self.side = SideTab::Database;
+                    self.show_side = true;
+                    ui.close();
+                }
+            });
+            let _ = menu
+                .response
+                .on_hover_text("数据库连接管理，以及侧栏里的库表树");
+
             // 右组是从右往左排的，这一排剩下的地方不够就会一路压过左组的字，
             // 所以先换一排再排它。注意要量「这一排还剩多少」：可换行布局下
             // available_width() 报的是整排的宽度，永远碰不到这个阈值。
-            // 430 = 右组固定那部分（实测约 350）再留一点看工作区名的地方。
-            if ui.available_rect_before_wrap().width() < 430.0 {
+            // 380 = 右组固定那部分（实测约 350）再留一点看工作区名的地方。
+            // 加了「数据库」下拉后左组变宽，这个数再往下压就只剩个位数给工作区名了。
+            if ui.available_rect_before_wrap().width() < 380.0 {
                 ui.end_row();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2033,6 +2077,7 @@ impl EasyEditorApp {
                         (SideTab::Files, "文件"),
                         (SideTab::Search, "搜索"),
                         (SideTab::Journal, "日志"),
+                        (SideTab::Database, "数据库"),
                     ] {
                         if ui
                             .selectable_label(self.side == tab, RichText::new(label).size(12.5))
@@ -2076,6 +2121,9 @@ impl EasyEditorApp {
                     }
                     SideTab::Journal => {
                         journal_jump = self.journal_panel(ui);
+                    }
+                    SideTab::Database => {
+                        self.database.sidebar(ui);
                     }
                 }
             });
@@ -3343,6 +3391,11 @@ impl EasyEditorApp {
         self.frame_count += 1;
 
         self.search.poll();
+        self.database.poll();
+        if self.database.busy() {
+            // 库表列表和测试结果都在后台线程，不催一帧就永远停在「读取中…」
+            ctx.request_repaint_after(std::time::Duration::from_millis(60));
+        }
         // 后台面板的输出也要每帧读进屏幕模型，否则 PTY 的 channel 会一直堆
         self.terminal.pump();
         if self.find.open && self.find.stale {
@@ -3399,6 +3452,7 @@ impl EasyEditorApp {
         self.close_confirm(&ctx);
         self.help_window(&ctx);
         self.terminal_settings_window(&ctx);
+        self.database.manager_window(&ctx);
 
         // 编辑器在 central() 里才会把最新光标写回 OpenFile，所以放在最后收
         self.poll_caret(&ctx);

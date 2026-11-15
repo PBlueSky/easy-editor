@@ -523,6 +523,8 @@ pub struct MockDriver {
     /// 失败时是否声明「这条会话废了」，用来测 hub 的重连分支
     pub fail_reconnects: bool,
     pub rows: usize,
+    /// 按调用顺序记下跑过的语句和元数据请求（`SHOW DATABASES` 之类），
+    /// 上层「一次展开只发一条请求」这类约定就靠它验证。
     pub executed: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
@@ -534,6 +536,13 @@ impl MockDriver {
             rows: 2,
             executed: Default::default(),
         }
+    }
+
+    fn record(&self, call: &str) {
+        self.executed
+            .lock()
+            .expect("MockDriver 的记账锁不会中毒")
+            .push(call.to_string());
     }
 
     pub fn failing(message: &str) -> Self {
@@ -563,10 +572,7 @@ impl Driver for MockDriver {
         if self.fail.is_some() {
             return Err(self.err());
         }
-        self.executed
-            .lock()
-            .expect("MockDriver 的记账锁不会中毒")
-            .push(sql.to_string());
+        self.record(sql);
         Ok(crate::sql::split_statements(sql)
             .into_iter()
             .map(|stmt| {
@@ -615,6 +621,7 @@ impl Driver for MockDriver {
         if self.fail.is_some() {
             return Err(self.err());
         }
+        self.record("SHOW DATABASES");
         Ok(vec!["information_schema".into(), "demo".into()])
     }
 
@@ -622,6 +629,7 @@ impl Driver for MockDriver {
         if self.fail.is_some() {
             return Err(self.err());
         }
+        self.record(&format!("SHOW TABLES IN {database}"));
         Ok(vec![format!("{database}_users"), "orders".into()])
     }
 
@@ -629,6 +637,7 @@ impl Driver for MockDriver {
         if self.fail.is_some() {
             return Err(self.err());
         }
+        self.record("PROBE");
         Ok("8.0.33-mock".into())
     }
 }

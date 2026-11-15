@@ -5,6 +5,7 @@ mod config;
 // 下面两处 allow 是给第 3~5 步留的：调用方还没接上，先别用 dead_code 淹没 clippy 基线
 #[allow(dead_code)]
 mod db;
+mod database;
 mod editor;
 mod filetree;
 mod find;

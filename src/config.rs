@@ -1,10 +1,13 @@
-//! 用户配置：字号、主题、上次打开的工作目录，持久化到 `%APPDATA%\easy-editor\config.json`。
+//! 用户配置：字号、主题、上次打开的工作目录、数据库连接，
+//! 持久化到 `%APPDATA%\easy-editor\config.json`。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+
+use crate::db::ConnectionSpec;
 
 /// 应用数据目录（配置、截图都放这里）。
 pub fn app_data_dir() -> PathBuf {
@@ -53,6 +56,8 @@ pub struct Config {
     pub terminal_args: BTreeMap<String, String>,
     /// 编辑器自动换行：长行折到面板宽度，而不是横向滚出去。
     pub word_wrap: bool,
+    /// 数据库连接列表。`name` 是 SQL 块头部 `conn=` 引用到的键。
+    pub db_connections: Vec<ConnectionSpec>,
 }
 
 impl Default for Config {
@@ -69,6 +74,7 @@ impl Default for Config {
             terminal_programs: BTreeMap::new(),
             terminal_args: BTreeMap::new(),
             word_wrap: false,
+            db_connections: Vec::new(),
         }
     }
 }
@@ -85,13 +91,27 @@ impl Config {
         };
         match serde_json::from_str::<Self>(&text) {
             Ok(mut cfg) => {
-                // 挡住手工改坏的值
-                cfg.font_size = cfg.font_size.clamp(10.0, 28.0);
+                cfg.sanitize();
                 cfg
             }
             Err(_) => Self::default(),
         }
     }
+
+    /// 挡住手工改坏的值。配置是这个文件同用户都能编辑的 JSON，改坏了不能把应用带崩。
+    fn sanitize(&mut self) {
+        self.font_size = self.font_size.clamp(10.0, 28.0);
+        prune_connections(&mut self.db_connections);
+    }
+}
+
+/// 连接列表进界面前的两道关：没名字的不收，重名的只留第一条。
+///
+/// 侧栏的树和后台线程都拿名字当键。两条同名连接会让 A 的结果画到 B 的面板上，
+/// 而「看着对、其实是另一个库的结果」比直接报错危险得多。
+fn prune_connections(list: &mut Vec<ConnectionSpec>) {
+    let mut seen: HashSet<String> = HashSet::new();
+    list.retain(|c| !c.name.trim().is_empty() && seen.insert(c.name.clone()));
 }
 
 /// 带防抖的配置容器：改一下就标记，攒 600ms 再落盘，避免拖动字号时狂写磁盘。
@@ -175,5 +195,46 @@ mod tests {
         assert_eq!(back.font_size, 20.0);
         assert!(back.show_side);
         assert!(back.last_workspace.is_none());
+        assert!(back.db_connections.is_empty());
+    }
+
+    #[test]
+    fn connection_fields_are_optional_too() {
+        // 手改 JSON 时只写想改的几项，其余按默认补齐
+        let back: Config =
+            serde_json::from_str(r#"{"db_connections":[{"name":"本地","host":"10.0.0.5"}]}"#)
+                .unwrap();
+        assert_eq!(back.db_connections.len(), 1);
+        assert_eq!(back.db_connections[0].host, "10.0.0.5");
+        assert_eq!(back.db_connections[0].port, 3306);
+        assert_eq!(back.db_connections[0].user, "root");
+    }
+
+    #[test]
+    fn prune_drops_nameless_and_duplicate_connections() {
+        let named = |name: &str| ConnectionSpec {
+            name: name.into(),
+            ..Default::default()
+        };
+        let mut list = vec![named("本地"), named(""), named("   "), named("本地"), named("线上")];
+        prune_connections(&mut list);
+        let names: Vec<&str> = list.iter().map(|c| c.name.as_str()).collect();
+        // 重名只留第一条：留哪条都行，但绝不能留两条让结果串台
+        assert_eq!(names, ["本地", "线上"]);
+    }
+
+    #[test]
+    fn sanitize_clamps_a_hand_edited_font_size() {
+        let mut cfg = Config {
+            font_size: 99.0,
+            db_connections: vec![ConnectionSpec {
+                name: String::new(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        cfg.sanitize();
+        assert_eq!(cfg.font_size, 28.0);
+        assert!(cfg.db_connections.is_empty());
     }
 }
