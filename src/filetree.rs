@@ -71,11 +71,31 @@ fn is_executable(path: &Path) -> bool {
 }
 
 /// 文件树操作结果。
+#[derive(Debug)]
 pub enum TreeAction {
     Open(PathBuf),
     Created(PathBuf),
     /// 右键「格式化」：JSON / XML 文件原地格式化
     Format(PathBuf),
+    /// 右键「重命名」改名成功：旧路径 → 新路径，已经打开的标签要跟着换路径
+    Renamed(PathBuf, PathBuf),
+    /// 右键「在此处打开终端」：在这个目录里起一块新终端
+    OpenTerminal(PathBuf),
+}
+
+/// 校验改名输入：去掉首尾空白，空串 / `.` / `..` / 带路径分隔符或 Windows 非法字符的都算不合法。
+fn sanitized_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return None;
+    }
+    if trimmed
+        .chars()
+        .any(|c| matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 pub struct FileTree {
@@ -87,6 +107,10 @@ pub struct FileTree {
     new_entry: Option<(PathBuf, bool)>,
     /// 新建对话框里正在输入的名字
     pub new_name: String,
+    /// 正在就地改名的文件（改名输入框画在它那一行上）
+    renaming: Option<PathBuf>,
+    /// 改名输入框里的新名字
+    rename_buf: String,
     /// 文件搜索框：按名称 / 相对路径片段过滤整个工作区
     pub filter: String,
     /// 上次搜索结果，`(查询串, 命中)`；查询没变就不重新遍历目录
@@ -104,6 +128,8 @@ impl FileTree {
             selected: None,
             new_entry: None,
             new_name: String::new(),
+            renaming: None,
+            rename_buf: String::new(),
             filter: String::new(),
             filter_cache: None,
             show_hidden: false,
@@ -116,6 +142,7 @@ impl FileTree {
     pub fn refresh(&mut self) {
         self.children.clear();
         self.filter_cache = None;
+        self.cancel_rename();
     }
 
     fn read(&self, dir: &Path) -> Vec<Entry> {
@@ -181,6 +208,56 @@ impl FileTree {
             .unwrap_or_else(|| self.root.clone());
         self.new_entry = Some((parent, is_dir));
         self.new_name.clear();
+        // 同时只开一个输入框，免得两个都盯着键盘焦点
+        self.cancel_rename();
+    }
+
+    /// 请求就地改名：输入框先填上现在的名字。
+    pub fn start_rename(&mut self, path: &Path) {
+        self.rename_buf = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        self.renaming = Some(path.to_path_buf());
+        self.selected = Some(path.to_path_buf());
+        self.error = None;
+    }
+
+    pub fn cancel_rename(&mut self) {
+        self.renaming = None;
+        self.rename_buf.clear();
+    }
+
+    /// 落地改名：磁盘 `rename` 成功后把「旧路径 → 新路径」交给上层换标签页。
+    fn commit_rename(&mut self, out: &mut Option<TreeAction>) {
+        let Some(old) = self.renaming.take() else {
+            return;
+        };
+        let raw = std::mem::take(&mut self.rename_buf);
+        let Some(name) = sanitized_name(&raw) else {
+            self.error = Some(format!("非法的文件名：「{}」", raw.trim()));
+            return;
+        };
+        let Some(parent) = old.parent() else {
+            return;
+        };
+        let new = parent.join(&name);
+        if new == old {
+            return;
+        }
+        if new.exists() {
+            self.error = Some(format!("「{name}」已经存在"));
+            return;
+        }
+        match std::fs::rename(&old, &new) {
+            Ok(()) => {
+                self.refresh();
+                self.selected = Some(new.clone());
+                self.error = None;
+                *out = Some(TreeAction::Renamed(old, new));
+            }
+            Err(e) => self.error = Some(format!("重命名失败：{e}")),
+        }
     }
 
     /// 返回需要打开或新建完成后的文件。
@@ -464,7 +541,8 @@ impl FileTree {
                 " "
             };
 
-            let painter = ui.painter();
+            // clone 一份：改名分支里还要 `ui.put`，不能一直借着 ui.painter()
+            let painter = ui.painter().clone();
             painter.text(
                 egui::pos2(rect.left() + indent, rect.center().y),
                 Align2::LEFT_CENTER,
@@ -472,15 +550,41 @@ impl FileTree {
                 FontId::proportional(10.0),
                 text_color.gamma_multiply(0.8),
             );
-            painter.text(
-                egui::pos2(rect.left() + indent + 13.0, rect.center().y),
-                Align2::LEFT_CENTER,
-                &entry.name,
-                FontId::proportional(12.5),
-                text_color,
-            );
 
-            if response.clicked() {
+            let renaming = self.renaming.as_deref() == Some(entry.path.as_path());
+            if renaming {
+                // 改名输入框盖在名字原来所在的位置上
+                let edit_rect = Rect::from_min_max(
+                    egui::pos2(rect.left() + indent + 13.0, rect.top()),
+                    rect.max - Vec2::new(2.0, 0.0),
+                );
+                let edit = egui::TextEdit::singleline(&mut self.rename_buf)
+                    .font(FontId::proportional(12.5))
+                    .desired_width(edit_rect.width());
+                let resp = ui.put(edit_rect, edit);
+                // 每帧无条件 request_focus 会把输入法组字打断（见 src/ime.rs）
+                ime::focus_input_box(&resp);
+                if !ime::composing(ui) {
+                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    if esc {
+                        self.cancel_rename();
+                    } else if enter || resp.lost_focus() {
+                        // 单行输入框收到回车自己就交还焦点，两条路都得接住
+                        self.commit_rename(out);
+                    }
+                }
+            } else {
+                painter.text(
+                    egui::pos2(rect.left() + indent + 13.0, rect.center().y),
+                    Align2::LEFT_CENTER,
+                    &entry.name,
+                    FontId::proportional(12.5),
+                    text_color,
+                );
+            }
+
+            if response.clicked() && !renaming {
                 self.selected = Some(entry.path.clone());
                 if entry.is_dir {
                     if expanded {
@@ -515,7 +619,7 @@ impl FileTree {
                     ui.close();
                 }
                 if !entry.is_dir && ui.button("重命名").clicked() {
-                    self.selected = Some(entry.path.clone());
+                    self.start_rename(&entry.path);
                     ui.close();
                 }
                 if ui.button("在资源管理器中显示").clicked() {
@@ -523,7 +627,7 @@ impl FileTree {
                     ui.close();
                 }
                 if ui.button("在此处打开终端").clicked() {
-                    reveal(&target_dir);
+                    *out = Some(TreeAction::OpenTerminal(target_dir.clone()));
                     ui.close();
                 }
             });
@@ -674,23 +778,34 @@ mod tests {
 
     /// 走 egui 正常的输入管线跑一帧：事件必须是 RawInput 里的，
     /// 因为指针状态在 begin_pass 就算好了，事后往 events 里塞是没用的。
-    fn pass(ctx: &egui::Context, tree: &mut FileTree, events: Vec<egui::Event>) -> egui::FullOutput {
+    /// 返回值第二项是这一帧树交上来的操作（打开 / 改名 / 开终端……）。
+    fn pass(
+        ctx: &egui::Context,
+        tree: &mut FileTree,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, Option<TreeAction>) {
         let raw = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, SCREEN)),
             events,
             ..Default::default()
         };
+        let mut action = None;
         let mut out = ctx.run_pass(raw, |ctx| {
             ctx.root_ui(|ui| {
                 egui::Panel::left("side").show(ui, |ui| {
-                    let _ = tree.ui(ui, false);
+                    action = tree.ui(ui, false);
                 });
             });
         });
         // 测试里没有真正的渲染器，字体图集的增量没人消费，
         // epaint 会在 TexturesDelta 被 drop 时断言，这里手动清掉。
         out.textures_delta.clear();
-        out
+        (out, action)
+    }
+
+    /// 只关心画面、不关心操作结果的帧。
+    fn frame(ctx: &egui::Context, tree: &mut FileTree, events: Vec<egui::Event>) -> egui::FullOutput {
+        pass(ctx, tree, events).0
     }
 
     fn pointer(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> Vec<egui::Event> {
@@ -726,7 +841,7 @@ mod tests {
         needle: &str,
     ) -> Option<Rect> {
         for _ in 0..4 {
-            let out = pass(ctx, tree, vec![]);
+            let out = frame(ctx, tree, vec![]);
             if let Some(rect) = find_text(&out, needle) {
                 return Some(rect);
             }
@@ -745,7 +860,7 @@ mod tests {
         ctx.set_pixels_per_point(1.0);
         let mut tree = FileTree::new(dir.clone());
 
-        let out = pass(&ctx, &mut tree, vec![]);
+        let out = frame(&ctx, &mut tree, vec![]);
         let row = find_text(&out, "a.txt")
             .expect("文件树里没画出 a.txt")
             .center();
@@ -759,14 +874,14 @@ mod tests {
         pass(&ctx, &mut tree, pointer(item, egui::PointerButton::Primary, true));
         pass(&ctx, &mut tree, pointer(item, egui::PointerButton::Primary, false));
         // Window 的第一帧只量尺寸不画内容，再跑一帧才能看到它
-        let out = pass(&ctx, &mut tree, vec![]);
+        let out = frame(&ctx, &mut tree, vec![]);
         assert!(tree.new_entry.is_some(), "点了菜单项却没记下新建目标");
         assert!(
             find_text(&out, "文件名，如 main.rs").is_some(),
             "新建对话框没画出来"
         );
 
-        pass(
+        frame(
             &ctx,
             &mut tree,
             vec![egui::Event::Text("probe.txt".into())],
@@ -776,7 +891,7 @@ mod tests {
             "对话框里的输入框没收到键盘文字"
         );
 
-        pass(
+        frame(
             &ctx,
             &mut tree,
             vec![egui::Event::Key {
@@ -788,6 +903,214 @@ mod tests {
             }],
         );
         assert!(dir.join("probe.txt").is_file(), "回车没能把文件建出来");
+    }
+
+    /// 右键「重命名」→ 就地改名 → 回车：磁盘文件真的换了名字。
+    #[test]
+    fn right_click_rename_replaces_the_file_on_disk() {
+        let dir = std::env::temp_dir().join("easy-editor-tree-rename-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("a.txt");
+        std::fs::write(&old, "hello\n").unwrap();
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let mut tree = FileTree::new(dir.clone());
+
+        let out = frame(&ctx, &mut tree, vec![]);
+        let row = find_text(&out, "a.txt")
+            .expect("文件树里没画出 a.txt")
+            .center();
+
+        frame(&ctx, &mut tree, pointer(row, egui::PointerButton::Secondary, true));
+        frame(&ctx, &mut tree, pointer(row, egui::PointerButton::Secondary, false));
+        let item = wait_for_text(&ctx, &mut tree, "重命名")
+            .expect("右键没有弹出「重命名」菜单")
+            .center();
+        frame(&ctx, &mut tree, pointer(item, egui::PointerButton::Primary, true));
+        frame(&ctx, &mut tree, pointer(item, egui::PointerButton::Primary, false));
+
+        // 改名框出现，并预填当前名字
+        let out = frame(&ctx, &mut tree, vec![]);
+        assert_eq!(tree.renaming.as_deref(), Some(old.as_path()));
+        assert_eq!(tree.rename_buf, "a.txt");
+        assert!(
+            find_text(&out, "a.txt").is_some(),
+            "改名输入框没画出当前文件名"
+        );
+
+        // 模拟全选后重新敲一个名字
+        tree.rename_buf.clear();
+        frame(&ctx, &mut tree, vec![egui::Event::Text("b.txt".into())]);
+        assert_eq!(tree.rename_buf, "b.txt", "改名框没收到键盘文字");
+
+        let (_, action) = pass(
+            &ctx,
+            &mut tree,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let new = dir.join("b.txt");
+        match action {
+            Some(TreeAction::Renamed(from, to)) => {
+                assert_eq!(from, old);
+                assert_eq!(to, new);
+            }
+            other => panic!("回车改名没交出 Renamed 动作：{other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), "hello\n", "内容换了文件");
+        assert!(!old.exists(), "旧名字还留在磁盘上");
+        assert_eq!(tree.renaming, None, "改名框该关掉");
+    }
+
+    /// Esc 取消、非法名字不落盘：两者都不该动磁盘。
+    #[test]
+    fn rename_rejects_junk_names_and_cancels() {
+        let dir = std::env::temp_dir().join("easy-editor-tree-rename-bad-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("a.txt");
+        std::fs::write(&old, "a\n").unwrap();
+        std::fs::write(dir.join("taken.txt"), "t\n").unwrap();
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let mut tree = FileTree::new(dir.clone());
+
+        // 带路径分隔符：不合法
+        tree.start_rename(&old);
+        tree.rename_buf = "..\\evil.txt".into();
+        let mut action = None;
+        tree.commit_rename(&mut action);
+        assert!(action.is_none());
+        assert!(tree.error.is_some(), "非法名字要给出提示");
+        assert!(old.exists());
+
+        // 和已有文件重名：不改
+        tree.start_rename(&old);
+        tree.rename_buf = "taken.txt".into();
+        tree.commit_rename(&mut action);
+        assert!(action.is_none());
+        assert!(dir.join("taken.txt").is_file());
+        assert!(old.exists(), "撞名时把原文件弄丢了");
+
+        // 名字没变：静默关掉，不产生动作
+        tree.start_rename(&old);
+        tree.rename_buf = "a.txt".into();
+        tree.commit_rename(&mut action);
+        assert!(action.is_none());
+        assert!(tree.error.is_none());
+        assert_eq!(tree.renaming, None);
+
+        // Esc 取消
+        let out = frame(&ctx, &mut tree, vec![]);
+        let row = find_text(&out, "a.txt").expect("没画出 a.txt").center();
+        frame(&ctx, &mut tree, pointer(row, egui::PointerButton::Secondary, true));
+        frame(&ctx, &mut tree, pointer(row, egui::PointerButton::Secondary, false));
+        let item = wait_for_text(&ctx, &mut tree, "重命名")
+            .expect("右键没有弹出「重命名」菜单")
+            .center();
+        frame(&ctx, &mut tree, pointer(item, egui::PointerButton::Primary, true));
+        frame(&ctx, &mut tree, pointer(item, egui::PointerButton::Primary, false));
+        frame(&ctx, &mut tree, vec![]);
+        assert_eq!(tree.renaming.as_deref(), Some(old.as_path()));
+        frame(
+            &ctx,
+            &mut tree,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(tree.renaming, None, "Esc 没能取消改名");
+        assert!(old.exists());
+    }
+
+    /// 右键「在此处打开终端」交出目录，而不是去开资源管理器。
+    #[test]
+    fn open_terminal_menu_emits_the_directory() {
+        let dir = std::env::temp_dir().join("easy-editor-tree-term-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/a.txt"), "a\n").unwrap();
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let mut tree = FileTree::new(dir.clone());
+        tree.expanded.insert(dir.join("sub"));
+
+        let out = frame(&ctx, &mut tree, vec![]);
+        let row = find_text(&out, "a.txt")
+            .expect("文件树里没画出 sub/a.txt")
+            .center();
+        frame(&ctx, &mut tree, pointer(row, egui::PointerButton::Secondary, true));
+        frame(&ctx, &mut tree, pointer(row, egui::PointerButton::Secondary, false));
+        let item = wait_for_text(&ctx, &mut tree, "在此处打开终端")
+            .expect("右键没有弹出「在此处打开终端」菜单")
+            .center();
+        frame(&ctx, &mut tree, pointer(item, egui::PointerButton::Primary, true));
+        let (_, action) = pass(&ctx, &mut tree, pointer(item, egui::PointerButton::Primary, false));
+        match action {
+            Some(TreeAction::OpenTerminal(at)) => assert_eq!(at, dir.join("sub")),
+            other => panic!("点「在此处打开终端」没交出目录：{other:?}"),
+        }
+    }
+
+    /// 改名框是 `Ui::put` 塞进行矩形里的，它会把父布局的光标往前推。
+    /// 推多了整棵树会往下跳，这里量一下下面那几行有没有挪。
+    #[test]
+    fn rename_box_does_not_push_the_rows_below() {
+        let dir = std::env::temp_dir().join("easy-editor-tree-rename-shift-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["a.txt", "m.txt", "z.txt"] {
+            std::fs::write(dir.join(name), "x\n").unwrap();
+        }
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let mut tree = FileTree::new(dir.clone());
+
+        let out = frame(&ctx, &mut tree, vec![]);
+        let before = find_text(&out, "z.txt")
+            .expect("没画出 z.txt")
+            .min
+            .to_vec2();
+
+        tree.start_rename(&dir.join("a.txt"));
+        let out = frame(&ctx, &mut tree, vec![]);
+        let after = find_text(&out, "z.txt")
+            .expect("改名时 z.txt 不见了")
+            .min
+            .to_vec2();
+
+        assert!(
+            (after - before).length() < 2.0,
+            "改名框把下面的行推了 {before:?} → {after:?}"
+        );
+    }
+
+    #[test]
+    fn sanitized_name_rejects_path_tricks() {
+        assert_eq!(sanitized_name("  a.txt  ").as_deref(), Some("a.txt"));
+        assert_eq!(sanitized_name(""), None);
+        assert_eq!(sanitized_name("   "), None);
+        assert_eq!(sanitized_name("."), None);
+        assert_eq!(sanitized_name(".."), None);
+        assert_eq!(sanitized_name("a/b"), None);
+        assert_eq!(sanitized_name("a\\b"), None);
+        assert_eq!(sanitized_name("C:evil"), None);
+        assert_eq!(sanitized_name("a*b?c"), None);
+        assert_eq!(sanitized_name("报告.md").as_deref(), Some("报告.md"));
     }
 
     /// 文件搜索按名称和相对路径片段匹配，并且不会漏掉子目录里的文件。

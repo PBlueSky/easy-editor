@@ -1269,9 +1269,15 @@ impl TerminalPanel {
     }
     /// 起一个新终端，返回它的 id。
     pub fn create(&mut self) -> Result<u64, String> {
+        let cwd = self.cwd.clone();
+        self.create_at(&cwd)
+    }
+
+    /// 在指定目录里起一块终端（文件树右键「在此处打开终端」）。
+    pub fn create_at(&mut self, cwd: &Path) -> Result<u64, String> {
         let id = self.next_id;
         self.next_id += 1;
-        let term = Terminal::spawn(id, &self.cwd, 100, 28, self.shell, &self.settings)?;
+        let term = Terminal::spawn(id, cwd, 100, 28, self.shell, &self.settings)?;
         self.terms.push(term);
         Ok(id)
     }

@@ -475,6 +475,23 @@ impl EasyEditorApp {
         self.revalidate_find();
     }
 
+    /// 文件树里改了名：已打开的标签跟着换路径，未保存的改动仍会落到新名字上。
+    fn file_renamed(&mut self, old: &Path, new: &Path) {
+        for tab in &mut self.tabs {
+            if tab.path == old {
+                tab.path = new.to_path_buf();
+            }
+        }
+        if let Some(root) = &self.root {
+            self.index = filetree::collect_files(root, 50_000);
+        }
+        self.status = format!(
+            "已重命名 {} → {}",
+            old.file_name().unwrap_or_default().to_string_lossy(),
+            new.file_name().unwrap_or_default().to_string_lossy()
+        );
+    }
+
     fn save_active(&mut self) {
         let Some(idx) = self.focused_tab() else { return };
         let Some(file) = self.tabs.get_mut(idx) else { return };
@@ -1007,7 +1024,13 @@ impl EasyEditorApp {
     /// 之前固定切在下方，用户没有任何办法把终端放到右边；改成左右并排后，
     /// 编辑器在左、终端在右，正好是多数人习惯的布局。
     fn new_terminal_pane(&mut self) {
-        let id = match self.terminal.create() {
+        let cwd = self.terminal.cwd.clone();
+        self.new_terminal_pane_at(&cwd);
+    }
+
+    /// 在指定目录里起一块终端（文件树右键「在此处打开终端」）。
+    fn new_terminal_pane_at(&mut self, cwd: &Path) {
+        let id = match self.terminal.create_at(cwd) {
             Ok(id) => id,
             Err(e) => {
                 self.status = e;
@@ -2066,6 +2089,8 @@ impl EasyEditorApp {
                 }
                 self.open_file(path, None);
             }
+            Some(TreeAction::Renamed(old, new)) => self.file_renamed(&old, &new),
+            Some(TreeAction::OpenTerminal(dir)) => self.new_terminal_pane_at(&dir),
             None => {}
         }
         if let Some(byte) = journal_jump {
@@ -3776,6 +3801,110 @@ mod tests {
             }],
         );
         assert!(dir.join("probe.txt").is_file(), "回车没能把文件建出来");
+    }
+
+    /// 右键文件树某个条目 → 等菜单出现 → 点它。
+    fn click_tree_menu(app: &mut EasyEditorApp, ctx: &egui::Context, at: Pos2, label: &str) {
+        frame(app, ctx, pointer(at, egui::PointerButton::Secondary, true));
+        frame(app, ctx, pointer(at, egui::PointerButton::Secondary, false));
+        let item = wait_for_text(app, ctx, label)
+            .unwrap_or_else(|| panic!("右键没有弹出「{label}」菜单"))
+            .center();
+        frame(app, ctx, pointer(item, egui::PointerButton::Primary, true));
+        frame(app, ctx, pointer(item, egui::PointerButton::Primary, false));
+    }
+
+    /// 右键「重命名」：改名后已打开的标签跟着换路径，保存落到新文件。
+    ///
+    /// 只单测 FileTree 复现不了标签页这一半：磁盘换名和 `tabs` 里的路径是两处状态，
+    /// 漏掉任何一处都会表现为「存盘又生出一个旧名字的副本」。
+    #[test]
+    fn renaming_in_the_tree_follows_the_open_tab() {
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-rename-test", "hello\n");
+        let old = dir.join("a.txt");
+        app.open_file(old.clone(), None);
+        assert_eq!(app.tabs.len(), 1);
+
+        let out = frame(&mut app, &ctx, vec![]);
+        let row = find_text(&out, "a.txt")
+            .expect("文件树里没画出 a.txt")
+            .center();
+        click_tree_menu(&mut app, &ctx, row, "重命名");
+        // 改名框要到下一帧才画出来并拿到焦点，这一帧敲键会丢
+        let out = frame(&mut app, &ctx, vec![]);
+        assert!(
+            find_text(&out, "a.txt").is_some(),
+            "改名框没在原位画出来"
+        );
+
+        // 改名框预填了当前名字：Ctrl+A 全选，再敲新名字整段替换，最后回车落地
+        frame(&mut app, &ctx, vec![key_press(Key::A, Modifiers::COMMAND)]);
+        frame(&mut app, &ctx, vec![egui::Event::Text("b.txt".into())]);
+        frame(&mut app, &ctx, vec![key_press(Key::Enter, Modifiers::NONE)]);
+
+        let new = dir.join("b.txt");
+        assert!(new.is_file(), "改名没落到磁盘上");
+        assert!(!old.exists(), "旧名字还留在磁盘上");
+        assert_eq!(app.tabs[0].path, new, "标签页还指着旧路径");
+        assert!(
+            app.index.contains(&new) && !app.index.contains(&old),
+            "快速打开索引没跟着改名"
+        );
+
+        // 未保存的改动要写进新名字的文件里
+        app.tabs[0].text = "changed\n".into();
+        app.tabs[0].refresh_dirty();
+        app.save_active();
+        assert_eq!(
+            std::fs::read_to_string(&new).unwrap(),
+            "changed\n",
+            "保存写到了别的地方"
+        );
+        assert!(!old.exists(), "保存又生成了旧名字的副本");
+    }
+
+    /// 右键「在此处打开终端」：在这个目录里起一块新终端面板。
+    ///
+    /// shell 强制成 cmd.exe：`bootstrap` 读的是真实用户的 config.json，
+    /// 那里面手填的 WSL / Git Bash 路径换台机器就不存在，会让这条测试假红。
+    #[cfg(windows)]
+    #[test]
+    fn open_terminal_menu_splits_in_that_directory() {
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-open-term-test", "a\n");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        app.tree
+            .as_mut()
+            .unwrap()
+            .expanded
+            .insert(dir.join("sub"));
+        app.terminal.settings = TerminalSettings::default();
+        app.terminal.shell = crate::terminal::ShellKind::Cmd;
+
+        let before = app.terminal.len();
+        let out = frame(&mut app, &ctx, vec![]);
+        let row = find_text(&out, "sub")
+            .expect("文件树里没画出 sub")
+            .center();
+        click_tree_menu(&mut app, &ctx, row, "在此处打开终端");
+        // 拆分与终端计数都要走完一帧才看得清
+        frame(&mut app, &ctx, vec![]);
+
+        assert_eq!(app.terminal.len(), before + 1, "没有多起一块终端");
+        let spawned: Vec<u64> = app
+            .panes
+            .pane_ids()
+            .into_iter()
+            .filter_map(|id| app.panes.payload_of(id).copied())
+            .filter_map(|kind| match kind {
+                PaneKind::Terminal(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert!(!spawned.is_empty(), "终端没挂进分屏树");
+        // 收尾：杀掉这条测试起的 shell，别把进程留在机器上
+        for t in spawned {
+            app.terminal.remove(t);
+        }
     }
 
     /// 右键某一行 → 点菜单里的「新建文件」，把对话框打开。返回输入框位置。
