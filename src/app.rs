@@ -144,6 +144,12 @@ pub struct EasyEditorApp {
     database: DatabasePanel,
     /// 底部结果区：一条语句一个面板，同时展示这次执行拿到的所有结果
     results: ResultsDock,
+    /// 标了 `auto` 的只读块：块 id → 已经自动跑过的那份正文。正文没改就不重复敲门。
+    auto_ran: std::collections::HashMap<String, String>,
+    /// 自动执行的到点时间。用户还在改就一帧帧往后推，手停下来才真跑。
+    auto_due: Option<std::time::Instant>,
+    /// 上一帧看到的那批「待自动执行」的指纹，变了说明内容还在动
+    auto_sig: String,
     /// 上一帧算出的面板矩形，方位键找邻居时要用
     pane_layout: TreeLayout,
     /// 最后一次聚焦过的编辑面板。焦点切到终端时，文本类操作还是落在这块上
@@ -167,6 +173,26 @@ fn native_hwnd(cc: &eframe::CreationContext<'_>) -> Option<isize> {
 #[cfg(not(windows))]
 fn native_hwnd(_cc: &eframe::CreationContext<'_>) -> Option<isize> {
     None
+}
+
+/// 手停下来多久才允许自动执行。太短了边打字边打库，太长了像在等人。
+const AUTO_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(700);
+
+/// 一段 SQL 交给哪条连接执行、结果面板挂回哪儿。
+///
+/// 人手 Ctrl+Enter 和自动执行都拼这一个走同一个出口：两条路各写一遍提交，
+/// 自动那条迟早会少做一步收尾（比如忘了记块头，跑完状态就不回写了）。
+struct Submission {
+    path: PathBuf,
+    conn: String,
+    title: String,
+    sql: String,
+    /// 结果面板「回块」跳到哪个字节
+    jump: usize,
+    /// 整块执行才记块头，跑完把头部回写成 `[已执行]` / `[失败]`
+    block_head: Option<usize>,
+    /// 状态栏后缀，说清楚这几条语句出自哪一块
+    where_: String,
 }
 
 impl EasyEditorApp {
@@ -236,6 +262,9 @@ impl EasyEditorApp {
             panes: PaneTree::new(),
             database: DatabasePanel::new(db_connections),
             results: ResultsDock::new(),
+            auto_ran: std::collections::HashMap::new(),
+            auto_due: None,
+            auto_sig: String::new(),
             pane_layout: TreeLayout::default(),
             last_editor_pane: None,
             boot: std::time::Instant::now(),
@@ -760,45 +789,132 @@ impl EasyEditorApp {
         // 范围和这份文本快照是同一帧取的，理论上不会越界；真越界也只夹不炸
         let a = body.0.min(text.len());
         let b = body.1.clamp(a, text.len());
-        let sql_text = text[a..b].trim().to_string();
-        if sql_text.is_empty() {
-            self.status = "这里没有可执行的 SQL".into();
-            return;
+        let where_ = if in_block.is_some() {
+            format!("（{}）", sql::describe(&blocks, line))
+        } else {
+            String::new()
+        };
+        // 只有整块交出去才回写状态；块外挑一段跑，跑完不代表这块跑完
+        let block_head = match (self.tabs[idx].selection_range, in_block) {
+            (None, Some(b)) => Some(b.head_start),
+            _ => None,
+        };
+        let sub = Submission {
+            path,
+            conn,
+            title,
+            sql: text[a..b].trim().to_string(),
+            jump: origin,
+            block_head,
+            where_,
+        };
+        self.status = match self.submit(&sub) {
+            Ok(n) => format!("已提交 {n} 条语句到「{}」{}", sub.conn, sub.where_),
+            Err(why) => why,
+        };
+    }
+
+    /// 把一段 SQL 交出去执行。Ok 给的是交出去的语句条数，Err 直接拿去当状态栏。
+    fn submit(&mut self, sub: &Submission) -> Result<usize, String> {
+        if sub.sql.is_empty() {
+            return Err("这里没有可执行的 SQL".into());
         }
-        if conn.is_empty() {
-            self.status = "还没有数据库连接，先在顶栏「数据库 → 连接管理」里加一个".into();
-            return;
+        if sub.conn.is_empty() {
+            return Err("还没有数据库连接，先在顶栏「数据库 → 连接管理」里加一个".into());
         }
-        match self.database.run(&conn, &sql_text) {
-            Ok(parts) if parts.is_empty() => {
-                self.status = "只有注释，没有语句可跑".into();
-            }
+        match self.database.run(&sub.conn, &sub.sql) {
+            Ok(parts) if parts.is_empty() => Err("只有注释，没有语句可跑".into()),
             Ok(parts) => {
-                let where_ = if in_block.is_some() {
-                    format!("（{}）", sql::describe(&blocks, line))
-                } else {
-                    String::new()
-                };
-                self.status = format!("已提交 {} 条语句到「{conn}」{where_}", parts.len());
-                // 只有整块交出去才回写状态；块外挑一段跑，跑完不代表这块跑完
-                let block_head = match (self.tabs[idx].selection_range, in_block) {
-                    (None, Some(b)) => Some(b.head_start),
-                    _ => None,
-                };
                 self.results.start_run(
-                    &conn,
-                    &title,
+                    &sub.conn,
+                    &sub.title,
                     &parts,
                     Some(results::Origin {
-                        path,
-                        jump: origin,
-                        block_head,
+                        path: sub.path.clone(),
+                        jump: sub.jump,
+                        block_head: sub.block_head,
                     }),
                 );
+                Ok(parts.len())
             }
-            Err(err) => {
-                self.status = err;
+            Err(err) => Err(err),
+        }
+    }
+
+    /// 手停下来一会儿，把标了 `auto` 的只读块自己跑掉——jupyter 那种「改完就有结果」。
+    ///
+    /// 三道闸：`sql::auto_runnable`（写了 auto 且条条只读）、同一份正文只跑一次、
+    /// 结果区还在等回执就不开新的一批。写操作永远只能人手按。
+    ///
+    /// `now` 由调用方给，测试才能不用真睡 700 毫秒。
+    fn auto_tick(&mut self, now: std::time::Instant) {
+        if self.results.running() {
+            return;
+        }
+        let Some(idx) = self.focused_tab() else { return };
+        let text = self.tabs[idx].text.clone();
+        let path = self.tabs[idx].path.clone();
+        let pending: Vec<sql::Block> = sql::scan(&text)
+            .into_iter()
+            .filter(|b| sql::auto_runnable(b, &text))
+            .filter(|b| {
+                self.auto_ran
+                    .get(&b.id())
+                    .map(String::as_str)
+                    != Some(b.sql(&text))
+            })
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        // 每改一个字这批的指纹就变，到点时间跟着往后推。手没停就一直在推，停下才跑得掉。
+        let sig = pending
+            .iter()
+            .map(|b| format!("{}|{}", b.id(), b.sql(&text)))
+            .collect::<Vec<_>>()
+            .join("\u{1}");
+        if sig != self.auto_sig {
+            self.auto_sig = sig;
+            self.auto_due = Some(now + AUTO_DEBOUNCE);
+            return;
+        }
+        let Some(due) = self.auto_due else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.auto_due = None;
+        self.auto_sig.clear();
+        for block in pending {
+            let body = block.sql(&text).to_string();
+            // 先记账再提交：连不上库的时候不该每帧重敲一次门，改了正文才会再试
+            self.auto_ran.insert(block.id(), body.clone());
+            let conn = if block.conn.is_empty() {
+                self.database
+                    .active_conn()
+                    .unwrap_or_default()
+                    .to_string()
+            } else {
+                block.conn.clone()
+            };
+            let mut title = block.title.clone();
+            if title.is_empty() {
+                title = "SQL".into();
             }
+            let sub = Submission {
+                jump: block.head_start,
+                block_head: Some(block.head_start),
+                where_: String::new(),
+                path: path.clone(),
+                conn,
+                title,
+                sql: body,
+            };
+            self.status = match self.submit(&sub) {
+                Ok(n) => format!("自动执行 {n} 条语句 →「{}」", sub.conn),
+                Err(why) => why,
+            };
         }
     }
 
@@ -3720,6 +3836,11 @@ impl EasyEditorApp {
 
         // 编辑器在 central() 里才会把最新光标写回 OpenFile，所以放在最后收
         self.poll_caret(&ctx);
+        // 自动执行要看的是这一帧最新的文本，判完才知道要不要接着排闹钟
+        self.auto_tick(std::time::Instant::now());
+        if self.auto_due.is_some() {
+            ctx.request_repaint_after(AUTO_DEBOUNCE);
+        }
 
         if self.search.busy {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
@@ -5997,6 +6118,52 @@ mod tests {
             shown.iter().filter(|t| t.as_str() == "导出").count(),
             2,
             "两份查询结果各给一个导出按钮，存盘框归系统弹，这里只测按钮在不在：{shown:?}"
+        );
+    }
+
+    /// 把当前文件换成一个带 `auto` 标记的块，正文就是传进来的那句 SQL。
+    fn auto_text(app: &mut EasyEditorApp, sql: &str) {
+        let idx = app.active.unwrap();
+        app.tabs[idx].text =
+            format!("-- sql 探测 2026-01-01 10:00 [待执行] conn=本机 auto\n{sql}\n");
+    }
+
+    #[test]
+    fn an_auto_block_runs_itself_once_you_stop_typing() {
+        let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_auto");
+        auto_text(&mut app, "SELECT id FROM a");
+        let t0 = std::time::Instant::now();
+        app.auto_tick(t0);
+        assert_eq!(app.results.count(), 0, "刚发现就跑等于没防抖，字还没打完");
+        app.auto_tick(t0);
+        assert_eq!(app.results.count(), 0, "到点时间还没到，不该跑");
+
+        app.auto_tick(t0 + AUTO_DEBOUNCE + std::time::Duration::from_millis(1));
+        assert_eq!(app.results.count(), 1, "手停下来了，只读块该自己跑掉");
+        settle_results(&mut app, &ctx);
+
+        // 正文一个字没改，就不该再敲第二次门
+        app.auto_tick(t0 + AUTO_DEBOUNCE * 4);
+        assert_eq!(app.results.count(), 1, "同一份正文只自动跑一次");
+
+        // 改了正文才值得再算一遍
+        auto_text(&mut app, "SELECT id2 FROM a");
+        app.auto_tick(t0 + AUTO_DEBOUNCE * 5);
+        app.auto_tick(t0 + AUTO_DEBOUNCE * 8);
+        assert_eq!(app.results.count(), 2, "改了 SQL 就该重算");
+    }
+
+    #[test]
+    fn auto_never_runs_a_write_statement() {
+        let (_ctx, mut app, _dir) = app_on_sql_block("ee_sql_auto_write");
+        auto_text(&mut app, "DELETE FROM t");
+        let t0 = std::time::Instant::now();
+        app.auto_tick(t0);
+        app.auto_tick(t0 + AUTO_DEBOUNCE * 4);
+        assert_eq!(app.results.count(), 0, "标了 auto 的写操作也只能人手按");
+        assert!(
+            app.auto_ran.is_empty(),
+            "没跑就不该记账，改了正文还得再看一眼"
         );
     }
 

@@ -361,6 +361,19 @@ pub fn all_read_only(stmts: &[String]) -> bool {
     stmts.iter().all(|s| classify(s).is_read_only())
 }
 
+/// 这个块能不能自动跑：头部写了 `auto`，正文切出来有语句，而且条条只读。
+///
+/// 自动执行没有确认这一步，所以门槛宁可高一点：`INSERT`/`UPDATE`/`DELETE` 就算
+/// 标了 `auto` 也只走人手 Ctrl+Enter。只有注释、没有语句的块同样不算，
+/// 那种正文跑不出结果，自动执行会白占一个面板。
+pub fn auto_runnable(block: &Block, text: &str) -> bool {
+    if !block.auto {
+        return false;
+    }
+    let stmts = split_statements(block.sql(text));
+    !stmts.is_empty() && all_read_only(&stmts)
+}
+
 /// 按顶层分号切分语句，跳过引号、反引号和注释里的分号。
 ///
 /// 只做切分，不做语句合法性判断。注释块和 `DELIMITER` 改分隔符的存储过程写法
@@ -534,6 +547,34 @@ SELECT 2;
         assert_eq!(again[0].conn, "demo");
         assert!(again[0].auto);
         assert_eq!(new_text[again[0].body_start..].trim(), "SELECT 1;");
+    }
+
+    #[test]
+    fn auto_runnable_only_takes_read_only_bodies() {
+        let cases = [
+            ("-- sql x 2026-11-15 14:03 auto\nSELECT 1;\n", true),
+            (
+                "-- sql x 2026-11-15 14:03 auto\nSELECT 1;\nSHOW TABLES;\n",
+                true,
+            ),
+            (
+                "-- sql x 2026-11-15 14:03 auto\nSELECT 1;\nDELETE FROM t;\n",
+                false,
+            ),
+            ("-- sql x 2026-11-15 14:03 auto\nUPDATE t SET a=1;\n", false),
+            // 没标 auto 的块，正文再只读也不许自动跑
+            ("-- sql x 2026-11-15 14:03\nSELECT 1;\n", false),
+            // 只有注释：跑不出结果，别白占一个面板
+            ("-- sql x 2026-11-15 14:03 auto\n-- 只是注释\n", false),
+        ];
+        for (text, want) in cases {
+            let blocks = scan(text);
+            assert_eq!(
+                auto_runnable(&blocks[0], text),
+                want,
+                "「{text}\" 期望自动执行={want}"
+            );
+        }
     }
 
     #[test]
