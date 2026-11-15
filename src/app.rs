@@ -187,12 +187,20 @@ struct Submission {
     conn: String,
     title: String,
     sql: String,
+    /// `sql` 在文件里从哪个字节起跳，报错的语句要标回原文
+    base: usize,
     /// 结果面板「回块」跳到哪个字节
     jump: usize,
     /// 整块执行才记块头，跑完把头部回写成 `[已执行]` / `[失败]`
     block_head: Option<usize>,
     /// 状态栏后缀，说清楚这几条语句出自哪一块
     where_: String,
+}
+
+/// 区间开头那段空白有多长。交出去的是 trim 过的正文，下标得对齐回文件里。
+fn lead(text: &str, a: usize, b: usize) -> usize {
+    let raw = &text[a..b];
+    a + (raw.len() - raw.trim_start().len())
 }
 
 impl EasyEditorApp {
@@ -803,6 +811,7 @@ impl EasyEditorApp {
             path,
             conn,
             title,
+            base: lead(&text, a, b),
             sql: text[a..b].trim().to_string(),
             jump: origin,
             block_head,
@@ -825,17 +834,40 @@ impl EasyEditorApp {
         match self.database.run(&sub.conn, &sub.sql) {
             Ok(parts) if parts.is_empty() => Err("只有注释，没有语句可跑".into()),
             Ok(parts) => {
+                // 拆句和后台用的是同一把尺子，第 i 个区间必然对得上第 i 条语句
+                let mut spans = sql::split_ranges(&sub.sql).into_iter();
+                let owned: Vec<results::Part> = parts
+                    .into_iter()
+                    .map(|(task, stmt)| results::Part {
+                        task,
+                        stmt,
+                        range: spans.next().map(|(a, b)| (sub.base + a, sub.base + b)),
+                    })
+                    .collect();
+                let n = owned.len();
+                // 这一段重新跑了，旧的红色先抹掉：跑对了它不该还留在屏上
+                if let Some(idx) = self.tabs.iter().position(|t| t.path == sub.path) {
+                    let file = &mut self.tabs[idx];
+                    let (a, b) = (sub.base, sub.base + sub.sql.len());
+                    file.sql_errors = Arc::new(
+                        file.sql_errors
+                            .iter()
+                            .filter(|&&(x, y)| y <= a || x >= b)
+                            .copied()
+                            .collect(),
+                    );
+                }
                 self.results.start_run(
                     &sub.conn,
                     &sub.title,
-                    &parts,
+                    &owned,
                     Some(results::Origin {
                         path: sub.path.clone(),
                         jump: sub.jump,
                         block_head: sub.block_head,
                     }),
                 );
-                Ok(parts.len())
+                Ok(n)
             }
             Err(err) => Err(err),
         }
@@ -906,6 +938,7 @@ impl EasyEditorApp {
                 jump: block.head_start,
                 block_head: Some(block.head_start),
                 where_: String::new(),
+                base: lead(&text, block.body_start, block.body_end),
                 path: path.clone(),
                 conn,
                 title,
@@ -915,6 +948,26 @@ impl EasyEditorApp {
                 Ok(n) => format!("自动执行 {n} 条语句 →「{}」", sub.conn),
                 Err(why) => why,
             };
+        }
+    }
+
+    /// 跑失败的语句在原文里铺一层红底——改 SQL 的人第一眼要看到的是哪一句出的问题。
+    ///
+    /// 区间是提交那一帧量下的，中间文本改过就对不上号。所以只认原文正好等于这条
+    /// 语句的那一处，对不上宁可丢掉：少标一片红没人受害，标错地方会误导人改别句。
+    fn paint_failures(&mut self) {
+        for (path, a, b, stmt) in self.results.take_failures() {
+            let Some(idx) = self.tabs.iter().position(|t| t.path == path) else {
+                continue;
+            };
+            let file = &mut self.tabs[idx];
+            if file.text.get(a..b) != Some(stmt.as_str()) {
+                continue;
+            }
+            let dup = file.sql_errors.iter().any(|&(x, y)| (x, y) == (a, b));
+            if !dup {
+                Arc::make_mut(&mut file.sql_errors).push((a, b));
+            }
         }
     }
 
@@ -3758,6 +3811,7 @@ impl EasyEditorApp {
         for event in self.database.take_stray() {
             self.results.on_event(&event);
         }
+        self.paint_failures();
         // 一整批都到家了才回写块状态：半途写会把还在跑的块说成已经跑完
         for done in self.results.settled() {
             self.mark_block(&done);
@@ -5854,6 +5908,20 @@ mod tests {
         )
     }
 
+    /// 一执行就报错的假连接，用来试语句失败之后编辑器和结果区各干了什么。
+    fn failing_database() -> DatabasePanel {
+        DatabasePanel::with_hub(
+            crate::db::DbHub::with_driver(|_| {
+                Ok(Box::new(crate::db::MockDriver::failing("1064 语法错了")))
+            }),
+            vec![crate::db::ConnectionSpec {
+                name: "本机".into(),
+                database: "test".into(),
+                ..Default::default()
+            }],
+        )
+    }
+
     const SQL_BLOCK: &str = "-- sql 查用户 2026-01-01 10:00 [待执行] conn=本机\n\
                               SELECT id FROM a;\n\
                               SELECT name FROM b;\n";
@@ -5987,16 +6055,7 @@ mod tests {
     #[test]
     fn a_failing_run_leaves_nothing_spinning() {
         let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_failing");
-        app.database = DatabasePanel::with_hub(
-            crate::db::DbHub::with_driver(|_| {
-                Ok(Box::new(crate::db::MockDriver::failing("1064 语法错了")))
-            }),
-            vec![crate::db::ConnectionSpec {
-                name: "本机".into(),
-                database: "test".into(),
-                ..Default::default()
-            }],
-        );
+        app.database = failing_database();
         app.sql_run();
         settle_results(&mut app, &ctx);
         let out = frame(&mut app, &ctx, vec![]);
@@ -6025,16 +6084,7 @@ mod tests {
     #[test]
     fn a_failed_block_is_marked_as_failed() {
         let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_mark_failed");
-        app.database = DatabasePanel::with_hub(
-            crate::db::DbHub::with_driver(|_| {
-                Ok(Box::new(crate::db::MockDriver::failing("1064 语法错了")))
-            }),
-            vec![crate::db::ConnectionSpec {
-                name: "本机".into(),
-                database: "test".into(),
-                ..Default::default()
-            }],
-        );
+        app.database = failing_database();
         app.sql_run();
         settle_results(&mut app, &ctx);
         frame(&mut app, &ctx, vec![]);
@@ -6043,6 +6093,40 @@ mod tests {
             app.tabs[idx].text.contains("[失败]"),
             "有一条报错就该标成失败：{}",
             app.tabs[idx].text
+        );
+    }
+
+    #[test]
+    fn a_failing_statement_goes_red_in_the_block() {
+        let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_red");
+        app.database = failing_database();
+        app.sql_run();
+        settle_results(&mut app, &ctx);
+        // 头部回写 [失败] 让正文整体前移了 3 个字节，红底得跟着挪
+        frame(&mut app, &ctx, vec![]);
+        let idx = app.active.unwrap();
+        let file = &app.tabs[idx];
+        let marks = file.sql_errors.iter().copied().collect::<Vec<_>>();
+        assert_eq!(marks.len(), 1, "第二条是被连累跳过的，不该跟着红");
+        assert_eq!(
+            &file.text[marks[0].0..marks[0].1],
+            "SELECT id FROM a",
+            "红底没盖在报错的那句话上：{:?}",
+            file.text
+        );
+
+        // 改对了再跑一遍，旧的红色该跟着这次提交一起抹掉
+        app.database = mock_database();
+        app.tabs[idx].line = 2;
+        app.sql_run();
+        assert!(app.tabs[idx].sql_errors.is_empty(), "重跑先清掉这一段旧的红");
+        settle_results(&mut app, &ctx);
+        frame(&mut app, &ctx, vec![]);
+        let idx = app.active.unwrap();
+        assert!(
+            app.tabs[idx].sql_errors.is_empty(),
+            "这回两条都过了：{:?}",
+            app.tabs[idx].sql_errors
         );
     }
 

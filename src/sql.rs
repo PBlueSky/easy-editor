@@ -379,6 +379,17 @@ pub fn auto_runnable(block: &Block, text: &str) -> bool {
 /// 只做切分，不做语句合法性判断。注释块和 `DELIMITER` 改分隔符的存储过程写法
 /// 不在支持范围内——那种文件请人工拆开执行。
 pub fn split_statements(sql: &str) -> Vec<String> {
+    split_ranges(sql)
+        .into_iter()
+        .map(|(a, b)| sql[a..b].to_string())
+        .collect()
+}
+
+/// 和 `split_statements` 同一把尺子，但给的是字节区间而不是文本。
+///
+/// 报错的语句要在文件里标红，光有文本定位不了——同一句 `SELECT 1` 能写两遍。
+/// 两边都走这里，所以第 i 个区间必然对应第 i 条语句。
+pub fn split_ranges(sql: &str) -> Vec<(usize, usize)> {
     #[derive(PartialEq)]
     enum State {
         Normal,
@@ -388,7 +399,7 @@ pub fn split_statements(sql: &str) -> Vec<String> {
     }
 
     let bytes = sql.as_bytes();
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<(usize, usize)> = Vec::new();
     let mut start = 0usize;
     let mut i = 0usize;
     let mut state = State::Normal;
@@ -407,7 +418,7 @@ pub fn split_statements(sql: &str) -> Vec<String> {
                         i += 1;
                     }
                     b';' => {
-                        push_stmt(&mut out, &sql[start..i]);
+                        push_range(&mut out, sql, start, i);
                         start = i + 1;
                     }
                     _ => {}
@@ -445,11 +456,14 @@ pub fn split_statements(sql: &str) -> Vec<String> {
             }
         }
     }
-    push_stmt(&mut out, &sql[start..]);
+    push_range(&mut out, sql, start, sql.len());
     out
 }
 
-fn push_stmt(out: &mut Vec<String>, raw: &str) {
+/// 收下一段候选语句：掐头去尾的空白不算进去，纯注释直接丢掉。
+fn push_range(out: &mut Vec<(usize, usize)>, sql: &str, start: usize, end: usize) {
+    let raw = &sql[start..end];
+    let lead = raw.len() - raw.trim_start().len();
     let stmt = raw.trim();
     if stmt.is_empty() {
         return;
@@ -458,7 +472,8 @@ fn push_stmt(out: &mut Vec<String>, raw: &str) {
     if first_keyword(stmt).is_none() {
         return;
     }
-    out.push(stmt.to_string());
+    let a = start + lead;
+    out.push((a, a + stmt.len()));
 }
 
 #[cfg(test)]
@@ -547,6 +562,21 @@ SELECT 2;
         assert_eq!(again[0].conn, "demo");
         assert!(again[0].auto);
         assert_eq!(new_text[again[0].body_start..].trim(), "SELECT 1;");
+    }
+
+    #[test]
+    fn split_ranges_points_at_the_statement_not_its_padding() {
+        let sql = "  SELECT 1 ;\n\n  DELETE FROM t ;  ";
+        let ranges = split_ranges(sql);
+        assert_eq!(ranges.len(), 2);
+        // 区间正好圈住语句本身：前后的空白和分号都不沾，标红才不会糊到行尾
+        assert_eq!(&sql[ranges[0].0..ranges[0].1], "SELECT 1");
+        assert_eq!(&sql[ranges[1].0..ranges[1].1], "DELETE FROM t");
+        assert_eq!(
+            split_statements(sql),
+            vec!["SELECT 1".to_string(), "DELETE FROM t".to_string()],
+            "两条尺子得量出同样的东西"
+        );
     }
 
     #[test]

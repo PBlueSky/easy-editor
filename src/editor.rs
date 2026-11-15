@@ -61,6 +61,8 @@ pub struct OpenFile {
     pub current_match: Option<usize>,
     /// 选词高亮：当前选中的词在全文里的所有出现（字节范围）。
     pub occurrences: Arc<Vec<(usize, usize)>>,
+    /// SQL 里报错的那几条语句（字节范围）。执行结果回来时才写，跟查找无关。
+    pub sql_errors: Arc<Vec<(usize, usize)>>,
     /// 上一次高亮用的 `(词, 是否整词)`；选区没变就不重扫全文。
     occurrence_term: Option<(String, bool)>,
     pub bytes_len: usize,
@@ -99,6 +101,7 @@ impl OpenFile {
             matches: Arc::new(Vec::new()),
             current_match: None,
             occurrences: Arc::new(Vec::new()),
+            sql_errors: Arc::new(Vec::new()),
             occurrence_term: None,
             bytes_len,
             caret_byte: 0,
@@ -174,12 +177,43 @@ impl OpenFile {
         self.refresh_dirty();
         self.matches = Arc::new(Vec::new());
         self.current_match = None;
+        // 块头回写 `[待执行]`→`[失败]` 会让后面所有字节前移，红底得跟着挪，
+        // 不然下一次打开文件它就骑在别的语句上了
+        if !self.sql_errors.is_empty() {
+            let moved = shift_marks(&self.sql_errors, start, end, edit.insert.len());
+            self.sql_errors = Arc::new(moved);
+        }
         if let Some(caret) = edit.caret {
             let caret = caret.min(self.text.len());
             self.caret_byte = caret;
             self.pending_jump = Some(caret);
         }
     }
+}
+
+/// 文本改了一段，标错的区间跟着挪。
+///
+/// 整段在改动之前的原样留下，整段在之后的按增量平移，改动穿过的那条丢掉——
+/// 那片红说的是老句子，挂到新文本上只会指错地方。
+fn shift_marks(
+    ranges: &[(usize, usize)],
+    start: usize,
+    end: usize,
+    insert_len: usize,
+) -> Vec<(usize, usize)> {
+    let delta = insert_len as i64 - (end - start) as i64;
+    ranges
+        .iter()
+        .filter_map(|&(a, b)| {
+            if b <= start {
+                Some((a, b))
+            } else if a >= end {
+                Some(((a as i64 + delta) as usize, (b as i64 + delta) as usize))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// 内容指纹。只用来和「上次保存的内容」比较，碰撞概率可以忽略。
@@ -391,6 +425,12 @@ pub fn show(
     } else {
         Color32::from_rgb(190, 215, 240)
     };
+    // SQL 报错的语句：半透明红，笔画还得能看清，这条语句人是要照着改的
+    let err_bg = if dark {
+        Color32::from_rgba_unmultiplied(196, 60, 52, 96)
+    } else {
+        Color32::from_rgba_unmultiplied(224, 82, 72, 78)
+    };
 
     let scroll_id = ui.make_persistent_id(("editor_scroll", pane, file.path.clone()));
     let edit_id = ui.make_persistent_id(("editor_text", pane, file.path.clone()));
@@ -470,18 +510,25 @@ pub fn show(
             // 一旦字节数对不上就会切坏 UTF-8 字符。
             let matches = file.matches.clone();
             let occurrences = file.occurrences.clone();
+            let sql_errors = file.sql_errors.clone();
             let current_match = file.current_match;
             let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| -> Arc<Galley> {
                 let text = buf.as_str();
                 let spans = hl.highlight(Some(&path), text);
-                let overlay = merge_overlay(
+                // 报错的语句排在最前：`paint_overlay` 先到先得，
+                // 红底不能被查找 / 选词高亮盖掉——那条语句才是这一帧要人看的地方。
+                let mut overlay: Vec<Seg> = sql_errors
+                    .iter()
+                    .map(|(a, b)| (*a, *b, err_bg))
+                    .collect();
+                overlay.extend(merge_overlay(
                     &matches,
                     current_match,
                     &occurrences,
                     match_bg,
                     cur_match_bg,
                     occ_bg,
-                );
+                ));
                 // wrap_width 是 TextEdit 这一帧真正能给到文字的宽度：开了横向滚动它是
                 // 无穷大（不折行时本来就要保持原样），折行时正好就是视口宽度。
                 let galley = build_galley(
@@ -614,6 +661,8 @@ pub fn show(
         file.reindex();
         file.matches = Arc::new(Vec::new());
         file.current_match = None;
+        // SQL 报错的区间是按提交那一刻的文本算的，改过就不作数了
+        file.sql_errors = Arc::new(Vec::new());
     }
 
     EditorOutput { changed }
@@ -1053,6 +1102,23 @@ pub fn cursor_text(file: &OpenFile) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 块头从 `[待执行]` 回写成 `[失败]` 会让正文整体前移几个字节，
+    /// 红底要跟着挪；盖在改动里的那条说的是老句子，留着只会指错地方。
+    #[test]
+    fn an_edit_shifts_the_error_marks() {
+        let marks = [(0, 2), (10, 12), (20, 35)];
+        assert_eq!(
+            shift_marks(&marks, 2, 14, 11),
+            vec![(0, 2), (19, 34)],
+            "改动之前的原样留下，之后的按增量平移，穿过去的丢掉"
+        );
+        assert_eq!(
+            shift_marks(&marks, 0, 0, 6),
+            vec![(6, 8), (16, 18), (26, 41)],
+            "块头前面插一行，红底整体后移"
+        );
+    }
 
     /// 查找/选词高亮的底色必须严丝合缝盖住自己那一视觉行。
     ///

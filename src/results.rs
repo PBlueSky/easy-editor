@@ -44,6 +44,16 @@ pub struct Origin {
     pub block_head: Option<usize>,
 }
 
+/// 一条交出去的语句：`task` 是它的回执 id，`range` 是它在文件里的字节区间。
+///
+/// 区间用来把报错的那条在编辑器里标红。同一句 SQL 在一个文件里能写两遍，
+/// 光靠文本对不回位置，所以提交这一帧就得把区间记死。
+pub struct Part {
+    pub task: u64,
+    pub stmt: String,
+    pub range: Option<(usize, usize)>,
+}
+
 /// 一个语句结果面板。`task` 是 [`crate::db::DbHub::run`] 给这条语句发的 id。
 pub struct Panel {
     pub task: u64,
@@ -53,6 +63,8 @@ pub struct Panel {
     /// SQL 块标题，块外选中一段执行时是「选中内容」
     pub title: String,
     pub stmt: String,
+    /// 这条语句在文件里的字节区间，报错时按它标红
+    pub stmt_range: Option<(usize, usize)>,
     /// 这条语句出自哪个文件的哪个字节，用来跳回去、跑完回写状态
     pub origin: Option<Origin>,
     pub slot: Slot,
@@ -96,6 +108,9 @@ pub struct ResultsDock {
     popup: Option<u64>,
     /// 「导出」按下的那一帧攒在这儿，app 每帧取走一次去弹存盘框。
     pending_export: Option<Export>,
+    /// 报错语句在文件里的位置，攒着等 app 每帧取走标红。带上语句原文，
+    /// app 拿它对一下区间——中间用户改过文本的话区间就不作数了。
+    fails: Vec<(PathBuf, usize, usize, String)>,
 }
 
 impl Default for ResultsDock {
@@ -114,12 +129,18 @@ impl ResultsDock {
             pending_jump: None,
             popup: None,
             pending_export: None,
+            fails: Vec::new(),
         }
     }
 
     /// 取走攒下的导出请求；没有就返回 None，取一次就清空。
     pub fn take_export(&mut self) -> Option<Export> {
         self.pending_export.take()
+    }
+
+    /// 报错的语句在文件里占哪几个字节。app 取走一次就清空，标红归编辑器。
+    pub fn take_failures(&mut self) -> Vec<(PathBuf, usize, usize, String)> {
+        std::mem::take(&mut self.fails)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -140,17 +161,18 @@ impl ResultsDock {
         &mut self,
         conn: &str,
         title: &str,
-        parts: &[(u64, String)],
+        parts: &[Part],
         origin: Option<Origin>,
     ) -> u64 {
         let run = self.next_run;
         self.next_run += 1;
-        let batch = parts.iter().map(|(task, stmt)| Panel {
-            task: *task,
+        let batch = parts.iter().map(|part| Panel {
+            task: part.task,
             run,
             conn: conn.to_string(),
             title: title.to_string(),
-            stmt: stmt.clone(),
+            stmt: part.stmt.clone(),
+            stmt_range: part.range,
             origin: origin.clone(),
             slot: Slot::Running,
             collapsed: false,
@@ -214,6 +236,14 @@ impl ResultsDock {
                 let run = self.panels[index].run;
                 let task = self.panels[index].task;
                 self.panels[index].slot = Slot::Failed(err.clone());
+                // 报错的那条在文件里占哪几个字节，攒给 app 标红
+                if let (Some(Origin { path, .. }), Some((a, b))) = (
+                    self.panels[index].origin.as_ref(),
+                    self.panels[index].stmt_range,
+                ) {
+                    let stmt = self.panels[index].stmt.clone();
+                    self.fails.push((path.clone(), a, b, stmt));
+                }
                 // 一条连接只有一个工作线程，前一条报错后面就不送了。
                 // 不标出来的话那些面板会永远停在「执行中」。
                 for panel in &mut self.panels {
@@ -859,15 +889,19 @@ mod tests {
     }
 
     /// 语句 id 从 `base + 1` 递增，模拟 hub 连续发号
-    fn parts(stmts: &[&str]) -> Vec<(u64, String)> {
+    fn parts(stmts: &[&str]) -> Vec<Part> {
         offset_parts(stmts, 0)
     }
 
-    fn offset_parts(stmts: &[&str], base: u64) -> Vec<(u64, String)> {
+    fn offset_parts(stmts: &[&str], base: u64) -> Vec<Part> {
         stmts
             .iter()
             .enumerate()
-            .map(|(i, s)| (base + i as u64 + 1, s.to_string()))
+            .map(|(i, s)| Part {
+                task: base + i as u64 + 1,
+                stmt: s.to_string(),
+                range: None,
+            })
             .collect()
     }
 
@@ -928,13 +962,60 @@ mod tests {
     fn old_panels_get_evicted() {
         let mut dock = ResultsDock::new();
         for run in 0..3 {
-            let batch: Vec<(u64, String)> = (0..3)
-                .map(|i| (run * 10 + i + 1, format!("SELECT {run}_{i}")))
+            let batch: Vec<Part> = (0..3)
+                .map(|i| Part {
+                    task: run * 10 + i + 1,
+                    stmt: format!("SELECT {run}_{i}"),
+                    range: None,
+                })
                 .collect();
             dock.start_run("本机", "块", &batch, None);
         }
         assert_eq!(dock.count(), MAX_PANELS, "最多留 {MAX_PANELS} 个");
         assert_eq!(dock.panels[0].task, 21, "挤剩的该是最早那批的尾巴");
+    }
+
+    #[test]
+    fn a_failure_hands_back_the_span_it_came_from() {
+        let mut dock = ResultsDock::new();
+        let file = PathBuf::from("d:/a.sql");
+        let owned = |stmts: &[&str]| -> Vec<Part> {
+            stmts
+                .iter()
+                .enumerate()
+                .map(|(i, s)| Part {
+                    task: i as u64 + 1,
+                    stmt: s.to_string(),
+                    // 假装有区间：每条往后挪 10 个字节
+                    range: Some((i * 10 + 7, i * 10 + 7 + s.len())),
+                })
+                .collect()
+        };
+        let origin = Origin {
+            path: file.clone(),
+            jump: 0,
+            block_head: None,
+        };
+        dock.start_run(
+            "本机",
+            "块",
+            &owned(&["SELECT 1;", "BAD SYNTAX"]),
+            Some(origin),
+        );
+        assert!(dock.take_failures().is_empty(), "回执还没来，红底无从谈起");
+        dock.on_event(&event(1, Ok(query(1, 1))));
+        assert!(dock.take_failures().is_empty(), "跑对的那条不该标");
+        dock.on_event(&event(2, Err(DbError::new("语法错了").to_string())));
+        let fails = dock.take_failures();
+        assert_eq!(fails.len(), 1);
+        assert_eq!(fails[0].0, file);
+        assert_eq!(fails[0].1, 17);
+        assert_eq!(fails[0].2, 27);
+        assert_eq!(fails[0].3, "BAD SYNTAX");
+        assert!(
+            dock.take_failures().is_empty(),
+            "取走一次就清空，红底不能每帧重铺一遍"
+        );
     }
 
     #[test]
