@@ -8,8 +8,8 @@
 //!   格式化交给服务端，结果天然和 `mysql` 命令行看到的一致；
 //! - 预处理语句要自己管占位符，而用户写的 SQL 里 `?` 到处都是。
 //!
-//! 多条语句由 `crate::sql::split_statements` 切开逐条执行，逐条返回结果。
-//! 刻意不合并成一个结果集：一个块里三条 SELECT 就该出三个面板。
+//! 一个块里的多条语句由 `DbHub::run` 用 `crate::sql::split_statements` 切开，
+//! 逐条送进 `execute`。刻意不合并成一个结果集：一个块里三条 SELECT 就该出三个面板。
 
 use std::time::Duration;
 
@@ -30,13 +30,10 @@ pub struct MysqlDriver {
 }
 
 impl Driver for MysqlDriver {
-    fn execute(&mut self, sql: &str, max_rows: usize) -> Result<Vec<StatementResult>, DbError> {
-        let max_rows = max_rows.clamp(1, MAX_ROWS);
-        let mut out = Vec::new();
-        for stmt in crate::sql::split_statements(sql) {
-            out.push(self.run_one(&stmt, max_rows)?);
-        }
-        Ok(out)
+    /// 跑一条语句。切分在上层（`DbHub::run`），所以这里不需要循环，
+    /// 也就不会出现「第 2 条报错把第 1 条的结果一起丢掉」。
+    fn execute(&mut self, stmt: &str, max_rows: usize) -> Result<StatementResult, DbError> {
+        self.run_one(stmt, max_rows.clamp(1, MAX_ROWS))
     }
 
     fn list_databases(&mut self) -> Result<Vec<String>, DbError> {
@@ -314,18 +311,17 @@ mod tests {
         let dbs = driver.list_databases().unwrap();
         assert!(dbs.contains(&"mysql".to_string()), "实际 {dbs:?}");
 
-        let list = driver
-            .execute("SELECT 1 AS one; SELECT 2 AS two", 100)
-            .unwrap();
-        assert_eq!(list.len(), 2, "两条 SELECT 就该出两个结果，不合并");
-        assert_eq!(list[0].columns[0].name, "one");
-        assert_eq!(list[0].rows[0][0], Cell::Text("1".into()));
+        // 驱动一次只吃一条语句（切分在 DbHub），这里就逐条喂
+        let first = driver.execute("SELECT 1 AS one", 100).unwrap();
+        assert_eq!(first.columns[0].name, "one");
+        assert_eq!(first.rows[0][0], Cell::Text("1".into()));
+        let second = driver.execute("SELECT 2 AS two", 100).unwrap();
+        assert_eq!(second.columns[0].name, "two");
+        assert_eq!(second.rows[0][0], Cell::Text("2".into()));
 
-        let capped = driver
-            .execute("SELECT * FROM mysql.user", 1)
-            .unwrap();
+        let capped = driver.execute("SELECT * FROM mysql.user", 1).unwrap();
         assert!(
-            capped[0].truncated || capped[0].rows.len() < 2,
+            capped.truncated || capped.rows.len() < 2,
             "max_rows=1 要么截断要么本来就只有一行"
         );
     }

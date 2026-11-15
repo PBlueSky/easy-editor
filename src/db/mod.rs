@@ -244,10 +244,12 @@ impl std::fmt::Display for DbError {
 impl std::error::Error for DbError {}
 
 /// 一个后台任务的产出。
+///
+/// 一次 `Done` 就是一条语句的结果：一个块拆出的多条语句各发各的，
+/// 后面那条失败不会把前面已经拿到的结果一起丢掉。
 #[derive(Clone, Debug)]
 pub enum DbOutcome {
-    /// 按语句顺序，一条一个结果
-    Statements(Vec<StatementResult>),
+    Statement(StatementResult),
     /// `SHOW DATABASES` / 表名列表这类只回一串名字的
     Names(Vec<String>),
     /// 「测试连接」的回执，一句能证明连上了的话，比如版本号
@@ -257,11 +259,12 @@ pub enum DbOutcome {
 impl DbOutcome {
     pub fn describe(&self) -> String {
         match self {
-            Self::Statements(list) => {
-                let rows: usize = list.iter().map(|s| s.row_count()).sum();
-                let affected: u64 = list.iter().map(|s| s.affected_rows).sum();
-                let ms: u128 = list.iter().map(|s| s.elapsed_ms).sum();
-                format!("{} 条语句 · {rows} 行 · 影响 {affected} 行 · {ms} ms", list.len())
+            Self::Statement(one) => {
+                if one.is_query() {
+                    format!("{} 行 · {} ms", one.row_count(), one.elapsed_ms)
+                } else {
+                    format!("影响 {} 行 · {} ms", one.affected_rows, one.elapsed_ms)
+                }
             }
             Self::Names(names) => format!("{} 项", names.len()),
             Self::Message(text) => text.clone(),
@@ -271,9 +274,9 @@ impl DbOutcome {
 
 /// 一个引擎要实现的最小接口。调用方保证同一实例只被一个线程用。
 pub trait Driver: Send {
-    /// 逐条执行，结果按语句顺序返回。中途失败就停，已经跑掉的语句不回滚——
-    /// 块级事务不是这一层能替用户猜的，要事务就自己在 SQL 里写 `START TRANSACTION`。
-    fn execute(&mut self, sql: &str, max_rows: usize) -> Result<Vec<StatementResult>, DbError>;
+    /// 执行**一条**语句。切分由 [`DbHub::run`] 做，这样每条语句才有自己的任务 id，
+    /// 结果也才能各回各的面板。
+    fn execute(&mut self, stmt: &str, max_rows: usize) -> Result<StatementResult, DbError>;
 
     fn list_databases(&mut self) -> Result<Vec<String>, DbError>;
     fn list_tables(&mut self, database: &str) -> Result<Vec<String>, DbError>;
@@ -286,16 +289,25 @@ pub trait Driver: Send {
 /// 测试要能把它换成 `MockDriver`，线程编排才能在没有 MySQL 的机器上跑。
 type ConnectFn = fn(&ConnectionSpec) -> Result<Box<dyn Driver>, DbError>;
 
-enum Work {
-    Execute { sql: String, max_rows: usize },
+/// 一次只回一个结果的请求。整块执行不走它，见 [`Job::Run`]。
+enum Call {
     Databases,
-    Tables { database: String },
+    Tables {
+        database: String,
+    },
     Probe,
 }
 
-struct Job {
-    id: u64,
-    work: Work,
+/// 派给工作线程的一次任务。
+enum Job {
+    /// 一个块拆出来的若干条语句，每条带自己的任务 id。逐条执行、逐条回报，
+    /// 中途失败就停，后面的语句不再发事件。
+    Run {
+        parts: Vec<(u64, String)>,
+        max_rows: usize,
+    },
+    /// 库表列表、测试连接这类一条一个回执的调用
+    Call { id: u64, call: Call },
 }
 
 /// 后台线程送回的消息
@@ -315,7 +327,7 @@ enum Msg {
 /// 轮询到的一条完成事件。
 #[derive(Debug)]
 pub struct DbEvent {
-    /// `submit` 的返回值，UI 用它把结果认领到对应的结果面板
+    /// [`DbHub::run`] 返回的那个 id，UI 用它把结果认领到对应的结果面板
     pub id: u64,
     pub conn: String,
     pub outcome: Result<DbOutcome, String>,
@@ -349,36 +361,73 @@ impl DbHub {
         }
     }
 
-    /// 提交一次执行，返回任务 id。
-    pub fn run(&mut self, spec: &ConnectionSpec, sql: String, max_rows: usize) -> Result<u64, DbError> {
-        self.submit(
-            spec,
-            Work::Execute {
-                sql,
-                max_rows: max_rows.clamp(1, MAX_ROWS),
-            },
-        )
-    }
-
-    pub fn databases(&mut self, spec: &ConnectionSpec) -> Result<u64, DbError> {
-        self.submit(spec, Work::Databases)
-    }
-
-    pub fn tables(&mut self, spec: &ConnectionSpec, database: String) -> Result<u64, DbError> {
-        self.submit(spec, Work::Tables { database })
-    }
-
-    pub fn probe(&mut self, spec: &ConnectionSpec) -> Result<u64, DbError> {
-        self.submit(spec, Work::Probe)
-    }
-
-    fn submit(&mut self, spec: &ConnectionSpec, work: Work) -> Result<u64, DbError> {
+    /// 提交一个块，返回 `Vec[(任务 id, 语句原文)]`，按执行顺序。
+    ///
+    /// 拆句在这里做、每条给一个 id，底部结果区才能一个面板挂一条：
+    /// 第 2 条报错时第 1 条的结果已经各自到家，不会跟着一次失败一起丢。
+    /// 返回空表示块里没有语句（纯注释）。
+    pub fn run(
+        &mut self,
+        spec: &ConnectionSpec,
+        block: &str,
+        max_rows: usize,
+    ) -> Result<Vec<(u64, String)>, DbError> {
         if let Some(field) = spec.missing() {
             return Err(DbError::new(format!("连接配置缺少{field}")));
         }
+        let parts: Vec<(u64, String)> = crate::sql::split_statements(block)
+            .into_iter()
+            .map(|stmt| {
+                let id = self.take_id();
+                (id, stmt)
+            })
+            .collect();
+        if parts.is_empty() {
+            return Ok(parts);
+        }
+        let max_rows = max_rows.clamp(1, MAX_ROWS);
+        self.ensure_worker(spec);
+        let tx = self.workers[&spec.name].1.clone();
+        // 工作线程只可能在 hub 被 drop 后退出，那时整个应用也要走了，不特别处理
+        let _ = tx.send(Job::Run {
+            parts: parts.clone(),
+            max_rows,
+        });
+        Ok(parts)
+    }
+
+    pub fn databases(&mut self, spec: &ConnectionSpec) -> Result<u64, DbError> {
+        self.submit(spec, Call::Databases)
+    }
+
+    pub fn tables(&mut self, spec: &ConnectionSpec, database: String) -> Result<u64, DbError> {
+        self.submit(spec, Call::Tables { database })
+    }
+
+    pub fn probe(&mut self, spec: &ConnectionSpec) -> Result<u64, DbError> {
+        self.submit(spec, Call::Probe)
+    }
+
+    fn submit(&mut self, spec: &ConnectionSpec, call: Call) -> Result<u64, DbError> {
+        if let Some(field) = spec.missing() {
+            return Err(DbError::new(format!("连接配置缺少{field}")));
+        }
+        let id = self.take_id();
+        self.ensure_worker(spec);
+        let tx = self.workers[&spec.name].1.clone();
+        // 工作线程只可能在 hub 被 drop 后退出，那时整个应用也要走了，不特别处理
+        let _ = tx.send(Job::Call { id, call });
+        Ok(id)
+    }
+
+    fn take_id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
+        id
+    }
 
+    /// 保证这个连接有一条用自己的工作线程：没有就建，配置改过就换一条。
+    fn ensure_worker(&mut self, spec: &ConnectionSpec) {
         let stale = self
             .workers
             .get(&spec.name)
@@ -391,10 +440,6 @@ impl DbHub {
             let tx = self.spawn(spec.clone());
             self.workers.insert(spec.name.clone(), (spec.clone(), tx));
         }
-        let tx = self.workers[&spec.name].1.clone();
-        // 工作线程只可能在 hub 被 drop 后退出，那时整个应用也要走了，不特别处理
-        let _ = tx.send(Job { id, work });
-        Ok(id)
     }
 
     fn spawn(&self, spec: ConnectionSpec) -> Sender<Job> {
@@ -404,17 +449,26 @@ impl DbHub {
         std::thread::spawn(move || {
             let mut driver: Option<Box<dyn Driver>> = None;
             while let Ok(job) = job_rx.recv() {
+                // 一个块的多条语句各有自己的任务 id，出错时得挨个报回去：
+                // 只报第一条的话，其余面板会永远停在「执行中」。
+                let ids: Vec<u64> = match &job {
+                    Job::Run { parts, .. } => parts.iter().map(|(id, _)| *id).collect(),
+                    Job::Call { id, .. } => vec![*id],
+                };
                 // 连不上不算致命：把失败报回去，下个任务再试一次，
                 // 免得一时的网络抖动把这条连接的线程整个带走。
                 if driver.is_none() {
                     match connect(&spec) {
                         Ok(fresh) => driver = Some(fresh),
                         Err(err) => {
-                            let _ = reply.send(Msg::Failed {
-                                id: job.id,
-                                conn: spec.name.clone(),
-                                error: err.to_string(),
-                            });
+                            let error = err.to_string();
+                            for id in ids {
+                                let _ = reply.send(Msg::Failed {
+                                    id,
+                                    conn: spec.name.clone(),
+                                    error: error.clone(),
+                                });
+                            }
                             continue;
                         }
                     }
@@ -423,34 +477,72 @@ impl DbHub {
                     Some(d) => d,
                     None => continue,
                 };
-                let outcome = match job.work {
-                    Work::Execute { sql, max_rows } => {
-                        target.execute(&sql, max_rows).map(DbOutcome::Statements)
-                    }
-                    Work::Databases => target.list_databases().map(DbOutcome::Names),
-                    Work::Tables { database } => target.list_tables(&database).map(DbOutcome::Names),
-                    Work::Probe => target.probe().map(DbOutcome::Message),
-                };
-                let sent = match outcome {
-                    Ok(outcome) => Msg::Done {
-                        id: job.id,
-                        conn: spec.name.clone(),
-                        outcome,
-                    },
-                    Err(err) => {
-                        // 会话级错误之后这个连接不可信，丢掉等下个任务重连。
-                        // SQL 本身的错误（语法、字段不存在）不在此列，连接照常能用。
-                        if err.needs_reconnect {
-                            driver = None;
+                // 会话是否废了。逐条执行时先记下来，跑完再丢驱动：
+                // `target` 还借在 `driver` 上，同一段作用域里直接赋值过不了借用检查。
+                let mut session_dead = false;
+                match job {
+                    Job::Run { parts, max_rows } => {
+                        for (id, stmt) in parts {
+                            let (sent, failed) = match target.execute(&stmt, max_rows) {
+                                Ok(one) => (
+                                    Msg::Done {
+                                        id,
+                                        conn: spec.name.clone(),
+                                        outcome: DbOutcome::Statement(one),
+                                    },
+                                    false,
+                                ),
+                                Err(err) => {
+                                    session_dead = err.needs_reconnect;
+                                    (
+                                        Msg::Failed {
+                                            id,
+                                            conn: spec.name.clone(),
+                                            error: err.to_string(),
+                                        },
+                                        true,
+                                    )
+                                }
+                            };
+                            let _ = reply.send(sent);
+                            if failed {
+                                // 前一条没成，后面几条大概率也跟着错，写语句连跑更危险。
+                                // 没发出去的那些不会有任何回执，结果面板自己标成「未执行」。
+                                break;
+                            }
                         }
-                        Msg::Failed {
-                            id: job.id,
-                            conn: spec.name.clone(),
-                            error: err.to_string(),
-                        }
                     }
-                };
-                let _ = reply.send(sent);
+                    Job::Call { id, call } => {
+                        let outcome = match call {
+                            Call::Databases => target.list_databases().map(DbOutcome::Names),
+                            Call::Tables { database } => {
+                                target.list_tables(&database).map(DbOutcome::Names)
+                            }
+                            Call::Probe => target.probe().map(DbOutcome::Message),
+                        };
+                        let sent = match outcome {
+                            Ok(outcome) => Msg::Done {
+                                id,
+                                conn: spec.name.clone(),
+                                outcome,
+                            },
+                            Err(err) => {
+                                // 会话级错误之后这个连接不可信，丢掉等下个任务重连。
+                                // SQL 本身的错误（语法、字段不存在）不在此列，连接照常能用。
+                                session_dead = err.needs_reconnect;
+                                Msg::Failed {
+                                    id,
+                                    conn: spec.name.clone(),
+                                    error: err.to_string(),
+                                }
+                            }
+                        };
+                        let _ = reply.send(sent);
+                    }
+                }
+                if session_dead {
+                    driver = None;
+                }
             }
         });
         job_tx
@@ -568,53 +660,48 @@ impl Default for MockDriver {
 }
 
 impl Driver for MockDriver {
-    fn execute(&mut self, sql: &str, max_rows: usize) -> Result<Vec<StatementResult>, DbError> {
+    fn execute(&mut self, stmt: &str, max_rows: usize) -> Result<StatementResult, DbError> {
         if self.fail.is_some() {
             return Err(self.err());
         }
-        self.record(sql);
-        Ok(crate::sql::split_statements(sql)
-            .into_iter()
-            .map(|stmt| {
-                let is_read = crate::sql::classify(&stmt).is_read_only();
-                let total = self.rows.min(max_rows);
-                StatementResult {
-                    columns: if is_read {
-                        vec![
-                            Column {
-                                name: "id".into(),
-                                type_name: "LONGLONG".into(),
-                            },
-                            Column {
-                                name: "name".into(),
-                                type_name: "VARCHAR".into(),
-                            },
-                        ]
-                    } else {
-                        Vec::new()
+        self.record(stmt);
+        let is_read = crate::sql::classify(stmt).is_read_only();
+        let total = self.rows.min(max_rows);
+        Ok(StatementResult {
+            columns: if is_read {
+                vec![
+                    Column {
+                        name: "id".into(),
+                        type_name: "LONGLONG".into(),
                     },
-                    rows: (0..total)
-                        .map(|i| {
-                            vec![
-                                Cell::Text((i + 1).to_string()),
-                                // 第 3 行留一个 NULL，让渲染层有机会显示灰色 NULL
-                                if i == 2 {
-                                    Cell::Null
-                                } else {
-                                    Cell::Text(format!("行{i}"))
-                                },
-                            ]
-                        })
-                        .collect(),
-                    affected_rows: if is_read { total as u64 } else { self.rows as u64 },
-                    last_insert_id: if is_read { 0 } else { 42 },
-                    warnings: 0,
-                    truncated: self.rows > max_rows,
-                    elapsed_ms: 1,
-                    preview: preview_of(&stmt),
-                }
-            })
-            .collect())
+                    Column {
+                        name: "name".into(),
+                        type_name: "VARCHAR".into(),
+                    },
+                ]
+            } else {
+                Vec::new()
+            },
+            rows: (0..total)
+                .map(|i| {
+                    vec![
+                        Cell::Text((i + 1).to_string()),
+                        // 第 3 行留一个 NULL，让渲染层有机会显示灰色 NULL
+                        if i == 2 {
+                            Cell::Null
+                        } else {
+                            Cell::Text(format!("行{i}"))
+                        },
+                    ]
+                })
+                .collect(),
+            affected_rows: if is_read { total as u64 } else { self.rows as u64 },
+            last_insert_id: if is_read { 0 } else { 42 },
+            warnings: 0,
+            truncated: self.rows > max_rows,
+            elapsed_ms: 1,
+            preview: preview_of(stmt),
+        })
     }
 
     fn list_databases(&mut self) -> Result<Vec<String>, DbError> {
@@ -773,35 +860,80 @@ mod tests {
     }
 
     #[test]
-    fn hub_runs_a_query_and_reports_it_back() {
+    fn a_block_becomes_one_task_per_statement() {
         let mut hub = DbHub::with_driver(|_| Ok(Box::new(MockDriver::new())));
-        let id = hub
-            .run(&spec("demo"), "SELECT 1; SELECT 2".into(), 100)
-            .unwrap();
-        let events = wait(&mut hub);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].id, id);
-        assert_eq!(events[0].conn, "demo");
-        match &events[0].outcome {
-            Ok(DbOutcome::Statements(list)) => {
-                assert_eq!(list.len(), 2, "两条语句要出两个结果");
-                assert!(list[0].is_query());
-                assert_eq!(list[0].columns[0].name, "id");
-                assert_eq!(list[0].row_count(), 2);
-                assert_eq!(list[0].preview, "SELECT 1");
-                assert_eq!(list[1].preview, "SELECT 2");
+        let parts = hub.run(&spec("demo"), "SELECT 1; SELECT 2", 100).unwrap();
+        let stmts: Vec<&str> = parts.iter().map(|(_, s)| s.as_str()).collect();
+        assert_eq!(stmts, vec!["SELECT 1", "SELECT 2"], "切好的语句要原样交回，面板标题靠它");
+        let events = wait_all(&mut hub, 2);
+        assert_eq!(events.len(), 2, "两条语句各回一个事件，不打包");
+        // 同一个连接线程串行执行、按序回报，所以事件顺序就是语句顺序
+        for (event, (id, stmt)) in events.iter().zip(&parts) {
+            assert_eq!(event.id, *id);
+            assert_eq!(event.conn, "demo");
+            match &event.outcome {
+                Ok(DbOutcome::Statement(one)) => {
+                    assert!(one.is_query());
+                    assert_eq!(one.columns[0].name, "id");
+                    assert_eq!(one.row_count(), 2);
+                    assert_eq!(&one.preview, stmt);
+                }
+                other => panic!("期望语句结果，拿到 {other:?}"),
             }
-            other => panic!("期望语句结果，拿到 {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_failing_statement_keeps_the_results_before_it() {
+        // 第 2 条报错：第 1 条的结果已经各自到家，第 3 条根本不跑、也不发事件，
+        // 由结果面板把它标成「未执行」。
+        struct SecondFails;
+        impl Driver for SecondFails {
+            fn execute(&mut self, stmt: &str, _: usize) -> Result<StatementResult, DbError> {
+                if stmt.contains("bad") {
+                    return Err(DbError {
+                        message: "语法错了".into(),
+                        code: Some(1064),
+                        needs_reconnect: false,
+                    });
+                }
+                Ok(StatementResult::empty(&preview_of(stmt)))
+            }
+            fn list_databases(&mut self) -> Result<Vec<String>, DbError> {
+                Ok(vec![])
+            }
+            fn list_tables(&mut self, _: &str) -> Result<Vec<String>, DbError> {
+                Ok(vec![])
+            }
+            fn probe(&mut self) -> Result<String, DbError> {
+                Ok("ok".into())
+            }
+        }
+        let mut hub = DbHub::with_driver(|_| Ok(Box::new(SecondFails)));
+        let parts = hub
+            .run(&spec("demo"), "SELECT 1; SELECT bad; SELECT 3", 10)
+            .unwrap();
+        assert_eq!(parts.len(), 3);
+
+        let events = wait_all(&mut hub, 2);
+        assert!(events[0].outcome.is_ok(), "第一条的结果要留着：{:?}", events[0]);
+        assert_eq!(events[0].id, parts[0].0);
+        assert!(
+            matches!(&events[1].outcome, Err(text) if text.contains("语法错了")),
+            "{:?}",
+            events[1]
+        );
+        assert_eq!(events[1].id, parts[1].0);
+        assert!(hub.poll().is_empty(), "第三条没跑，就该一声不吭");
     }
 
     #[test]
     fn a_failing_task_does_not_take_the_worker_thread_down() {
         let mut hub = DbHub::with_driver(|_| Ok(Box::new(MockDriver::failing("语法错了"))));
-        let bad = hub.run(&spec("demo"), "SELECT".into(), 100).unwrap();
+        let bad = hub.run(&spec("demo"), "SELECT", 100).unwrap();
         let events = wait(&mut hub);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].id, bad);
+        assert_eq!(events[0].id, bad[0].0);
         assert!(
             matches!(&events[0].outcome, Err(text) if text.contains("语法错了")),
             "{:?}",
@@ -823,7 +955,7 @@ mod tests {
     fn hub_rejects_an_incomplete_spec_before_spawning() {
         let mut hub = DbHub::with_driver(|_| Ok(Box::new(MockDriver::new())));
         let err = hub
-            .run(&ConnectionSpec::default(), "SELECT 1".into(), 100)
+            .run(&ConnectionSpec::default(), "SELECT 1", 100)
             .unwrap_err();
         assert!(err.message.contains("名称"), "实际 {err}");
         assert!(wait(&mut hub).is_empty());
@@ -839,7 +971,7 @@ mod tests {
             Ok(Box::new(MockDriver::new()))
         }
         let mut hub = DbHub::with_driver(build);
-        hub.run(&spec("demo"), "SELECT 1".into(), 100).unwrap();
+        hub.run(&spec("demo"), "SELECT 1", 100).unwrap();
         wait(&mut hub);
         hub.databases(&spec("demo")).unwrap();
         wait(&mut hub);
@@ -886,7 +1018,7 @@ mod tests {
         }
         struct FlakyDriver;
         impl Driver for FlakyDriver {
-            fn execute(&mut self, _: &str, _: usize) -> Result<Vec<StatementResult>, DbError> {
+            fn execute(&mut self, _: &str, _: usize) -> Result<StatementResult, DbError> {
                 let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if n == 0 {
                     Err(DbError {
@@ -895,7 +1027,7 @@ mod tests {
                         needs_reconnect: true,
                     })
                 } else {
-                    Ok(vec![StatementResult::empty("SELECT 1")])
+                    Ok(StatementResult::empty("SELECT 1"))
                 }
             }
             fn list_databases(&mut self) -> Result<Vec<String>, DbError> {
@@ -910,13 +1042,13 @@ mod tests {
         }
 
         let mut hub = DbHub::with_driver(build);
-        hub.run(&spec("demo"), "SELECT 1".into(), 10).unwrap();
+        hub.run(&spec("demo"), "SELECT 1", 10).unwrap();
         let events = wait(&mut hub);
         assert!(events[0].outcome.is_err());
-        hub.run(&spec("demo"), "SELECT 1".into(), 10).unwrap();
+        hub.run(&spec("demo"), "SELECT 1", 10).unwrap();
         let events = wait(&mut hub);
         assert!(
-            matches!(&events[0].outcome, Ok(DbOutcome::Statements(_))),
+            matches!(&events[0].outcome, Ok(DbOutcome::Statement(_))),
             "断连后下个任务应该自动重连再跑：{:?}",
             events[0].outcome
         );
@@ -931,13 +1063,12 @@ mod tests {
                 ..MockDriver::new()
             }))
         });
-        hub.run(&spec("demo"), "SELECT * FROM big".into(), 999_999)
-            .unwrap();
+        hub.run(&spec("demo"), "SELECT * FROM big", 999_999).unwrap();
         let events = wait(&mut hub);
         match &events[0].outcome {
-            Ok(DbOutcome::Statements(list)) => {
-                assert_eq!(list[0].row_count(), MAX_ROWS);
-                assert!(list[0].truncated, "截断过就要标出来，别让用户以为拿全了");
+            Ok(DbOutcome::Statement(one)) => {
+                assert_eq!(one.row_count(), MAX_ROWS);
+                assert!(one.truncated, "截断过就要标出来，别让用户以为拿全了");
             }
             other => panic!("期望语句结果，拿到 {other:?}"),
         }
@@ -956,56 +1087,43 @@ mod tests {
     }
 
     #[test]
-    fn comment_only_block_yields_no_results() {
-        // 只有注释的块不该占一个结果面板：sql 层已经把注释片段丢了
-        let mut mock = MockDriver::new();
-        let list = mock
-            .execute("-- 只是说明\n/* 也没语句 */", 100)
+    fn comment_only_block_becomes_no_task() {
+        // 只有注释的块不该占一个结果面板，也不该为它起一条连接线程
+        let mut hub = DbHub::with_driver(|_| Ok(Box::new(MockDriver::new())));
+        let parts = hub
+            .run(&spec("demo"), "-- 只是说明\n/* 也没语句 */", 100)
             .unwrap();
-        assert!(list.is_empty(), "实际 {} 条", list.len());
+        assert!(parts.is_empty(), "实际 {} 条", parts.len());
+        assert!(
+            hub.connections().is_empty(),
+            "没语句可跑，线程也不用开"
+        );
     }
 
     #[test]
     fn mock_write_statement_has_no_grid() {
         let mut mock = MockDriver::new();
-        let list = mock
-            .execute("DELETE FROM t WHERE id = 1", 100)
-            .unwrap();
-        assert_eq!(list.len(), 1);
-        assert!(!list[0].is_query());
-        assert_eq!(list[0].affected_rows, 2);
-        assert_eq!(list[0].last_insert_id, 42);
-        assert_eq!(list[0].preview, "DELETE FROM t WHERE id = 1");
-    }
-
-    #[test]
-    fn mock_records_the_whole_block_once() {
-        let shared: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
-        let mut mock = MockDriver {
-            executed: shared.clone(),
-            ..MockDriver::new()
-        };
-        mock.execute("SELECT 1; SELECT 2", 100).unwrap();
-        let sent = shared.lock().unwrap().clone();
-        assert_eq!(sent.len(), 1, "整块只该交给驱动一次，不是每条语句一次");
-        assert_eq!(sent[0], "SELECT 1; SELECT 2");
+        let one = mock.execute("DELETE FROM t WHERE id = 1", 100).unwrap();
+        assert!(!one.is_query());
+        assert_eq!(one.affected_rows, 2);
+        assert_eq!(one.last_insert_id, 42);
+        assert_eq!(one.preview, "DELETE FROM t WHERE id = 1");
     }
 
     #[test]
     fn outcome_describes_itself_for_the_status_bar() {
         let mut mock = MockDriver::new();
-        let list = mock.execute("SELECT 1; SELECT 2", 100).unwrap();
+        let read = mock.execute("SELECT 1", 100).unwrap();
+        assert_eq!(DbOutcome::Statement(read).describe(), "2 行 · 1 ms");
+        let write = mock.execute("DELETE FROM t", 100).unwrap();
         assert_eq!(
-            DbOutcome::Statements(list).describe(),
-            "2 条语句 · 4 行 · 影响 4 行 · 2 ms"
+            DbOutcome::Statement(write).describe(),
+            "影响 2 行 · 1 ms",
+            "写操作没有网格，报的是受影响行数"
         );
         assert_eq!(
             DbOutcome::Names(vec!["a".into(), "b".into()]).describe(),
             "2 项"
-        );
-        assert_eq!(
-            DbOutcome::Statements(Vec::new()).describe(),
-            "0 条语句 · 0 行 · 影响 0 行 · 0 ms"
         );
     }
 

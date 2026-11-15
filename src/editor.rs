@@ -69,6 +69,9 @@ pub struct OpenFile {
     /// 当前选中的文本（没有选区就是空串）。
     /// 用于 `Ctrl+F` 时自动把选中的词填进查找框。
     pub selection: String,
+    /// 选区的字节范围，没有选区就是 None。
+    /// `selection` 只是给人看的文本，拿去定位会撞上重复片段；执行 SQL 要的是范围。
+    pub selection_range: Option<(usize, usize)>,
     /// 最近一次加载/保存时的修改时间，用于外部改动检测
     pub mtime: Option<std::time::SystemTime>,
     /// 上次打开/保存时的内容指纹。`dirty` 按它算，撤销回原样后标记会自己消失。
@@ -100,6 +103,7 @@ impl OpenFile {
             bytes_len,
             caret_byte: 0,
             selection: String::new(),
+            selection_range: None,
             mtime: None,
             saved_hash,
         }
@@ -561,6 +565,7 @@ pub fn show(
                     // 只在真的有选区时才分配字符串。
                     if range.is_empty() {
                         file.selection.clear();
+                        file.selection_range = None;
                     } else {
                         let [min, max] = range.sorted_cursors();
                         let (a, b) = (
@@ -570,6 +575,9 @@ pub fn show(
                         if a < b && b <= file.text.len() {
                             file.selection.clear();
                             file.selection.push_str(&file.text[a..b]);
+                            file.selection_range = Some((a, b));
+                        } else {
+                            file.selection_range = None;
                         }
                     }
                 }

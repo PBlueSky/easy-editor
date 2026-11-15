@@ -2,7 +2,7 @@
 //!
 //! 边界：这一层只管「有哪些连接、连不连得上、里面有什么」。
 //! SQL 块头部的文本格式在 `crate::sql`，引擎与线程编排在 `crate::db`，
-//! 结果网格在 `crate::app` 的底部结果区。
+//! 结果网格在 `crate::results` 的底部结果区。
 //!
 //! 树只有三层（连接 → 库 → 表），每层的键还各不相同，所以这里按层写死，
 //! 不套文件树那种递归渲染：递归的代价是每层都要造一个路径式的 id，
@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use eframe::egui::{self, RichText, Ui};
 
-use crate::db::{ConnectionSpec, DbHub, DbKind, DbOutcome};
+use crate::db::{ConnectionSpec, DbEvent, DbHub, DbKind, DbOutcome, MAX_ROWS};
 
 /// 子层缩进（库 1 格、表 2 格）。
 const INDENT: f32 = 14.0;
@@ -79,6 +79,11 @@ pub struct DatabasePanel {
     /// 侧栏里选中的连接。SQL 块头部没写 `conn=` 时发到这里。
     active: Option<String>,
     pending: HashMap<u64, Pending>,
+    /// 不属于这层的回执（SQL 块的结果），底部结果区每帧来取。
+    ///
+    /// 语句结果和库表列表共用一条通道、一套 id，这里只认领自己发出去的那些，
+    /// 剩下的原样转交——不然得给 hub 再造一条通道，或者让两边抢着 poll。
+    stray: Vec<DbEvent>,
     draft: Option<Draft>,
     show_manager: bool,
     /// 这次打开管理窗口时要不要摆回屏幕正中
@@ -101,6 +106,7 @@ impl DatabasePanel {
             trees: HashMap::new(),
             active,
             pending: HashMap::new(),
+            stray: Vec::new(),
             draft: None,
             show_manager: false,
             center_manager: false,
@@ -117,6 +123,48 @@ impl DatabasePanel {
         !self.pending.is_empty()
     }
 
+    /// 这条连接现在选中的是哪条：侧栏点过的那条，否则列表第一条。
+    ///
+    /// SQL 块头部没写 `conn=` 时，执行就发到这里。
+    pub fn active_conn(&self) -> Option<&str> {
+        self.active
+            .as_deref()
+            .or_else(|| self.connections.first().map(|c| c.name.as_str()))
+    }
+
+    /// 把一个块交给某条连接执行，返回 `Vec[(任务 id, 语句原文)]`（按执行顺序）。
+    ///
+    /// 切分交给 hub：它返回的语句就是实际送进服务器的那些，结果面板的标题、
+    /// 「未执行」的个数都以它为准，两边不会各切各的数出不同的条数。
+    pub fn run(&mut self, conn: &str, block: &str) -> Result<Vec<(u64, String)>, String> {
+        let Some(spec) = self.spec_of(conn).cloned() else {
+            return Err(if self.connections.is_empty() {
+                "还没配数据库连接，先在顶栏「数据库 → 连接管理」里加一个".into()
+            } else {
+                let list = self
+                    .connections
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("、");
+                format!("没有叫「{conn}」的连接，现有：{list}")
+            });
+        };
+        let parts = self
+            .hub
+            .run(&spec, block, MAX_ROWS)
+            .map_err(|err| err.to_string())?;
+        if !parts.is_empty() {
+            self.status = format!("{} · 已提交 {} 条语句", conn, parts.len());
+        }
+        Ok(parts)
+    }
+
+    /// 取走不属于这一层的回执（也就是 SQL 块的语句结果），交给底部结果区。
+    pub fn take_stray(&mut self) -> Vec<DbEvent> {
+        std::mem::take(&mut self.stray)
+    }
+
     pub fn open_manager(&mut self) {
         self.show_manager = true;
         self.center_manager = true;
@@ -126,7 +174,9 @@ impl DatabasePanel {
     pub fn poll(&mut self) {
         for event in self.hub.poll() {
             let Some(pending) = self.pending.remove(&event.id) else {
-                // 连接在这一帧之前被改过或删掉了，结果没人认领
+                // 不是这层发出去的（SQL 块的结果），或者是连接在这帧之前被改过、
+                // 删掉了 —— 都原样搁下，让上层取走认领得了的那部分。
+                self.stray.push(event);
                 continue;
             };
             let text = match &event.outcome {
@@ -189,7 +239,7 @@ impl DatabasePanel {
     }
 
     fn load_databases(&mut self, name: &str) {
-        let Some(spec) = self.connection(name).cloned() else {
+        let Some(spec) = self.spec_of(name).cloned() else {
             return;
         };
         {
@@ -215,7 +265,7 @@ impl DatabasePanel {
     }
 
     fn load_tables(&mut self, name: &str, database: &str) {
-        let Some(spec) = self.connection(name).cloned() else {
+        let Some(spec) = self.spec_of(name).cloned() else {
             return;
         };
         let database = database.to_string();
@@ -264,7 +314,8 @@ impl DatabasePanel {
         }
     }
 
-    fn connection(&self, name: &str) -> Option<&ConnectionSpec> {
+    /// 按名字找连接配置。SQL 块头部的 `conn=` 和侧栏树的键都是这个名字。
+    pub fn spec_of(&self, name: &str) -> Option<&ConnectionSpec> {
         self.connections.iter().find(|c| c.name == name)
     }
 
@@ -496,7 +547,7 @@ impl DatabasePanel {
                     ui.close();
                 }
                 if ui.button("测试连接").clicked() {
-                    let saved = self.connection(&name).cloned();
+                    let saved = self.spec_of(&name).cloned();
                     ui.close();
                     if let Some(saved) = saved {
                         self.test_connection(&saved);

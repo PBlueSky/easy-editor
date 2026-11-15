@@ -2,7 +2,8 @@
 
 mod app;
 mod config;
-// 下面两处 allow 是给第 3~5 步留的：调用方还没接上，先别用 dead_code 淹没 clippy 基线
+// SQL 功能分几步落地：这两块里有一批只被单测摸到的口子（状态回写、只读判定、
+// 连接校验收口），界面还没接上，先别报 dead_code。
 #[allow(dead_code)]
 mod db;
 mod database;
@@ -15,8 +16,8 @@ mod journal;
 mod keymap;
 mod nav;
 mod pane;
+mod results;
 mod search;
-// 调用方在第 2、4 步陆续接上，先别让 dead_code 淹没 clippy 基线
 #[allow(dead_code)]
 mod sql;
 mod syntax;

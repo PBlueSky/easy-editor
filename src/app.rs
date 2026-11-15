@@ -17,7 +17,9 @@ use crate::journal;
 use crate::keymap::{self, Keymap};
 use crate::nav::{CaretHistory, NavPoint};
 use crate::pane::{self, Axis, Dir, PaneId, PaneTree, TreeLayout};
+use crate::results::ResultsDock;
 use crate::search::SearchState;
+use crate::sql;
 use crate::syntax::Highlighter;
 use crate::terminal::{TerminalPanel, TerminalSettings};
 use crate::theme;
@@ -140,6 +142,8 @@ pub struct EasyEditorApp {
     panes: PaneTree<PaneKind>,
     /// 数据库连接：侧栏「数据库」页签 + 连接管理窗口，SQL 块也从这里取连接
     database: DatabasePanel,
+    /// 底部结果区：一条语句一个面板，同时展示这次执行拿到的所有结果
+    results: ResultsDock,
     /// 上一帧算出的面板矩形，方位键找邻居时要用
     pane_layout: TreeLayout,
     /// 最后一次聚焦过的编辑面板。焦点切到终端时，文本类操作还是落在这块上
@@ -231,6 +235,7 @@ impl EasyEditorApp {
             center_terminal_settings: false,
             panes: PaneTree::new(),
             database: DatabasePanel::new(db_connections),
+            results: ResultsDock::new(),
             pane_layout: TreeLayout::default(),
             last_editor_pane: None,
             boot: std::time::Instant::now(),
@@ -686,6 +691,135 @@ impl EasyEditorApp {
         }
     }
 
+    // ---------- SQL 块与结果 ----------
+
+    fn insert_sql_block(&mut self) {
+        let Some(idx) = self.focused_tab() else {
+            self.status = "SQL 块写在文本文件里，请先打开一个文件".into();
+            return;
+        };
+        let file = &mut self.tabs[idx];
+        if file.large {
+            self.status = "大文件为只读预览，无法插入 SQL 块".into();
+            return;
+        }
+        // 头部写死当前选中的连接：块放在文件里发给别人时，收件人看得出这段 SQL 跑在哪
+        let conn = self.database.active_conn().unwrap_or_default().to_string();
+        let n = sql::scan(&file.text).len() + 1;
+        let title = format!("查询{n}");
+        let (new_text, caret) = sql::insert_block(&file.text, file.caret_byte, &title, &conn);
+        let total = new_text.len();
+        file.pending_edit = Some(PendingEdit {
+            range: Some((0, total.min(file.text.len()))),
+            insert: new_text,
+            caret: Some(caret),
+        });
+        self.status = if conn.is_empty() {
+            format!("已插入「{title}」，写好 SQL 就能执行（还没配连接）")
+        } else {
+            format!("已插入「{title}」，连到「{conn}」，写好 SQL 就能执行")
+        };
+    }
+
+    /// 执行 SQL：选中一段就跑那段，否则跑光标所在的整块。
+    ///
+    /// 拆句和发号都在 `DatabasePanel::run` 里，这里只把返回的 (id, 语句) 一批挂上结果区。
+    fn sql_run(&mut self) {
+        let Some(idx) = self.focused_tab() else {
+            self.status = "先打开一个文件，里面写个 SQL 块".into();
+            return;
+        };
+        // 整份文本拷出来：下面要拿 self.database 发消息，不能同时借着 tabs
+        let text = self.tabs[idx].text.clone();
+        let path = self.tabs[idx].path.clone();
+        let line = self.tabs[idx].line.saturating_sub(1);
+        let blocks = sql::scan(&text);
+        let in_block = sql::block_at(&blocks, line);
+        let (body, title, origin) = match (self.tabs[idx].selection_range, in_block) {
+            (Some(range), block) => (
+                range,
+                "选中内容".to_string(),
+                block.map(|b| b.head_start).unwrap_or(range.0),
+            ),
+            (None, Some(block)) => {
+                let mut title = block.title.clone();
+                if title.is_empty() {
+                    title = "SQL".into();
+                }
+                ((block.body_start, block.body_end), title, block.head_start)
+            }
+            (None, None) => {
+                self.status = "光标不在 SQL 块里，也没有选中语句。Ctrl+Shift+J 插一个块".into();
+                return;
+            }
+        };
+        let conn = match in_block.map(|b| b.conn.clone()).filter(|c| !c.is_empty()) {
+            Some(conn) => conn,
+            None => self.database.active_conn().unwrap_or_default().to_string(),
+        };
+        // 范围和这份文本快照是同一帧取的，理论上不会越界；真越界也只夹不炸
+        let a = body.0.min(text.len());
+        let b = body.1.clamp(a, text.len());
+        let sql_text = text[a..b].trim().to_string();
+        if sql_text.is_empty() {
+            self.status = "这里没有可执行的 SQL".into();
+            return;
+        }
+        if conn.is_empty() {
+            self.status = "还没有数据库连接，先在顶栏「数据库 → 连接管理」里加一个".into();
+            return;
+        }
+        match self.database.run(&conn, &sql_text) {
+            Ok(parts) if parts.is_empty() => {
+                self.status = "只有注释，没有语句可跑".into();
+            }
+            Ok(parts) => {
+                let where_ = if in_block.is_some() {
+                    format!("（{}）", sql::describe(&blocks, line))
+                } else {
+                    String::new()
+                };
+                self.status = format!("已提交 {} 条语句到「{conn}」{where_}", parts.len());
+                self.results
+                    .start_run(&conn, &title, &parts, Some((path, origin)));
+            }
+            Err(err) => {
+                self.status = err;
+            }
+        }
+    }
+
+    /// 结果面板的「回块」：把文件摊到前台，再让光标跳到块头。
+    fn jump_to_byte(&mut self, path: &Path, byte: usize) {
+        self.open_file(path.to_path_buf(), None);
+        let Some(idx) = self.tabs.iter().position(|t| t.path == path) else {
+            self.status = "那个文件已经不在标签里了".into();
+            return;
+        };
+        self.tabs[idx].pending_jump = Some(byte);
+    }
+
+    fn results_panel(&mut self, ui: &mut Ui) {
+        let keys = self.keymap.to_config();
+        let hint = keys
+            .get("sql_run")
+            .cloned()
+            .unwrap_or_else(|| "Ctrl+Enter".into());
+        egui::Panel::bottom("db_results")
+            // 高度得由面板自己定死一个起点，不能靠内容量：内容超过面板预留的那格会被
+            // 裁掉，egui 连 shape 都不留。给足两三个面板的空间，多余的走滚动，
+            // 上边缘照常可以拖着调。
+            .resizable(true)
+            .default_size(320.0)
+            .size_range(120.0..=600.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(ui.ctx().global_style().visuals.faint_bg_color)
+                    .inner_margin(egui::Margin::symmetric(8, 5)),
+            )
+            .show(ui, |ui| self.results.show(ui, &hint));
+    }
+
     // ---------- 查找替换 ----------
 
     fn sync_find_to_file(&mut self) {
@@ -813,6 +947,15 @@ impl EasyEditorApp {
         }
         if self.keymap.consume(ctx, "journal_toggle") {
             self.journal_toggle();
+        }
+        if self.keymap.consume(ctx, "sql_insert") {
+            self.insert_sql_block();
+        }
+        if self.keymap.consume(ctx, "sql_run") {
+            self.sql_run();
+        }
+        if self.keymap.consume(ctx, "results_toggle") {
+            self.results.open = !self.results.open;
         }
         if self.keymap.consume(ctx, "nav_back") {
             self.nav_goto(false);
@@ -1939,6 +2082,39 @@ impl EasyEditorApp {
 
             // 顶栏只多这一个入口：连接相关的操作都在这个下拉里，不再摊开一排按钮
             let menu = ui.menu_button(RichText::new("数据库").size(12.5), |ui| {
+                let h_sql_insert = format!("在光标处插入 SQL 块  {}", hint("sql_insert"));
+                if ui
+                    .add_enabled(self.active.is_some(), egui::Button::new("插入 SQL 块"))
+                    .on_hover_text(h_sql_insert)
+                    .clicked()
+                {
+                    self.insert_sql_block();
+                    ui.close();
+                }
+                let h_sql_run = format!("跑选中的语句，或光标所在的整个块  {}", hint("sql_run"));
+                if ui
+                    .add_enabled(self.active.is_some(), egui::Button::new("执行 SQL"))
+                    .on_hover_text(h_sql_run)
+                    .clicked()
+                {
+                    self.sql_run();
+                    ui.close();
+                }
+                let n = self.results.count();
+                let label = if n == 0 {
+                    "结果区".to_string()
+                } else {
+                    format!("结果区（{n}）")
+                };
+                if ui
+                    .selectable_label(self.results.open, label)
+                    .on_hover_text("底部结果区，一条语句一个面板")
+                    .clicked()
+                {
+                    self.results.open = !self.results.open;
+                    ui.close();
+                }
+                ui.separator();
                 if ui
                     .button("连接管理…")
                     .on_hover_text("增删改数据库连接，配置写在 config.json")
@@ -1959,7 +2135,7 @@ impl EasyEditorApp {
             });
             let _ = menu
                 .response
-                .on_hover_text("数据库连接管理，以及侧栏里的库表树");
+                .on_hover_text("SQL 块的插入与执行，以及连接管理和库表树");
 
             // 右组是从右往左排的，这一排剩下的地方不够就会一路压过左组的字，
             // 所以先换一排再排它。注意要量「这一排还剩多少」：可换行布局下
@@ -2677,6 +2853,7 @@ impl EasyEditorApp {
                 "{} 打开文件夹   {} 快速打开   {} 全局搜索\n\
                  {} 查找   {} 替换   {} 日志块   {} / {} 块间跳转\n\
                  {} 新建文件   {} 终端   {} 新建终端\n\
+                 {} 插入 SQL 块   {} 执行 SQL   {} 结果区\n\
                  {} 自动拆分   {} / {} 手动拆分   {} 关闭面板   {} 下一个面板   {} 快捷键",
                 k("open_folder"),
                 k("quick_open"),
@@ -2689,6 +2866,9 @@ impl EasyEditorApp {
                 k("new_file"),
                 k("terminal_toggle"),
                 k("terminal_new"),
+                k("sql_insert"),
+                k("sql_run"),
+                k("results_toggle"),
                 k("split_auto"),
                 k("split_col"),
                 k("split_row"),
@@ -3392,7 +3572,11 @@ impl EasyEditorApp {
 
         self.search.poll();
         self.database.poll();
-        if self.database.busy() {
+        // SQL 块的回执不归侧栏管，转手给底部结果区
+        for event in self.database.take_stray() {
+            self.results.on_event(&event);
+        }
+        if self.database.busy() || self.results.running() {
             // 库表列表和测试结果都在后台线程，不催一帧就永远停在「读取中…」
             ctx.request_repaint_after(std::time::Duration::from_millis(60));
         }
@@ -3443,6 +3627,12 @@ impl EasyEditorApp {
 
         self.status_bar(ui);
         self.find_bar(ui);
+        if self.results.open {
+            self.results_panel(ui);
+        }
+        if let Some((path, byte)) = self.results.pending_jump.take() {
+            self.jump_to_byte(&path, byte);
+        }
         self.side_panel(ui);
         self.central(ui);
         // 面板树是焦点的事实来源，画完（可能点过、拆过、关过）再刷一次镜像
@@ -5454,6 +5644,214 @@ mod tests {
         assert!(
             !ime.should_interrupt_composition,
             "拖选结束那一帧还在打断输入法"
+        );
+    }
+
+    /// 结果区用的假连接：不碰 MySQL，两条 SELECT 各回一份网格。
+    fn mock_database() -> DatabasePanel {
+        DatabasePanel::with_hub(
+            crate::db::DbHub::with_driver(|_| Ok(Box::new(crate::db::MockDriver::new()))),
+            vec![crate::db::ConnectionSpec {
+                name: "本机".into(),
+                database: "test".into(),
+                ..Default::default()
+            }],
+        )
+    }
+
+    const SQL_BLOCK: &str = "-- sql 查用户 2026-01-01 10:00 [待执行] conn=本机\n\
+                              SELECT id FROM a;\n\
+                              SELECT name FROM b;\n";
+
+    /// 把 SQL 块喂给应用，停在正文第二行（也就是光标在块里）。
+    fn app_on_sql_block(dir_name: &str) -> (egui::Context, EasyEditorApp, PathBuf) {
+        let (ctx, mut app, dir) = app_in_folder(dir_name, SQL_BLOCK);
+        app.database = mock_database();
+        app.open_file(dir.join("a.txt"), None);
+        let idx = app.active.unwrap();
+        app.tabs[idx].line = 2;
+        (ctx, app, dir)
+    }
+
+    /// 等后台线程把这一批语句的回执都送回来。
+    fn settle_results(app: &mut EasyEditorApp, ctx: &egui::Context) {
+        for _ in 0..60 {
+            frame(app, ctx, vec![]);
+            if !app.results.running() {
+                return;
+            }
+        }
+        panic!("结果区一直停在「执行中」，后台回执没接到");
+    }
+
+    /// 看得见的所有文字：文本 + 它在屏幕上的矩形。
+    ///
+    /// `texts()` 只看 shape 存不存在——egui 对完全落在裁剪区外的文字照样留一条
+    /// shape，于是「面板挤出结果区所以看不见」这种 bug 它查不出来，只能连 clip 一起量。
+    fn seen(out: &egui::FullOutput) -> Vec<(String, Rect)> {
+        fn walk(shape: &egui::Shape, clip: Rect, v: &mut Vec<(String, Rect)>) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    let rect = t.galley.rect.translate(t.pos.to_vec2());
+                    if clip.intersects(rect) {
+                        v.push((t.galley.job.text.clone(), rect));
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for s in shapes {
+                        walk(s, clip, v);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut v = Vec::new();
+        for cs in &out.shapes {
+            walk(&cs.shape, cs.clip_rect, &mut v);
+        }
+        v
+    }
+
+    #[test]
+    fn sql_block_gets_one_result_panel_per_statement() {
+        let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_two_panels");
+        app.sql_run();
+        assert_eq!(app.results.count(), 2, "块里两条语句就该两个面板");
+        assert!(app.results.open, "提交了结果区就该亮出来");
+
+        settle_results(&mut app, &ctx);
+        let out = frame(&mut app, &ctx, vec![]);
+        let shown = texts(&out);
+        assert!(shown.contains(&"结果 · 2 个".to_string()), "{shown:?}");
+        // 网格画出来了：列头 + 一份行数小结
+        assert!(shown.iter().any(|t| t.starts_with("本机 · 2 行")), "{shown:?}");
+
+        // 两个面板同时在屏上，而且都得没被结果区裁掉
+        let seen = seen(&out);
+        let visible = |needle: &str| {
+            seen.iter()
+                .filter(|(t, _)| t.starts_with(needle))
+                .map(|(_, r)| r.top())
+                .collect::<Vec<f32>>()
+        };
+        // 每块一行小结、一份列头：各两个才说明第二个面板整块画出来了，
+        // 而不是只把标题行挤在缝里露了个尖
+        assert_eq!(visible("本机 · 2 行").len(), 2, "{shown:?}");
+        assert_eq!(visible("name").len(), 2, "第二块的网格没画出来：{shown:?}");
+        let (first, second) = (visible("本机 · 2 行")[0], visible("本机 · 2 行")[1]);
+        assert!(
+            second > first,
+            "两个面板上下颠倒了：第 1 条在 {first}，第 2 条在 {second}"
+        );
+    }
+
+    #[test]
+    fn closing_one_panel_leaves_its_neighbours() {
+        let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_close_one");
+        app.sql_run();
+        settle_results(&mut app, &ctx);
+        let out = frame(&mut app, &ctx, vec![]);
+        let mut crosses = seen(&out)
+            .into_iter()
+            .filter(|(t, _)| t == "✕")
+            .map(|(_, r)| r.center())
+            .collect::<Vec<_>>();
+        assert_eq!(crosses.len(), 2, "两个面板该各有一个关闭按钮");
+        crosses.sort_by(|a, b| a.y.total_cmp(&b.y));
+        // 标题行现在是被限死一行高的矩形，点得着才说明按钮没被挤出可交互区
+        frame(
+            &mut app,
+            &ctx,
+            pointer(crosses[1], egui::PointerButton::Primary, true),
+        );
+        frame(
+            &mut app,
+            &ctx,
+            pointer(crosses[1], egui::PointerButton::Primary, false),
+        );
+        assert_eq!(app.results.count(), 1, "只该关掉点中的那个面板");
+    }
+
+    #[test]
+    fn selection_beats_the_block_around_it() {
+        let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_selection");
+        let idx = app.active.unwrap();
+        // 只选第二条语句那几个字
+        let text = app.tabs[idx].text.clone();
+        let a = text.find("SELECT name").unwrap();
+        app.tabs[idx].selection_range = Some((a, a + "SELECT name".len()));
+        app.sql_run();
+        assert_eq!(app.results.count(), 1, "选了半截就只跑那段");
+        settle_results(&mut app, &ctx);
+        assert!(
+            app.results.count() == 1 && !app.results.running(),
+            "选中的这条跑完就该安静下来"
+        );
+    }
+
+    #[test]
+    fn a_failing_run_leaves_nothing_spinning() {
+        let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_failing");
+        app.database = DatabasePanel::with_hub(
+            crate::db::DbHub::with_driver(|_| {
+                Ok(Box::new(crate::db::MockDriver::failing("1064 语法错了")))
+            }),
+            vec![crate::db::ConnectionSpec {
+                name: "本机".into(),
+                database: "test".into(),
+                ..Default::default()
+            }],
+        );
+        app.sql_run();
+        settle_results(&mut app, &ctx);
+        let out = frame(&mut app, &ctx, vec![]);
+        let shown = texts(&out);
+        assert!(
+            shown.iter().any(|t| t.contains("语法错了")),
+            "报错原文要贴在面板里：{shown:?}"
+        );
+        assert!(shown.iter().any(|t| t.contains("未执行")));
+    }
+
+    #[test]
+    fn results_dock_stays_out_of_the_way_when_closed() {
+        let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_closed");
+        let out = frame(&mut app, &ctx, vec![]);
+        assert!(!texts(&out).iter().any(|t| t.starts_with("结果 · ")));
+    }
+
+    #[test]
+    fn jump_back_from_a_result_brings_its_file_forward() {
+        let (_ctx, mut app, dir) = app_in_folder("ee_sql_jump", "one\ntwo\nthree\n");
+        let first = dir.join("a.txt");
+        app.open_file(first.clone(), None);
+        std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+        app.open_file(dir.join("b.txt"), None);
+
+        app.jump_to_byte(&first, 4);
+        assert_eq!(app.tabs[app.active.unwrap()].path, first, "文件没摊到前台");
+        let idx = app.tabs.iter().position(|t| t.path == first).unwrap();
+        assert_eq!(
+            app.tabs[idx].pending_jump,
+            Some(4),
+            "字节位置要原样交给编辑器"
+        );
+    }
+
+    #[test]
+    fn insert_sql_block_binds_the_active_connection() {
+        let (_ctx, mut app, _dir) = app_in_folder("ee_sql_insert", "hello\n");
+        app.database = mock_database();
+        app.open_file(_dir.join("a.txt"), None);
+        app.insert_sql_block();
+        let idx = app.active.unwrap();
+        // 插入只是排了个待办，真正落地在下一帧的编辑器里
+        assert!(app.tabs[idx].pending_edit.is_some());
+        let edit = app.tabs[idx].pending_edit.take().unwrap();
+        assert!(
+            edit.insert.contains("conn=本机"),
+            "头部要写死当前连接：{}",
+            edit.insert
         );
     }
 }
