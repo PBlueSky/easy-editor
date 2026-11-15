@@ -33,6 +33,17 @@ impl Slot {
     }
 }
 
+/// 这批结果和文件的对应关系。
+#[derive(Clone)]
+pub struct Origin {
+    pub path: PathBuf,
+    /// 「回块」跳到这里（块头起始字节；块外选中一段就是选区起点）
+    pub jump: usize,
+    /// 整块提交才记下块头位置。选中一段执行是 `None`：那一段跑完不代表整块跑完，
+    /// 不该把 `[待执行]` 改成 `[已执行]`。
+    pub block_head: Option<usize>,
+}
+
 /// 一个语句结果面板。`task` 是 [`crate::db::DbHub::run`] 给这条语句发的 id。
 pub struct Panel {
     pub task: u64,
@@ -42,8 +53,8 @@ pub struct Panel {
     /// SQL 块标题，块外选中一段执行时是「选中内容」
     pub title: String,
     pub stmt: String,
-    /// 这条语句出自哪个文件的哪个字节，用来跳回去
-    pub origin: Option<(PathBuf, usize)>,
+    /// 这条语句出自哪个文件的哪个字节，用来跳回去、跑完回写状态
+    pub origin: Option<Origin>,
     pub slot: Slot,
     pub collapsed: bool,
 }
@@ -54,11 +65,22 @@ impl Panel {
     }
 }
 
+/// 一批结果全部到家，app 可以拿去做收尾（比如把块头部的 `[待执行]` 改掉）。
+pub struct Settled {
+    /// 这批结果出自哪个文件的哪个块头。选中一段执行的没有块头，不会出现在这里。
+    pub path: PathBuf,
+    pub head: usize,
+    /// 整批都成功。有一条报错或有一条压根没执行，都算失败。
+    pub ok: bool,
+}
+
 /// 底部那一条结果区。
 pub struct ResultsDock {
     /// 新的在上面：一次执行 splice 到 0，同批内部仍按语句顺序。
     panels: Vec<Panel>,
     next_run: u64,
+    /// 已提交、还没收尾的那几批。`settled` 只认这里的，报过就摘掉。
+    waiting: Vec<u64>,
     /// 结果区显不显示。关掉不丢结果，只是收起来。
     pub open: bool,
     /// 「回块」按下的那一帧记在这里，app 取走去做跳转。
@@ -76,6 +98,7 @@ impl ResultsDock {
         Self {
             panels: Vec::new(),
             next_run: 1,
+            waiting: Vec::new(),
             open: false,
             pending_jump: None,
         }
@@ -94,14 +117,14 @@ impl ResultsDock {
         self.panels.iter().any(|p| p.slot.is_running())
     }
 
-    /// 一次提交开了哪些面板，逐条挂在这里等回执。
+    /// 一次提交开了哪些面板，逐条挂在这里等回执。返回这批的 run 号。
     pub fn start_run(
         &mut self,
         conn: &str,
         title: &str,
         parts: &[(u64, String)],
-        origin: Option<(PathBuf, usize)>,
-    ) {
+        origin: Option<Origin>,
+    ) -> u64 {
         let run = self.next_run;
         self.next_run += 1;
         let batch = parts.iter().map(|(task, stmt)| Panel {
@@ -115,8 +138,44 @@ impl ResultsDock {
             collapsed: false,
         });
         self.panels.splice(0..0, batch);
+        self.waiting.push(run);
         self.trim();
         self.open = true;
+        run
+    }
+
+    /// 全部到家、还没收尾的那几批。同一批只报一次。
+    ///
+    /// 报的是「这一批的面板都不再等回执」，不是「这一批还都在屏上」：
+    /// 用户中途把面板关掉就当这批不收了，免得给一个没跑完的块写 `[已执行]`。
+    pub fn settled(&mut self) -> Vec<Settled> {
+        let mut out = Vec::new();
+        let waiting = std::mem::take(&mut self.waiting);
+        for run in waiting {
+            let mine: Vec<&Panel> = self.panels.iter().filter(|p| p.run == run).collect();
+            if mine.iter().any(|p| p.slot.is_running()) {
+                self.waiting.push(run);
+                continue;
+            }
+            let Some(first) = mine.first() else {
+                continue; // 面板被清空了，这批不再有下文
+            };
+            // 块外选中一段执行的没有 block_head，不动任何块的状态
+            let Some(Origin {
+                path,
+                block_head: Some(head),
+                ..
+            }) = first.origin.clone()
+            else {
+                continue;
+            };
+            out.push(Settled {
+                path,
+                head,
+                ok: mine.iter().all(|p| matches!(p.slot, Slot::Done(_))),
+            });
+        }
+        out
     }
 
     /// 认领一条回执。`false` = 这个 id 不归这里，调用方可以转手。
@@ -337,13 +396,14 @@ fn header(
             {
                 close_runs.push(panel.run);
             }
-            if panel.origin.is_some()
-                && ui
+            if let Some(origin) = panel.origin.clone() {
+                if ui
                     .add(egui::Button::new(RichText::new("回块").size(11.0)).frame(false))
                     .on_hover_text("跳回文件里这个 SQL 块")
                     .clicked()
-            {
-                *jump = panel.origin.clone();
+                {
+                    *jump = Some((origin.path, origin.jump));
+                }
             }
             ui.label(weak(summary(panel)));
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
@@ -578,9 +638,70 @@ mod tests {
             "本机",
             "查用户",
             &parts(&["SELECT 1", "SELECT 2", "SELECT 3"]),
-            Some((PathBuf::from("d:/a.sql"), 12)),
+            Some(block_origin(12)),
         );
         dock
+    }
+
+    /// 整块提交：块头在第 12 字节，回块也跳那儿
+    fn block_origin(head: usize) -> Origin {
+        Origin {
+            path: PathBuf::from("d:/a.sql"),
+            jump: head,
+            block_head: Some(head),
+        }
+    }
+
+    /// 最后一次回执到家的那一帧，settled 才把这批报出去，而且只报一次
+    #[test]
+    fn settled_reports_a_finished_run_once() {
+        let mut dock = dock();
+        dock.on_event(&event(1, Ok(query(1, 2))));
+        dock.on_event(&event(2, Ok(query(2, 2))));
+        assert!(
+            dock.settled().is_empty(),
+            "第三条还在等，整批就还不算跑完"
+        );
+        dock.on_event(&event(3, Ok(query(3, 2))));
+        let done = dock.settled();
+        assert_eq!(done.len(), 1);
+        assert!(done[0].ok, "三条都成功");
+        assert_eq!(done[0].head, 12, "回写状态要知道改哪个块头");
+        assert!(dock.settled().is_empty(), "同一批不该报第二次");
+    }
+
+    #[test]
+    fn settled_marks_a_run_with_a_failure_inside_it() {
+        let mut dock = dock();
+        // 一条连接只有一个工作线程，回执按语句顺序回来，所以 2 到家时 1 必然已经到家
+        dock.on_event(&event(1, Ok(query(1, 2))));
+        dock.on_event(&event(2, Err(DbError::new("断了").to_string())));
+        let done = dock.settled();
+        assert_eq!(done.len(), 1, "报错会把排在后面的一起标掉，整批当场就有下文了");
+        assert!(!done[0].ok, "有一条失败，整块就该标 [失败]");
+    }
+
+    #[test]
+    fn selection_runs_write_no_block_status() {
+        let mut dock = ResultsDock::new();
+        let picked = Origin {
+            path: PathBuf::from("d:/a.sql"),
+            jump: 40,
+            block_head: None,
+        };
+        dock.start_run("本机", "选中内容", &parts(&["SELECT 1"]), Some(picked));
+        dock.on_event(&event(1, Ok(query(1, 1))));
+        assert!(
+            dock.settled().is_empty(),
+            "只跑了块里挑出来的一段，不该替整块宣布 [已执行]"
+        );
+    }
+
+    #[test]
+    fn closing_every_panel_of_a_run_drops_it() {
+        let mut dock = dock();
+        dock.close_run(1);
+        assert!(dock.settled().is_empty(), "用户把面板关了就别再回写状态");
     }
 
     /// 语句 id 从 `base + 1` 递增，模拟 hub 连续发号

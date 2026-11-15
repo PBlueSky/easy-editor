@@ -17,7 +17,7 @@ use crate::journal;
 use crate::keymap::{self, Keymap};
 use crate::nav::{CaretHistory, NavPoint};
 use crate::pane::{self, Axis, Dir, PaneId, PaneTree, TreeLayout};
-use crate::results::ResultsDock;
+use crate::results::{self, ResultsDock, Settled};
 use crate::search::SearchState;
 use crate::sql;
 use crate::syntax::Highlighter;
@@ -780,13 +780,57 @@ impl EasyEditorApp {
                     String::new()
                 };
                 self.status = format!("已提交 {} 条语句到「{conn}」{where_}", parts.len());
-                self.results
-                    .start_run(&conn, &title, &parts, Some((path, origin)));
+                // 只有整块交出去才回写状态；块外挑一段跑，跑完不代表这块跑完
+                let block_head = match (self.tabs[idx].selection_range, in_block) {
+                    (None, Some(b)) => Some(b.head_start),
+                    _ => None,
+                };
+                self.results.start_run(
+                    &conn,
+                    &title,
+                    &parts,
+                    Some(results::Origin {
+                        path,
+                        jump: origin,
+                        block_head,
+                    }),
+                );
             }
             Err(err) => {
                 self.status = err;
             }
         }
+    }
+
+    /// 跑完的一批把块头部从 `[待执行]` 改成 `[已执行]` / `[失败]`。
+    ///
+    /// 只认提交那一帧记下的字节位置：文件在这期间被改过就放弃回写，宁可头部不动，
+    /// 不能把状态塞进别的行里。
+    fn mark_block(&mut self, done: &Settled) {
+        let Some(idx) = self.tabs.iter().position(|t| t.path == done.path) else {
+            return;
+        };
+        let found = sql::scan(&self.tabs[idx].text)
+            .into_iter()
+            .find(|b| b.head_start == done.head);
+        let Some(block) = found else {
+            self.status = "文件改过了，SQL 块状态没回写".into();
+            return;
+        };
+        let next = if done.ok {
+            sql::STATUS_DONE
+        } else {
+            sql::STATUS_FAILED
+        };
+        if block.status == next {
+            return;
+        }
+        let (a, b, head) = sql::status_edit(&block, next);
+        self.tabs[idx].pending_edit = Some(PendingEdit {
+            range: Some((a, b)),
+            insert: head,
+            caret: None,
+        });
     }
 
     /// 结果面板的「回块」：把文件摊到前台，再让光标跳到块头。
@@ -3576,6 +3620,10 @@ impl EasyEditorApp {
         for event in self.database.take_stray() {
             self.results.on_event(&event);
         }
+        // 一整批都到家了才回写块状态：半途写会把还在跑的块说成已经跑完
+        for done in self.results.settled() {
+            self.mark_block(&done);
+        }
         if self.database.busy() || self.results.running() {
             // 库表列表和测试结果都在后台线程，不催一帧就永远停在「读取中…」
             ctx.request_repaint_after(std::time::Duration::from_millis(60));
@@ -5811,6 +5859,62 @@ mod tests {
             "报错原文要贴在面板里：{shown:?}"
         );
         assert!(shown.iter().any(|t| t.contains("未执行")));
+    }
+
+    #[test]
+    fn a_finished_block_gets_its_status_written_back() {
+        let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_mark_done");
+        app.sql_run();
+        settle_results(&mut app, &ctx);
+        frame(&mut app, &ctx, vec![]);
+        let idx = app.active.unwrap();
+        assert!(
+            app.tabs[idx].text.contains("[已执行]"),
+            "跑完了头部还挂着待执行：{}",
+            app.tabs[idx].text
+        );
+    }
+
+    #[test]
+    fn a_failed_block_is_marked_as_failed() {
+        let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_mark_failed");
+        app.database = DatabasePanel::with_hub(
+            crate::db::DbHub::with_driver(|_| {
+                Ok(Box::new(crate::db::MockDriver::failing("1064 语法错了")))
+            }),
+            vec![crate::db::ConnectionSpec {
+                name: "本机".into(),
+                database: "test".into(),
+                ..Default::default()
+            }],
+        );
+        app.sql_run();
+        settle_results(&mut app, &ctx);
+        frame(&mut app, &ctx, vec![]);
+        let idx = app.active.unwrap();
+        assert!(
+            app.tabs[idx].text.contains("[失败]"),
+            "有一条报错就该标成失败：{}",
+            app.tabs[idx].text
+        );
+    }
+
+    #[test]
+    fn a_selection_run_leaves_the_block_status_alone() {
+        let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_mark_selection");
+        let idx = app.active.unwrap();
+        let text = app.tabs[idx].text.clone();
+        let a = text.find("SELECT id").unwrap();
+        app.tabs[idx].selection_range = Some((a, a + "SELECT id FROM a".len()));
+        app.sql_run();
+        settle_results(&mut app, &ctx);
+        frame(&mut app, &ctx, vec![]);
+        let idx = app.active.unwrap();
+        assert!(
+            app.tabs[idx].text.contains("[待执行]"),
+            "只跑了块里挑出来的一段，整块还不算执行完：{}",
+            app.tabs[idx].text
+        );
     }
 
     #[test]
