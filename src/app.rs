@@ -843,6 +843,28 @@ impl EasyEditorApp {
         self.tabs[idx].pending_jump = Some(byte);
     }
 
+    /// 结果区「导出」按下来的那份 CSV，走系统存盘框落盘。
+    ///
+    /// 文件开头补一个 UTF-8 BOM：Windows 上的 Excel 只认 BOM 才按 UTF-8 读，
+    /// 少了它中文列直接变成一堆乱码，导出的意义就没了。
+    fn save_csv(&mut self, export: results::Export) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("导出结果")
+            .set_file_name(&export.name)
+            .add_filter("CSV", &["csv"])
+            .save_file()
+        else {
+            self.status = "导出取消".into();
+            return;
+        };
+        let mut bytes = vec![0xef, 0xbb, 0xbf];
+        bytes.extend_from_slice(export.csv.as_bytes());
+        self.status = match std::fs::write(&path, bytes) {
+            Ok(()) => format!("已导出「{}」到 {}", export.name, path.display()),
+            Err(err) => format!("导出失败：{err}"),
+        };
+    }
+
     fn results_panel(&mut self, ui: &mut Ui) {
         let keys = self.keymap.to_config();
         let hint = keys
@@ -3681,6 +3703,9 @@ impl EasyEditorApp {
         if let Some((path, byte)) = self.results.pending_jump.take() {
             self.jump_to_byte(&path, byte);
         }
+        if let Some(export) = self.results.take_export() {
+            self.save_csv(export);
+        }
         self.side_panel(ui);
         self.central(ui);
         // 面板树是焦点的事实来源，画完（可能点过、拆过、关过）再刷一次镜像
@@ -5958,6 +5983,20 @@ mod tests {
         assert!(
             texts(&out).contains(&"结果 · 查用户".to_string()),
             "放大窗口开完下一帧就自己关了"
+        );
+    }
+
+    #[test]
+    fn a_query_result_offers_a_csv_export_button() {
+        let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_export");
+        app.sql_run();
+        settle_results(&mut app, &ctx);
+        let out = frame(&mut app, &ctx, vec![]);
+        let shown = texts(&out);
+        assert_eq!(
+            shown.iter().filter(|t| t.as_str() == "导出").count(),
+            2,
+            "两份查询结果各给一个导出按钮，存盘框归系统弹，这里只测按钮在不在：{shown:?}"
         );
     }
 

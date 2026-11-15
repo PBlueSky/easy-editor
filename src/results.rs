@@ -74,6 +74,13 @@ pub struct Settled {
     pub ok: bool,
 }
 
+/// 按了「导出」攒下来的那份 CSV。文本在这儿已经排好，选路径和写文件归 app。
+pub struct Export {
+    /// 存盘对话框里的默认文件名
+    pub name: String,
+    pub csv: String,
+}
+
 /// 底部那一条结果区。
 pub struct ResultsDock {
     /// 新的在上面：一次执行 splice 到 0，同批内部仍按语句顺序。
@@ -87,6 +94,8 @@ pub struct ResultsDock {
     pub pending_jump: Option<(PathBuf, usize)>,
     /// 单独开窗口看的那份结果（按语句 id）。
     popup: Option<u64>,
+    /// 「导出」按下的那一帧攒在这儿，app 每帧取走一次去弹存盘框。
+    pending_export: Option<Export>,
 }
 
 impl Default for ResultsDock {
@@ -104,7 +113,13 @@ impl ResultsDock {
             open: false,
             pending_jump: None,
             popup: None,
+            pending_export: None,
         }
+    }
+
+    /// 取走攒下的导出请求；没有就返回 None，取一次就清空。
+    pub fn take_export(&mut self) -> Option<Export> {
+        self.pending_export.take()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -316,6 +331,9 @@ impl ResultsDock {
         if let Some(task) = act.zoom_toggle {
             self.popup = if self.popup == Some(task) { None } else { Some(task) };
         }
+        if act.export.is_some() {
+            self.pending_export = act.export;
+        }
         for task in act.closable {
             if self.popup == Some(task) {
                 self.popup = None; // 面板关了，单独拉出去的那个窗口跟着收
@@ -375,6 +393,8 @@ struct Clicked {
     zoom_toggle: Option<u64>,
     /// 当前开着窗口的那个面板，只拿来给按钮画按下态
     popup: Option<u64>,
+    /// 按了「导出」，这帧现成的 CSV 文本先记下来，落盘归 app 管
+    export: Option<Export>,
 }
 
 fn open_panel(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
@@ -447,6 +467,18 @@ fn header(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
                     .clicked()
                 {
                     act.zoom_toggle = Some(panel.task);
+                }
+                if ui
+                    .add(egui::Button::new(RichText::new("导出").size(11.0)).frame(false))
+                    .on_hover_text("把这份结果存成 CSV 文件")
+                    .clicked()
+                {
+                    if let Slot::Done(one) = &panel.slot {
+                        act.export = Some(Export {
+                            name: csv_name(&panel.title, panel.task),
+                            csv: to_csv(one),
+                        });
+                    }
                 }
             }
             if let Some(origin) = panel.origin.clone() {
@@ -588,6 +620,73 @@ fn grid(ui: &mut Ui, one: &StatementResult, task: u64, height: f32) {
         ui.label(weak(
             "行数超过上限，只留了前面这些；要全量请在 SQL 里自己分页。",
         ));
+    }
+}
+
+/// 结果排成 CSV（RFC 4180）：只拼文本，选路径和写文件归 app。
+///
+/// NULL 落成空字段——表格软件就这么表达空，导出成 "NULL" 反而会被当成字符串。
+/// BLOB 给十六进制，网格里那句「‹N 字节›」是给人看的占位符，写进文件就是假数据。
+fn to_csv(one: &StatementResult) -> String {
+    let mut out = String::new();
+    csv_row(&mut out, one.columns.iter().map(|c| c.name.clone()));
+    for row in &one.rows {
+        csv_row(
+            &mut out,
+            row.iter().map(|cell| match cell {
+                crate::db::Cell::Null => String::new(),
+                crate::db::Cell::Text(text) => text.clone(),
+                crate::db::Cell::Blob(bytes) => {
+                    bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                }
+            }),
+        );
+    }
+    out
+}
+
+fn csv_row(out: &mut String, fields: impl Iterator<Item = String>) {
+    for (i, field) in fields.enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        // 逗号、引号、换行有一样就得整块包起来，字段里的引号翻倍
+        let messy = field.contains([',', '"', '\n', '\r']);
+        // 存进 Excel 会被当公式算的字段，前面钉一个单引号按文本处理。
+        // 只认 = @ 开头和 + - 开头但整个不是数字的：`-2` 在 Excel 里就是个数，
+        // 给它钉引号等于把整列数值导成文本，用户求和时才发现。
+        let formula = field.starts_with(['=', '@', '\t'])
+            || (field.starts_with(['+', '-']) && field[1..].trim().parse::<f64>().is_err());
+        if formula {
+            out.push('\'');
+        }
+        if messy || formula {
+            out.push('"');
+            out.push_str(&field.replace('"', "\"\""));
+            out.push('"');
+        } else {
+            out.push_str(&field);
+        }
+    }
+    // RFC 4180 要求 CRLF，Windows 那边的表格软件也只认这个
+    out.push_str("\r\n");
+}
+
+/// 存盘框里的默认文件名。块标题可以随便写，得替文件系统把字符筛一遍。
+fn csv_name(title: &str, task: u64) -> String {
+    let cleaned: String = title
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let head = cleaned.trim();
+    if head.is_empty() {
+        format!("result_{task}.csv")
+    } else {
+        format!("{head}.csv")
     }
 }
 
@@ -898,5 +997,91 @@ mod tests {
             panic!("该有结果");
         };
         assert_eq!(write_line(one), "影响 7 行，最后插入 id 42，警告 1 条");
+    }
+
+    fn table(columns: &[&str], rows: Vec<Vec<Cell>>) -> StatementResult {
+        StatementResult {
+            columns: columns
+                .iter()
+                .map(|name| Column {
+                    name: (*name).to_string(),
+                    type_name: String::new(),
+                })
+                .collect(),
+            affected_rows: rows.len() as u64,
+            last_insert_id: 0,
+            warnings: 0,
+            truncated: false,
+            elapsed_ms: 1,
+            preview: "SELECT".into(),
+            rows,
+        }
+    }
+
+    #[test]
+    fn csv_keeps_the_shape_the_grid_shows() {
+        let one = table(
+            &["name", "n"],
+            vec![
+                vec![Cell::Text("张三".into()), Cell::Text("1".into())],
+                vec![Cell::Text("a,b".into()), Cell::Null],
+                vec![Cell::Text("他说\"嗨\"".into()), Cell::Text("3".into())],
+                vec![Cell::Blob(vec![0x00, 0xff]), Cell::Text("4".into())],
+            ],
+        );
+        let csv = to_csv(&one);
+        assert_eq!(
+            csv,
+            "name,n\r\n\
+             张三,1\r\n\
+             \"a,b\",\r\n\
+             \"他说\"\"嗨\"\"\",3\r\n\
+             00ff,4\r\n",
+            "逗号要包、引号要翻倍、NULL 留空、BLOB 走十六进制：{csv:?}"
+        );
+    }
+
+    #[test]
+    fn csv_quotes_lines_that_span_rows() {
+        let one = table(
+            &["log"],
+            vec![vec![Cell::Text("第一行\n第二行".into())]],
+        );
+        let csv = to_csv(&one);
+        assert_eq!(
+            csv,
+            "log\r\n\"第一行\n第二行\"\r\n",
+            "字段里的换行不包起来，读的人就数不清有几行了：{csv:?}"
+        );
+    }
+
+    #[test]
+    fn csv_neutralises_fields_excel_would_evaluate() {
+        let one = table(
+            &["cmd"],
+            vec![
+                vec![Cell::Text("=1+1".into())],
+                vec![Cell::Text("-250*cmd|'/C calc'!A0".into())],
+                vec![Cell::Text("@SUM(1,2)".into())],
+                vec![Cell::Text("-2".into())],
+            ],
+        );
+        let csv = to_csv(&one);
+        assert_eq!(
+            csv,
+            "cmd\r\n\
+             \'\"=1+1\"\r\n\
+             \'\"-250*cmd|\'/C calc\'!A0\"\r\n\
+             \'\"@SUM(1,2)\"\r\n\
+             -2\r\n",
+            "公式要打回文本，但 -2 这种纯数字不能被弄成文本：{csv:?}"
+        );
+    }
+
+    #[test]
+    fn csv_name_survives_a_title_that_is_not_a_filename() {
+        assert_eq!(csv_name("查 用户", 3), "查 用户.csv");
+        assert_eq!(csv_name("a/b:c*d", 3), "a_b_c_d.csv");
+        assert_eq!(csv_name("  ", 3), "result_3.csv", "空标题也得有个文件名");
     }
 }
