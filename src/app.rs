@@ -758,7 +758,108 @@ impl EasyEditorApp {
         };
     }
 
-    /// 执行 SQL：选中一段就跑那段，否则跑光标所在的整块。
+    /// 新建一个查询文件：`query-年月日-时分秒.sql`，首行是绑好当前连接的 SQL 块。
+    ///
+    /// 时间戳命名 + 撞名加序号，所以连点两次得到两个文件，谁也不覆盖谁。
+    /// 文件一落盘就按 `.sql` 打开，`sql_mode` 自动为真，Ctrl+Enter 直接跑整份。
+    fn new_query(&mut self, dir: Option<PathBuf>) {
+        let Some(dir) = self.query_dir(dir) else {
+            self.status = "没地方放这个查询文件：先打开一个文件夹".into();
+            return;
+        };
+        let conn = self.database.active_conn().unwrap_or_default().to_string();
+        let head = sql::make_head("查询", &conn, sql::STATUS_PENDING);
+        let text = format!("{head}\n\n");
+        let mut created: Option<PathBuf> = None;
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+        for n in 1..1000u32 {
+            let name = if n == 1 {
+                format!("query-{stamp}.sql")
+            } else {
+                format!("query-{stamp}-{n}.sql")
+            };
+            let path = dir.join(name);
+            // create_new 而不是 exists 判断：两步之间别人也可能建出同名文件
+            if std::fs::File::create_new(&path).is_ok() {
+                if let Err(e) = std::fs::write(&path, text.as_bytes()) {
+                    self.status = format!("写入 {} 失败：{e}", path.display());
+                    return;
+                }
+                created = Some(path);
+                break;
+            }
+        }
+        let Some(path) = created else {
+            self.status = format!("「{}」里同一秒新建的查询文件超过 999 个", dir.display());
+            return;
+        };
+        if Some(&dir) == self.root.as_ref() {
+            self.index = filetree::collect_files(&dir, 50_000);
+        }
+        self.open_file(path.clone(), None);
+        if let Some(idx) = self.tabs.iter().position(|t| t.path == path) {
+            // 光标落在块头下面那一行，进来就能写 SQL
+            self.tabs[idx].pending_jump = Some((head.len() + 1).min(text.len()));
+        }
+        self.status = if conn.is_empty() {
+            format!("已新建 {}（还没配连接）", path.file_name().unwrap_or_default().to_string_lossy())
+        } else {
+            format!(
+                "已新建 {}，连到「{conn}」",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            )
+        };
+    }
+
+    /// 查询文件的落点：文件树右键给的目录 > 工作区根 > 当前文件所在目录 > 启动目录。
+    fn query_dir(&self, explicit: Option<PathBuf>) -> Option<PathBuf> {
+        explicit
+            .or_else(|| self.root.clone())
+            .or_else(|| {
+                self.active
+                    .and_then(|i| self.tabs.get(i))
+                    .and_then(|f| f.path.parent().map(Path::to_path_buf))
+            })
+            .or_else(|| std::env::current_dir().ok())
+    }
+
+    /// 「数据库」下拉顶上那一行：默认连接是谁、连不连得上。
+    ///
+    /// 这块信息以前只存在于侧栏某一行的底色里，而块头没写 `conn=` 时
+    /// SQL 恰好就发到这里 —— 最该看见的时候最看不见。
+    fn connection_row(&self, ui: &mut Ui) {
+        let Some(name) = self.database.active_conn().map(|s| s.to_string()) else {
+            let warn = ui.visuals().warn_fg_color;
+            ui.label(RichText::new("还没有数据库连接").size(11.5).color(warn));
+            return;
+        };
+        let target = self
+            .database
+            .spec_of(&name)
+            .map(|s| s.target())
+            .unwrap_or_default();
+        let accent = ui.visuals().hyperlink_color;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("默认连接").size(11.0).weak());
+            ui.label(RichText::new(&name).size(11.5).strong().color(accent));
+            if let Some((mark, color)) = self.probe_badge(&name) {
+                ui.label(RichText::new(mark).size(11.5).strong().color(color));
+            }
+            ui.label(RichText::new(target).size(10.5).weak());
+        });
+    }
+
+    /// 测试连接的状态记号。没测过给 None，那一带就不会凭空多出一个符号。
+    fn probe_badge(&self, name: &str) -> Option<(&'static str, Color32)> {
+        use crate::database::Probe;
+        Some(match self.database.probe_state(name)? {
+            Probe::Running => ("…", Color32::GRAY),
+            Probe::Ok(_) => ("✓", Color32::from_rgb(70, 160, 100)),
+            Probe::Failed(_) => ("✗", Color32::from_rgb(196, 60, 52)),
+        })
+    }
+
+    /// 执行 SQL：选中一段就跑那段，其次光标所在的整块，SQL 模式下跑整份文件。
     ///
     /// 拆句和发号都在 `DatabasePanel::run` 里，这里只把返回的 (id, 语句) 一批挂上结果区。
     fn sql_run(&mut self) {
@@ -772,7 +873,10 @@ impl EasyEditorApp {
         let line = self.tabs[idx].line.saturating_sub(1);
         let blocks = sql::scan(&text);
         let in_block = sql::block_at(&blocks, line);
-        let (body, title, origin) = match (self.tabs[idx].selection_range, in_block) {
+        let selection = self.tabs[idx].selection_range;
+        // 查询文件本来就是一整篇 SQL：没有选区也没有块时，SQL 模式直接跑全文
+        let whole_file = selection.is_none() && in_block.is_none() && self.tabs[idx].sql_mode;
+        let (body, title, origin) = match (selection, in_block) {
             (Some(range), block) => (
                 range,
                 "选中内容".to_string(),
@@ -785,8 +889,17 @@ impl EasyEditorApp {
                 }
                 ((block.body_start, block.body_end), title, block.head_start)
             }
+            (None, None) if whole_file => (
+                (0, text.len()),
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("查询")
+                    .to_string(),
+                0,
+            ),
             (None, None) => {
-                self.status = "光标不在 SQL 块里，也没有选中语句。Ctrl+Shift+J 插一个块".into();
+                self.status =
+                    "光标不在 SQL 块里，也没选中语句。Ctrl+Shift+J 插一个块，或开本文件 SQL 模式跑全文".into();
                 return;
             }
         };
@@ -797,7 +910,9 @@ impl EasyEditorApp {
         // 范围和这份文本快照是同一帧取的，理论上不会越界；真越界也只夹不炸
         let a = body.0.min(text.len());
         let b = body.1.clamp(a, text.len());
-        let where_ = if in_block.is_some() {
+        let where_ = if whole_file {
+            "（整个文件）".to_string()
+        } else if in_block.is_some() {
             format!("（{}）", sql::describe(&blocks, line))
         } else {
             String::new()
@@ -1182,6 +1297,9 @@ impl EasyEditorApp {
         }
         if self.keymap.consume(ctx, "journal_toggle") {
             self.journal_toggle();
+        }
+        if self.keymap.consume(ctx, "sql_new_query") {
+            self.new_query(None);
         }
         if self.keymap.consume(ctx, "sql_insert") {
             self.insert_sql_block();
@@ -2317,6 +2435,18 @@ impl EasyEditorApp {
 
             // 顶栏只多这一个入口：连接相关的操作都在这个下拉里，不再摊开一排按钮
             let menu = ui.menu_button(RichText::new("数据库").size(12.5), |ui| {
+                // 先把「这段 SQL 发去哪儿」说清楚，再给动作
+                self.connection_row(ui);
+                ui.separator();
+                let h_new_query = format!("新建一个 .sql 查询文件，首行带好连接  {}", hint("sql_new_query"));
+                if ui
+                    .button("新建查询")
+                    .on_hover_text(h_new_query)
+                    .clicked()
+                {
+                    self.new_query(None);
+                    ui.close();
+                }
                 let h_sql_insert = format!("在光标处插入 SQL 块  {}", hint("sql_insert"));
                 if ui
                     .add_enabled(self.active.is_some(), egui::Button::new("插入 SQL 块"))
@@ -2326,7 +2456,10 @@ impl EasyEditorApp {
                     self.insert_sql_block();
                     ui.close();
                 }
-                let h_sql_run = format!("跑选中的语句，或光标所在的整个块  {}", hint("sql_run"));
+                let h_sql_run = format!(
+                    "跑选中的语句、光标所在的整块；SQL 模式下没有选区就跑整份文件  {}",
+                    hint("sql_run")
+                );
                 if ui
                     .add_enabled(self.active.is_some(), egui::Button::new("执行 SQL"))
                     .on_hover_text(h_sql_run)
@@ -2348,6 +2481,32 @@ impl EasyEditorApp {
                 {
                     self.results.open = !self.results.open;
                     ui.close();
+                }
+                // SQL 模式：.sql 文件天然开着，其他文件在这儿手动开
+                let idx = self.focused_tab();
+                let file_name = idx
+                    .and_then(|i| self.tabs.get(i))
+                    .map(|f| f.path.file_stem().unwrap_or_default().to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let mut on = idx.is_some_and(|i| self.tabs[i].sql_mode);
+                let check = ui
+                    .add_enabled(
+                        idx.is_some(),
+                        egui::Checkbox::new(&mut on, "本文件按 SQL 处理"),
+                    )
+                    .on_hover_text(
+                        "按 SQL 上色，且 Ctrl+Enter 在没有选区也没有块时跑整份文件。\n\
+                         打开 .sql 文件时自动开着，这里关掉的只影响当前标签。",
+                    );
+                if check.changed() {
+                    if let Some(i) = idx {
+                        self.tabs[i].sql_mode = on;
+                        self.status = if on {
+                            format!("「{file_name}」按 SQL 处理，Ctrl+Enter 可直接跑整份文件")
+                        } else {
+                            format!("「{file_name}」不再按 SQL 处理，回到只认 SQL 块")
+                        };
+                    }
                 }
                 ui.separator();
                 if ui
@@ -2550,6 +2709,7 @@ impl EasyEditorApp {
             }
             Some(TreeAction::Renamed(old, new)) => self.file_renamed(&old, &new),
             Some(TreeAction::OpenTerminal(dir)) => self.new_terminal_pane_at(&dir),
+            Some(TreeAction::NewQuery(dir)) => self.new_query(Some(dir)),
             None => {}
         }
         if let Some(byte) = journal_jump {
@@ -3075,9 +3235,43 @@ impl EasyEditorApp {
                             }
                         }
                     }
+                    self.db_chip(ui);
                 });
             });
         });
+    }
+
+    /// 状态栏最右边那一小块：这个文件的 SQL 会发到哪条连接，点一下跳侧栏。
+    ///
+    /// 只在跟 SQL 有关的文件上出现（开了 SQL 模式或有块），其余时候不占地方。
+    fn db_chip(&mut self, ui: &mut Ui) {
+        let Some(idx) = self.active else { return };
+        let Some(file) = self.tabs.get(idx) else {
+            return;
+        };
+        if !file.sql_mode && sql::scan(&file.text).is_empty() {
+            return;
+        }
+        ui.separator();
+        let name = self.database.active_conn().map(|s| s.to_string());
+        let accent = ui.visuals().hyperlink_color;
+        let (mark, color) = match name.as_deref().and_then(|n| self.probe_badge(n)) {
+            Some((mark, color)) => (mark, color),
+            // 有连接还没测过 = 只是信息；连连接都没有 = 现在跑不了，得醒目
+            None if name.is_some() => ("", accent),
+            None => ("", ui.visuals().warn_fg_color),
+        };
+        let label = match &name {
+            Some(name) => format!("SQL → {name}{mark}"),
+            None => "SQL → 未配置连接".to_string(),
+        };
+        let resp = ui
+            .add(egui::Button::new(RichText::new(label).size(11.0).color(color)).frame(false))
+            .on_hover_text("这个文件的 SQL 发往哪条连接，点开侧栏数据库树切换。测试连接的 ✓/✗ 也在这里");
+        if resp.clicked() {
+            self.side = SideTab::Database;
+            self.show_side = true;
+        }
     }
 
     fn central(&mut self, ui: &mut Ui) {
@@ -3088,7 +3282,7 @@ impl EasyEditorApp {
                 "{} 打开文件夹   {} 快速打开   {} 全局搜索\n\
                  {} 查找   {} 替换   {} 日志块   {} / {} 块间跳转\n\
                  {} 新建文件   {} 终端   {} 新建终端\n\
-                 {} 插入 SQL 块   {} 执行 SQL   {} 结果区\n\
+                 {} 新建查询   {} 插入 SQL 块   {} 执行 SQL   {} 结果区\n\
                  {} 自动拆分   {} / {} 手动拆分   {} 关闭面板   {} 下一个面板   {} 快捷键",
                 k("open_folder"),
                 k("quick_open"),
@@ -3101,6 +3295,7 @@ impl EasyEditorApp {
                 k("new_file"),
                 k("terminal_toggle"),
                 k("terminal_new"),
+                k("sql_new_query"),
                 k("sql_insert"),
                 k("sql_run"),
                 k("results_toggle"),
@@ -6290,6 +6485,239 @@ mod tests {
             edit.insert.contains("conn=本机"),
             "头部要写死当前连接：{}",
             edit.insert
+        );
+    }
+
+    /// 这一帧让 egui 往系统剪贴板写了什么（可能多条，按顺序）。
+    fn copied(out: &egui::FullOutput) -> Vec<String> {
+        out.platform_output
+            .commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 点中屏上最靠上的那段这种文字。返回松手那一帧——
+    /// 剪贴板这类「一次性请求」只出现在处理点击的那一帧里，往后就没了。
+    fn click_first(
+        app: &mut EasyEditorApp,
+        ctx: &egui::Context,
+        out: &egui::FullOutput,
+        needle: &str,
+    ) -> egui::FullOutput {
+        let mut hits = seen(out)
+            .into_iter()
+            .filter(|(t, _)| t == needle)
+            .map(|(_, r)| r.center())
+            .collect::<Vec<_>>();
+        assert!(!hits.is_empty(), "屏上找不到「{needle}」");
+        hits.sort_by(|a, b| a.y.total_cmp(&b.y));
+        frame(app, ctx, pointer(hits[0], egui::PointerButton::Primary, true));
+        frame(app, ctx, pointer(hits[0], egui::PointerButton::Primary, false))
+    }
+
+    #[test]
+    fn opening_a_sql_file_turns_on_sql_mode() {
+        let (_ctx, mut app, dir) = app_in_folder("ee_sql_mode_txt", "SELECT 1\n");
+        std::fs::write(dir.join("q.sql"), "SELECT 1\n").unwrap();
+        app.open_file(dir.join("q.sql"), None);
+        assert!(
+            app.tabs[app.active.unwrap()].sql_mode,
+            "扩展名是 .sql 就该按 SQL 对待，不用再手动开"
+        );
+        // 同一个目录里的 .txt 不受牵连：模式是逐个标签的
+        app.open_file(dir.join("a.txt"), None);
+        assert!(
+            !app.tabs[app.active.unwrap()].sql_mode,
+            "普通文本文件不该被顺手当成查询"
+        );
+    }
+
+    #[test]
+    fn a_sql_file_with_no_block_runs_the_whole_file() {
+        let (ctx, mut app, dir) = app_in_folder("ee_sql_mode_whole", "SELECT 1\n");
+        app.database = mock_database();
+        let file = dir.join("q.sql");
+        std::fs::write(&file, "SELECT id FROM a;\nSELECT name FROM b;\n").unwrap();
+        app.open_file(file, None);
+        app.sql_run();
+        assert_eq!(
+            app.results.count(),
+            2,
+            "没有选区也没有块，SQL 模式该把整份文件当一批交出去"
+        );
+        assert!(
+            app.status.contains("整个文件"),
+            "状态栏要说清跑的是全文：{}",
+            app.status
+        );
+        settle_results(&mut app, &ctx);
+        let idx = app.active.unwrap();
+        assert!(
+            !app.tabs[idx].text.contains('['),
+            "查询文件没有块头可回写：{}",
+            app.tabs[idx].text
+        );
+    }
+
+    #[test]
+    fn a_plain_file_with_no_block_refuses_to_run_everything() {
+        let (_ctx, mut app, _dir) = app_in_folder("ee_sql_mode_plain", "hello\n");
+        app.database = mock_database();
+        app.open_file(_dir.join("a.txt"), None);
+        app.sql_run();
+        assert_eq!(app.results.count(), 0, "普通文件整篇发出去太危险了");
+        assert!(
+            app.status.contains("SQL 模式"),
+            "拒绝的话得指出出路：{}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn new_query_writes_a_bound_block_and_opens_it() {
+        let (_ctx, mut app, dir) = app_in_folder("ee_sql_new_query", "x\n");
+        app.database = mock_database();
+        app.new_query(None);
+
+        let idx = app.active.expect("新建的查询该摊到前台");
+        let tab = &app.tabs[idx];
+        let name = tab
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(name.starts_with("query-") && name.ends_with(".sql"), "{name}");
+        assert!(tab.sql_mode, "新建的查询文件当然要按 SQL 对待");
+        assert!(
+            tab.text.starts_with("-- sql 查询") && tab.text.contains("conn=本机"),
+            "首行要绑好默认连接：{}",
+            tab.text
+        );
+        assert!(dir.join(&name).is_file(), "文件得真在磁盘上");
+        assert!(
+            app.status.contains(&format!("已新建 {name}")),
+            "{}",
+            app.status
+        );
+
+        // 同一秒里再点一次不能把刚建的那个盖掉
+        let first = tab.path.clone();
+        app.new_query(None);
+        let second = app.tabs[app.active.unwrap()].path.clone();
+        assert_ne!(second, first, "同一秒新建两次要有两个文件");
+    }
+
+    #[test]
+    fn a_batch_of_results_gets_one_header_row() {
+        let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_batch_head");
+        app.sql_run();
+        settle_results(&mut app, &ctx);
+        let out = frame(&mut app, &ctx, vec![]);
+        let shown = texts(&out);
+        // 一批一行抬头，两条语句共用；条数写在上面，用户不用自己数面板
+        assert_eq!(
+            shown
+                .iter()
+                .filter(|t| t.as_str() == "本机 · 「查用户」 · 共 2 条")
+                .count(),
+            1,
+            "批次抬头该出现正好一次：{shown:?}"
+        );
+        assert!(
+            shown.iter().any(|t| t == "1/2") && shown.iter().any(|t| t == "2/2"),
+            "面板标题里要看得出这是第几条：{shown:?}"
+        );
+    }
+
+    #[test]
+    fn the_copy_button_sends_the_result_to_the_clipboard() {
+        let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_copy");
+        app.sql_run();
+        settle_results(&mut app, &ctx);
+        let out = frame(&mut app, &ctx, vec![]);
+        let out = click_first(&mut app, &ctx, &out, "复制");
+        let board = copied(&out);
+        assert_eq!(board.len(), 1, "点一下只该写一次剪贴板：{board:?}");
+        assert_eq!(
+            board[0],
+            "id\tname\n1\t行0\n2\t行1",
+            "制表符分隔、带表头，粘进表格软件直接分列"
+        );
+    }
+
+    #[test]
+    fn expanding_a_row_lays_out_its_full_values() {
+        let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_expand");
+        app.sql_run();
+        settle_results(&mut app, &ctx);
+        let out = frame(&mut app, &ctx, vec![]);
+        // 表格每行行首那个 ▸（面板标题行用的是同一串，但它排得更靠上）
+        let mut arrows = seen(&out)
+            .into_iter()
+            .filter(|(t, _)| t == "▸")
+            .map(|(_, r)| r.center())
+            .collect::<Vec<_>>();
+        assert_eq!(arrows.len(), 4, "两个面板各两行：{arrows:?}");
+        arrows.sort_by(|a, b| a.y.total_cmp(&b.y));
+        frame(&mut app, &ctx, pointer(arrows[0], egui::PointerButton::Primary, true));
+        frame(&mut app, &ctx, pointer(arrows[0], egui::PointerButton::Primary, false));
+
+        let out = frame(&mut app, &ctx, vec![]);
+        let shown = texts(&out);
+        assert!(
+            shown.iter().any(|t| t == "id =") && shown.iter().any(|t| t == "name ="),
+            "展开后没把「列名 = 值」摊出来：{shown:?}"
+        );
+        assert!(shown.iter().any(|t| t == "第 1 行"), "{shown:?}");
+
+        // 再点一下收回去，明细不该留在屏上
+        let out = frame(&mut app, &ctx, vec![]);
+        click_first(&mut app, &ctx, &out, "▾");
+        let shown = texts(&frame(&mut app, &ctx, vec![]));
+        assert!(
+            !shown.iter().any(|t| t == "id ="),
+            "收了还留着明细：{shown:?}"
+        );
+    }
+
+    #[test]
+    fn the_database_tab_names_the_default_connection() {
+        let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_default");
+        app.side = SideTab::Database;
+        let shown = texts(&frame(&mut app, &ctx, vec![]));
+        assert!(
+            shown.iter().any(|t| t == "默认连接"),
+            "侧栏没交代 SQL 发往哪条：{shown:?}"
+        );
+        assert_eq!(
+            shown.iter().filter(|t| t.as_str() == "默认").count(),
+            1,
+            "「默认」牌子只能挂一块：{shown:?}"
+        );
+    }
+
+    #[test]
+    fn the_status_bar_shows_where_this_files_sql_goes() {
+        let (ctx, mut app, dir) = app_in_folder("ee_sql_chip", "SELECT 1\n");
+        app.database = mock_database();
+        std::fs::write(dir.join("q.sql"), "SELECT 1\n").unwrap();
+        app.open_file(dir.join("q.sql"), None);
+        let shown = texts(&frame(&mut app, &ctx, vec![]));
+        assert!(
+            shown.iter().any(|t| t == "SQL → 本机"),
+            "状态栏少了 SQL 去向这一截：{shown:?}"
+        );
+        // 普通文本、又没块，就别在状态栏挂个跟当前文件无关的尾巴
+        app.open_file(dir.join("a.txt"), None);
+        let shown = texts(&frame(&mut app, &ctx, vec![]));
+        assert!(
+            !shown.iter().any(|t| t.starts_with("SQL → ")),
+            "这个文件跟数据库没关系：{shown:?}"
         );
     }
 }

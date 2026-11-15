@@ -39,6 +39,7 @@ pub const ACTIONS: &[ActionDef] = &[
     ActionDef { id: "journal_next", label: "下一个日志块", group: "日志", default: "Ctrl+Alt+Down" },
     ActionDef { id: "journal_toggle", label: "切换完成状态", group: "日志", default: "Ctrl+Alt+D" },
     // 数据库
+    ActionDef { id: "sql_new_query", label: "新建查询文件", group: "数据库", default: "Ctrl+Alt+N" },
     ActionDef { id: "sql_insert", label: "插入 SQL 块", group: "数据库", default: "Ctrl+Shift+J" },
     ActionDef { id: "sql_run", label: "执行 SQL（块或选中语句）", group: "数据库", default: "Ctrl+Enter" },
     ActionDef { id: "results_toggle", label: "显示 / 隐藏结果区", group: "数据库", default: "Ctrl+Shift+R" },

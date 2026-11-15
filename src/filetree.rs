@@ -81,6 +81,8 @@ pub enum TreeAction {
     Renamed(PathBuf, PathBuf),
     /// 右键「在此处打开终端」：在这个目录里起一块新终端
     OpenTerminal(PathBuf),
+    /// 右键「新建 SQL 查询」：文件由 app 层直接建好，这里只报目录
+    NewQuery(PathBuf),
 }
 
 /// 校验改名输入：去掉首尾空白，空串 / `.` / `..` / 带路径分隔符或 Windows 非法字符的都算不合法。
@@ -611,6 +613,14 @@ impl FileTree {
                 if ui.button("新建文件夹").clicked() {
                     self.new_entry = Some((target_dir.clone(), true));
                     self.new_name.clear();
+                    ui.close();
+                }
+                if ui
+                    .button("新建 SQL 查询")
+                    .on_hover_text("时间戳命名的 .sql 文件，首行带好连接的 SQL 块，建完直接打开")
+                    .clicked()
+                {
+                    *out = Some(TreeAction::NewQuery(target_dir.clone()));
                     ui.close();
                 }
                 ui.separator();

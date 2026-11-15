@@ -55,8 +55,27 @@ struct ConnTree {
 enum Pending {
     Databases(String),
     Tables { conn: String, database: String },
-    /// 连接管理窗口里的「测试连接」
-    Probe,
+    /// 连接管理窗口（或侧栏右键）里点的「测试连接」，按连接名落回 `probes`
+    Probe(String),
+}
+
+/// 一次「测试连接」的结论。
+///
+/// 侧栏和编辑表单看的是同一份：从前只有表单里那行灰字，右键测完只在状态栏闪一下，
+/// 到底连上没有得自己猜。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Probe {
+    Running,
+    Ok(String),
+    Failed(String),
+}
+
+/// 结论 + 测它的时候那份配置的指纹（[`ConnectionSpec::stamp`]）。
+/// 指纹对不上就说明中间改过字段，那个绿勾不能再接着亮。
+#[derive(Clone, Debug)]
+struct ProbeRecord {
+    stamp: u64,
+    state: Probe,
 }
 
 /// 管理窗口里正在编辑的那一条。
@@ -68,8 +87,6 @@ struct Draft {
     /// 改的是 `connections` 里第几条；`None` 表示新建，还没落地
     index: Option<usize>,
     spec: ConnectionSpec,
-    /// 「测试连接」的回执：`None` = 没测过
-    probe: Option<String>,
 }
 
 pub struct DatabasePanel {
@@ -79,6 +96,8 @@ pub struct DatabasePanel {
     /// 侧栏里选中的连接。SQL 块头部没写 `conn=` 时发到这里。
     active: Option<String>,
     pending: HashMap<u64, Pending>,
+    /// 连接名 -> 最近一次测试连接。改了配置要跟着重测，见 [`ProbeRecord`]。
+    probes: HashMap<String, ProbeRecord>,
     /// 不属于这层的回执（SQL 块的结果），底部结果区每帧来取。
     ///
     /// 语句结果和库表列表共用一条通道、一套 id，这里只认领自己发出去的那些，
@@ -106,6 +125,7 @@ impl DatabasePanel {
             trees: HashMap::new(),
             active,
             pending: HashMap::new(),
+            probes: HashMap::new(),
             stray: Vec::new(),
             draft: None,
             show_manager: false,
@@ -198,13 +218,18 @@ impl DatabasePanel {
                     }
                     self.status = format!("{conn} / {database} · {text}");
                 }
-                Pending::Probe => {
-                    if let Some(draft) = self.draft.as_mut() {
-                        draft.probe = Some(text.clone());
+                Pending::Probe(conn) => {
+                    let state = match &event.outcome {
+                        Ok(_) => Probe::Ok(text.clone()),
+                        Err(_) => Probe::Failed(text.clone()),
+                    };
+                    // 测完到收回来之间连接可能被删掉，那就没人在等这条结论了
+                    if let Some(record) = self.probes.get_mut(&conn) {
+                        record.state = state;
                     }
                     self.status = match &event.outcome {
-                        Ok(_) => format!("连接可用：{text}"),
-                        Err(_) => format!("连接失败：{text}"),
+                        Ok(_) => format!("「{conn}」可用：{text}"),
+                        Err(_) => format!("「{conn}」连不上：{text}"),
                     };
                 }
             }
@@ -321,28 +346,96 @@ impl DatabasePanel {
 
     /// 发一次「测试连接」。回执走 `poll`，所以这里只登记任务。
     fn test_connection(&mut self, spec: &ConnectionSpec) {
+        let name = spec.name.clone();
+        let stamp = spec.stamp();
+        let record = |state: Probe| ProbeRecord { stamp, state };
         if let Some(field) = spec.missing() {
-            if let Some(draft) = self.draft.as_mut() {
-                draft.probe = Some(format!("请先填写{field}"));
-            }
+            // 没填全就别去麻烦后台线程，直接把该填哪一项说在结论那一格里
+            self.probes.insert(name, record(Probe::Failed(format!("请先填写{field}"))));
             return;
         }
         match self.hub.probe(spec) {
             Ok(id) => {
-                self.pending.insert(id, Pending::Probe);
-                if let Some(draft) = self.draft.as_mut() {
-                    draft.probe = Some("连接中…".into());
-                }
+                self.pending.insert(id, Pending::Probe(spec.name.clone()));
+                self.probes.insert(name, record(Probe::Running));
                 self.status = format!("正在测试 {}…", spec.name);
             }
             Err(err) => {
                 let text = err.to_string();
-                if let Some(draft) = self.draft.as_mut() {
-                    draft.probe = Some(text.clone());
-                }
+                self.probes.insert(name, record(Probe::Failed(text.clone())));
                 self.status = format!("连接失败：{text}");
             }
         }
+    }
+
+    /// 这条连接现在的测试结论。只在配置和当初测的那份一模一样时才给——
+    /// 改过主机、密码之类还不重测就接着显示绿勾，比不显示更坏。
+    fn probe_of(&self, spec: &ConnectionSpec) -> Option<&Probe> {
+        self.probes
+            .get(&spec.name)
+            .filter(|record| record.stamp == spec.stamp())
+            .map(|record| &record.state)
+    }
+
+    /// 给上层（工具栏、状态栏）看的测试结论。
+    pub fn probe_state(&self, name: &str) -> Option<Probe> {
+        self.spec_of(name).and_then(|spec| self.probe_of(spec).cloned())
+    }
+
+    /// 有过结论，但配置已经变了。
+    fn probe_stale(&self, spec: &ConnectionSpec) -> bool {
+        self.probes
+            .get(&spec.name)
+            .is_some_and(|record| record.stamp != spec.stamp())
+    }
+
+    /// 这条连接现在该显示的测试结论，图标、文案、颜色一起给。
+    ///
+    /// 侧栏的行和表单里那一块走同一份口径：同一个连接在两处说法不一，
+    /// 用户只会当成都在瞎说。没有结论就没有这一行——从没测过的连接不该被暗示「坏了」。
+    fn probe_view(
+        &self,
+        ui: &Ui,
+        spec: &ConnectionSpec,
+    ) -> Option<(&'static str, String, egui::Color32)> {
+        let visuals = ui.visuals();
+        let green = egui::Color32::from_rgb(70, 160, 100);
+        Some(match self.probe_of(spec) {
+            Some(Probe::Running) => ("⏳", "正在测试…".into(), visuals.hyperlink_color),
+            Some(Probe::Ok(info)) => ("✓", format!("连接可用 · {info}"), green),
+            Some(Probe::Failed(err)) => ("✗", format!("连不上：{err}"), visuals.error_fg_color),
+            // 测过之后又改了字段：与其把上次的绿勾接着亮，不如直说那个结果不作数了
+            None if self.probe_stale(spec) => (
+                "⚠",
+                "配置改过了，上次结果不作数".into(),
+                visuals.warn_fg_color,
+            ),
+            None => return None,
+        })
+    }
+
+    /// 表单里那一行测试结论，整块铺色。
+    ///
+    /// 单独占一行是有原因的：从前它挤在「测试连接」按钮边上，11 号灰字，
+    /// 用户点完根本不知道有没有生效。这一屏上「连上了没」是唯一要紧的答案。
+    fn probe_line(&self, ui: &mut Ui, spec: &ConnectionSpec) {
+        let Some((icon, text, color)) = self.probe_view(ui, spec) else {
+            return;
+        };
+        let dark = ui.visuals().dark_mode;
+        let alpha = if dark { 40 } else { 28 };
+        let fill = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha);
+        egui::Frame::new()
+            .fill(fill)
+            .corner_radius(4.0)
+            .inner_margin(egui::Margin::symmetric(6, 3))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(icon).size(12.0).strong().color(color));
+                    // 报错原因往往一大串，给成可选中才能直接抄去查
+                    ui.label(RichText::new(text).size(11.5).strong().color(color));
+                });
+            });
     }
 
     fn name_taken(&self, name: &str, except: Option<usize>) -> bool {
@@ -361,7 +454,6 @@ impl DatabasePanel {
         self.draft = Some(Draft {
             index: None,
             spec,
-            probe: None,
         });
         self.show_manager = true;
     }
@@ -373,7 +465,6 @@ impl DatabasePanel {
         self.draft = Some(Draft {
             index: Some(index),
             spec,
-            probe: None,
         });
     }
 
@@ -413,6 +504,16 @@ impl DatabasePanel {
         // 改过配置的连接，旧线程和旧列表都不再作数（改名时新旧名字一起收）
         self.forget(&old.name);
         self.forget(&spec.name);
+        // 测试结论是按名字存的：改名后把它挪到新名字上，绿勾不该因为一次改名就消失。
+        // 但结论本身按配置指纹认领，存完再对着新配置核验，改过密码那份 ✓ 自然不亮。
+        let tested = self
+            .probes
+            .remove(&draft.spec.name)
+            .or_else(|| self.probes.remove(&old.name));
+        self.probes.remove(&old.name);
+        if let Some(record) = tested {
+            self.probes.insert(spec.name.clone(), record);
+        }
         if self.active.as_deref() == Some(old.name.as_str()) {
             self.active = Some(spec.name.clone());
         }
@@ -427,6 +528,8 @@ impl DatabasePanel {
         // 没保存过的连接也可能被「测试连接」起了线程，顺手收掉
         if !self.connections.iter().any(|c| c.name == draft.spec.name) {
             self.hub.close(&draft.spec.name);
+            // 结论也别留着：这个名字下面马上会长出另一条不相干的连接
+            self.probes.remove(&draft.spec.name);
         }
     }
 
@@ -436,6 +539,7 @@ impl DatabasePanel {
         };
         self.connections.remove(index);
         self.forget(&spec.name);
+        self.probes.remove(&spec.name);
         if self.active.as_deref() == Some(spec.name.as_str()) {
             self.active = self.connections.first().map(|c| c.name.clone());
         }
@@ -492,6 +596,25 @@ impl DatabasePanel {
             return;
         }
 
+        // 默认连接单独说一行：块头没写 conn= 时发去哪儿，是最不该靠底色去猜的事。
+        // 认 `active_conn()` 而不是 `active`：一条都没点过时，发号处其实落在列表第一条，
+        // 这一行必须和那个事实一致，否则「看得见的那条」和「真正那条」会劈叉。
+        if let Some(active) = self.active_conn().map(str::to_string) {
+            let target = self.spec_of(&active).map(|s| s.target()).unwrap_or_default();
+            let color = ui.visuals().hyperlink_color;
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(2.0);
+                ui.label(RichText::new("默认连接").size(10.5).weak());
+                ui.label(
+                    RichText::new(format!("{active} · {target}"))
+                        .size(11.0)
+                        .strong()
+                        .color(color),
+                );
+            });
+            ui.add_space(1.0);
+        }
+
         egui::ScrollArea::vertical()
             .id_salt("db_tree")
             .auto_shrink([false, false])
@@ -515,8 +638,9 @@ impl DatabasePanel {
     fn conn_rows(&mut self, ui: &mut Ui, spec: &ConnectionSpec) {
         let name = spec.name.clone();
         let expanded = self.trees.get(&name).is_some_and(|t| t.expanded);
-        let selected = self.active.as_deref() == Some(name.as_str());
-        let rows_width = (ui.available_width() - 70.0).max(60.0);
+        let selected = self.active_conn() == Some(name.as_str());
+        // 名字右边还要放「默认」和测试结论，宽度不留够就把它们挤到面板外面裁掉了
+        let rows_width = (ui.available_width() - 98.0).max(50.0);
 
         ui.horizontal(|ui| {
             ui.add_space(2.0);
@@ -540,6 +664,16 @@ impl DatabasePanel {
                 ));
             if row.clicked() {
                 self.active = Some(name.clone());
+                self.status = format!("已把「{name}」设为默认连接");
+            }
+            if selected {
+                let accent = ui.visuals().hyperlink_color;
+                ui.label(RichText::new("默认").size(9.5).strong().color(accent))
+                    .on_hover_text("块头没写 conn= 的 SQL 都发到这里");
+            }
+            if let Some((icon, text, color)) = self.probe_view(ui, spec) {
+                ui.label(RichText::new(icon).size(11.5).strong().color(color))
+                    .on_hover_text(text);
             }
             row.context_menu(|ui| {
                 if ui.button("刷新库列表").clicked() {
@@ -833,6 +967,9 @@ impl DatabasePanel {
         }
 
         ui.add_space(6.0);
+        self.probe_line(ui, &spec);
+
+        ui.add_space(2.0);
         let mut test = false;
         let mut save = false;
         let mut cancel = false;
@@ -843,9 +980,6 @@ impl DatabasePanel {
                 .clicked()
             {
                 test = true;
-            }
-            if let Some(probe) = &draft.probe {
-                ui.label(RichText::new(probe.clone()).size(11.0).weak());
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("取消").clicked() {
@@ -1068,15 +1202,113 @@ mod tests {
     }
 
     #[test]
-    fn probe_result_lands_in_the_draft() {
+    fn probe_result_is_claimed_by_the_connection_that_asked() {
         let mut panel = panel(&["测试连接"]);
         panel.begin_edit(0);
         let draft_spec = panel.draft.clone().expect("草稿").spec;
         panel.test_connection(&draft_spec);
+        assert!(
+            matches!(panel.probe_of(&draft_spec), Some(Probe::Running)),
+            "点下去那一帧就该有反应，不然等回执的几秒像没点上"
+        );
         settle(&mut panel);
-        let draft = panel.draft.as_ref().expect("草稿还在");
-        assert_eq!(draft.probe.as_deref(), Some("8.0.33-mock"));
-        assert!(panel.status.contains("连接可用"), "状态栏也要说：{}", panel.status);
+        assert_eq!(
+            panel.probe_of(&draft_spec),
+            Some(&Probe::Ok("8.0.33-mock".into()))
+        );
+        assert!(
+            panel.status.contains("可用"),
+            "状态栏也要说：{}",
+            panel.status
+        );
+    }
+
+    #[test]
+    fn a_failed_probe_stays_visible_as_a_failure() {
+        let mut panel = panel(&[]);
+        let bad = ConnectionSpec {
+            host: "bad-host".into(),
+            ..spec("坏连接")
+        };
+        panel.connections.push(bad.clone());
+        panel.test_connection(&bad);
+        settle(&mut panel);
+        match panel.probe_of(&bad) {
+            Some(Probe::Failed(text)) => assert!(text.contains("连接被拒绝"), "{text}"),
+            other => panic!("失败得留在结论里，不能只在状态栏闪一下：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn editing_the_config_retires_the_previous_verdict() {
+        let mut panel = panel(&["测试连接"]);
+        let saved = spec("测试连接");
+        panel.test_connection(&saved);
+        settle(&mut panel);
+        assert!(panel.probe_of(&saved).is_some());
+        let mut edited = saved.clone();
+        edited.host = "10.0.0.1".into();
+        assert!(
+            panel.probe_of(&edited).is_none(),
+            "换了主机还亮绿勾等于骗人"
+        );
+        assert!(
+            panel.probe_stale(&edited),
+            "但得说清那是过期，不是从没测过"
+        );
+    }
+
+    #[test]
+    fn renaming_keeps_the_verdict_and_saving_moves_it_to_the_new_name() {
+        let mut panel = panel(&["旧名"]);
+        let saved = spec("旧名");
+        panel.test_connection(&saved);
+        settle(&mut panel);
+        panel.begin_edit(0);
+        panel.draft.as_mut().expect("草稿").spec.name = "新名".into();
+        panel.save_draft();
+        assert!(
+            panel.probe_of(&spec("新名")).is_some(),
+            "改个显示名不该把测过的结论丢掉"
+        );
+        assert!(!panel.probes.contains_key("旧名"), "旧名字下不该留孤儿");
+    }
+
+    #[test]
+    fn cancelling_an_unsaved_draft_drops_its_verdict() {
+        let mut panel = panel(&[]);
+        panel.begin_new();
+        panel.draft.as_mut().expect("草稿").spec = spec("临时连接");
+        let draft = panel.draft.clone().expect("草稿").spec;
+        panel.test_connection(&draft);
+        settle(&mut panel);
+        assert!(panel.probe_of(&draft).is_some(), "先测出个结论来");
+        panel.cancel_draft();
+        assert!(
+            panel.probes.is_empty(),
+            "没保存的连接，结论留着只会坑下一条同名连接"
+        );
+    }
+
+    #[test]
+    fn deleting_a_connection_drops_its_verdict() {
+        let mut panel = panel(&["测试连接"]);
+        let saved = spec("测试连接");
+        panel.test_connection(&saved);
+        settle(&mut panel);
+        panel.delete(0);
+        assert!(panel.probes.is_empty(), "连接没了，结论也该跟着走");
+    }
+
+    #[test]
+    fn a_probe_on_a_dead_connection_is_dropped_not_replayed() {
+        // 回执还在路上的时候连接被删了：那条结论不能凭空造出一个孤儿
+        let mut panel = panel(&["测试连接"]);
+        let saved = spec("测试连接");
+        panel.test_connection(&saved);
+        panel.delete(0);
+        settle(&mut panel);
+        assert!(panel.probes.is_empty(), "孤儿结论：{:?}", panel.probes);
     }
 
     #[test]
@@ -1184,5 +1416,111 @@ mod tests {
         assert!(!panel.trees.contains_key("删我"));
         assert!(!panel.hub.has_connection("删我"));
         assert_eq!(panel.active.as_deref(), Some("留着"), "选中的连接该顺延到下一条");
+    }
+
+    /// 把侧栏单独画一帧，收它往屏上丢的所有文字。
+    ///
+    /// 测试结论、默认连接这些最后都落成一个记号加一行小字。
+    /// 只断言 `probes` 里有条目证明不了用户看得见——画没画出来得看这一帧。
+    fn sidebar_texts(panel: &mut DatabasePanel) -> Vec<String> {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(420.0, 620.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_pass(raw, |ctx| {
+            ctx.root_ui(|ui| panel.sidebar(ui));
+        });
+        // 没有真的渲染器消费字体图集的增量，epaint 会在 drop 时断言
+        out.textures_delta.clear();
+
+        fn walk(shape: &egui::Shape, v: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => v.push(text.galley.job.text.clone()),
+                egui::Shape::Vec(shapes) => {
+                    for s in shapes {
+                        walk(s, v);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        for group in &out.shapes {
+            walk(&group.shape, &mut texts);
+        }
+        texts
+    }
+
+    #[test]
+    fn the_sidebar_marks_the_connection_sql_will_actually_use() {
+        let mut panel = panel(&["一库", "二库"]);
+        let texts = sidebar_texts(&mut panel);
+        assert!(
+            texts.iter().any(|t| t == "默认连接"),
+            "侧栏没说是哪条连接在收 SQL：{texts:?}"
+        );
+        // 一条都没点过时，发号处落在列表第一条——牌子和 header 都得跟着这个事实
+        assert_eq!(
+            texts.iter().filter(|t| *t == "默认").count(),
+            1,
+            "「默认」牌子只能有一块：{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.starts_with("一库")),
+            "第一条没进屏：{texts:?}"
+        );
+
+        panel.active = Some("二库".into());
+        let texts = sidebar_texts(&mut panel);
+        assert_eq!(texts.iter().filter(|t| *t == "默认").count(), 1);
+        assert!(
+            texts.iter().any(|t| t.starts_with("二库 · ")),
+            "header 没跟着换：{texts:?}"
+        );
+    }
+
+    #[test]
+    fn a_tested_connection_shows_its_verdict_in_the_sidebar() {
+        let mut panel = panel(&["结论上屏"]);
+        let good = panel.connections[0].clone();
+        assert!(
+            !sidebar_texts(&mut panel).iter().any(|t| t == "✓"),
+            "没测过的连接不该提前打勾"
+        );
+        panel.test_connection(&good);
+        settle(&mut panel);
+        assert!(
+            sidebar_texts(&mut panel).iter().any(|t| t == "✓"),
+            "测通了侧栏却看不到，用户只能再点一次"
+        );
+
+        // 改过配置，绿勾得当场降级成「不作数」
+        panel.connections[0].database = "别的库".into();
+        let texts = sidebar_texts(&mut panel);
+        assert!(
+            texts.iter().any(|t| t == "⚠") && !texts.iter().any(|t| t == "✓"),
+            "改了库名还挂着绿勾：{texts:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_probe_shows_a_cross_in_the_sidebar() {
+        let mut panel = panel(&[]);
+        let bad = ConnectionSpec {
+            host: "bad-host".into(),
+            ..spec("坏了的连接")
+        };
+        panel.connections.push(bad.clone());
+        panel.test_connection(&bad);
+        settle(&mut panel);
+        assert!(
+            sidebar_texts(&mut panel).iter().any(|t| t == "✗"),
+            "连不上得一眼看见"
+        );
     }
 }

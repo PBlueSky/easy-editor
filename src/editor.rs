@@ -1,7 +1,7 @@
 //! 代码编辑器控件：行号 + 语法高亮 + 可编辑 + 跳转 + 大文件虚拟渲染。
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eframe::egui::epaint::text::Row;
@@ -63,6 +63,9 @@ pub struct OpenFile {
     pub occurrences: Arc<Vec<(usize, usize)>>,
     /// SQL 里报错的那几条语句（字节范围）。执行结果回来时才写，跟查找无关。
     pub sql_errors: Arc<Vec<(usize, usize)>>,
+    /// 本文件按 SQL 对待：`Ctrl+Enter` 没选中也没块时可以整文件执行。
+    /// 打开 `.sql` 自动为真，其他文件在「数据库」菜单里手动开。
+    pub sql_mode: bool,
     /// 上一次高亮用的 `(词, 是否整词)`；选区没变就不重扫全文。
     occurrence_term: Option<(String, bool)>,
     pub bytes_len: usize,
@@ -81,11 +84,19 @@ pub struct OpenFile {
 }
 
 impl OpenFile {
+    /// 扩展名算不算 SQL（大小写都认，`.SQL` / `.sql` 一样）。
+    pub fn is_sql_path(path: &Path) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("sql"))
+    }
+
     pub fn new(path: PathBuf, text: String) -> Self {
         let bytes_len = text.len();
         let line_offsets = compute_line_offsets(&text);
         let large = bytes_len > LARGE_FILE_BYTES || line_offsets.len() > LARGE_FILE_LINES;
         let saved_hash = text_hash(&text);
+        let sql_mode = Self::is_sql_path(&path);
         Self {
             path,
             text,
@@ -102,6 +113,7 @@ impl OpenFile {
             current_match: None,
             occurrences: Arc::new(Vec::new()),
             sql_errors: Arc::new(Vec::new()),
+            sql_mode,
             occurrence_term: None,
             bytes_len,
             caret_byte: 0,
@@ -504,7 +516,13 @@ pub fn show(
             ui.spacing_mut().item_spacing.y = 0.0;
 
             let fg = hl.fg;
-            let path = file.path.clone();
+            // SQL 模式让任意扩展名都按 SQL 上色：语法选取只看扩展名，
+            // 换个名字拿去问比给高亮器一路加标志干净。只用于取语法，不碰磁盘。
+            let path = if file.sql_mode {
+                file.path.with_extension("sql")
+            } else {
+                file.path.clone()
+            };
             // 高亮必须跟着 layouter 实际拿到的文本算：TextEdit 会先应用本帧的编辑
             // （外部插入日志块、键盘输入）再回调 layouter，提前算好的 spans
             // 一旦字节数对不上就会切坏 UTF-8 字符。

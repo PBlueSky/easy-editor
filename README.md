@@ -29,9 +29,9 @@ The release package is a **single exe** (about 12 MB, 5.2 MB zipped). No .NET, n
 | Multiple terminals | Real PTYs via `portable-pty`, VT parsing via `alacritty_terminal`; open several and let each run its own thing | [Terminal](#terminal) |
 | Recursive split panes | The tmux / i3 binary pane tree — split as deep as you like, default keys match Windows Terminal | [Split panes](#split-panes) |
 | Journal blocks | Task blocks written directly into ordinary text files, mixed with prose and versioned with git | [Journal blocks](#journal-blocks) |
-| SQL blocks | Jupyter-style: the query lives in a plain text file, `Ctrl+Enter` runs it and the result lands below the editor | [SQL blocks](#sql-blocks) |
-| Multiple results at once | One panel per statement, so a broken second query does not throw away the first result; pop a panel out into its own window, export it as CSV | [Results dock](#results-dock) |
-| MySQL connections | Named connections in `config.json`, browsed as connection → database → table, passwords via `env:` so no secret sits on disk | [Connections](#connections) |
+| SQL blocks | Jupyter-style: the query lives in a plain text file, `Ctrl+Enter` runs it and the result lands below the editor. `Ctrl+Alt+N` starts a fresh `query-<timestamp>.sql` with the connection already bound | [SQL blocks](#sql-blocks) |
+| Multiple results at once | One panel per statement, so a broken second query does not throw away the first result; batch headers, pop-out windows, copy as TSV, export as CSV, long cells unfolded per row | [Results dock](#results-dock) |
+| MySQL connections | Named connections in `config.json`, browsed as connection → database → table, passwords via `env:` so no secret sits on disk. The test verdict (`✓` / `✗` / `⚠`) and the current default are visible wherever the connection is | [Connections](#connections) |
 | Cursor position history | Like IDEA's Navigate Back / Forward; a position only counts as a stop after the cursor sits there for 350 ms | [Cursor position history](#cursor-position-history) |
 | Find and replace | Case sensitivity, regex, all matches highlighted, hands stay in the input box | [Find and replace](#find-and-replace) |
 | Project-wide search | Streams `rg --json` first, falls back to a built-in byte-level scanner when ripgrep is absent | [Project-wide search](#project-wide-search) |
@@ -96,7 +96,7 @@ With no arguments, the startup folder is chosen by: **command-line argument > cu
 └──────────┴───────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Top toolbar**, left to right: `Open folder` `Save` `←` `→` (cursor history back / forward) `New file` `New folder` `Sidebar` `Wrap` `Terminal` `+Terminal` `‖ Split` `═ Split` `Quick open` `Project search` `Find` `Journal block` `Database`. The `Database` entry is a dropdown (`insert SQL block` / `run SQL` / `results dock` / `connection manager…` / `sidebar database tree`) — that is the only new button the whole database feature costs. The right-hand group is `Dark` / `Light` (theme), `?` (keybinding settings), the `shell:` dropdown, `⚙` (terminal settings), font size `- 14 +`, and the workspace name.
+- **Top toolbar**, left to right: `Open folder` `Save` `←` `→` (cursor history back / forward) `New file` `New folder` `Sidebar` `Wrap` `Terminal` `+Terminal` `‖ Split` `═ Split` `Quick open` `Project search` `Find` `Journal block` `Database`. The `Database` entry is a dropdown (default connection line / `new query` / `insert SQL block` / `run SQL` / `results dock` / `connection manager…` / `sidebar database tree` / `this file is SQL`) — that is the only new button the whole database feature costs. The right-hand group is `Dark` / `Light` (theme), `?` (keybinding settings), the `shell:` dropdown, `⚙` (terminal settings), font size `- 14 +`, and the workspace name.
 - **Sidebar** has four tabs: `Files` (the tree), `Search` (project-wide results), `Journal` (blocks in the current file), `Database` (connections → databases → tables → columns). `Ctrl+B` shows or hides it.
 - Narrow the window until one row no longer fits and the remaining buttons wrap onto a second row — they never squash together and text is never overdrawn. The right-hand group still anchors right-to-left after wrapping. A workspace name that is too long gets truncated; hover it for the full path.
 
@@ -190,8 +190,10 @@ LIMIT 50;
 
 Header = `-- sql` + title + `YYYY-MM-DD HH:MM` + `[status]` + tail keys. Two tail keys are recognised today: `conn=<name>` binds the block to a named connection, and a bare `auto` allows automatic execution. Anything unrecognised in the tail is ignored, so adding a field later cannot break old files.
 
+- `Ctrl+Alt+N` (or `Database ▸ New query`, or right-click a folder → `新建 SQL 查询`) creates `query-20261115-140312.sql`, already holding an empty block bound to the default connection, opens it and parks the caret on the line below the header. Two in the same second get `-2` appended rather than overwriting each other
+- `.sql` files open in **SQL mode**; any other file can switch it on from `Database ▸ 本文件按 SQL 处理`. SQL mode is per-tab and does not touch the file: the buffer is highlighted as SQL (`Ctrl+Enter` runs statements, not lines), and it is what unlocks running a file that has no blocks in it
+- `Ctrl+Enter` runs **the selection if there is one, otherwise the whole block the cursor is in, otherwise — in SQL mode only — the entire file**. The status bar says how many statements were handed over and which of the three it picked
 - `Ctrl+Shift+J` (or `Database ▸ Insert SQL block`) drops a block at the cursor, already carrying today's date / time and the default connection
-- `Ctrl+Enter` runs **the selection if there is one, otherwise the whole block the cursor is in**. The status bar says how many statements were handed over
 - Statements are split by a scanner that knows `'…'`, `"…"`, `` `…` ``, `--`, `#` and `/* … */`, so a semicolon inside a string or a comment does not cut a statement in half; the same scanner produces both the panel titles and the byte spans, which is why the two can never disagree
 - Once every statement of a **whole-block** run is back, the header status is rewritten `[待执行]` → `[已执行]` / `[失败]` (pending → done / failed). Running a selection deliberately leaves the block status alone — a piece of the block finishing is not the block finishing
 - A statement that the server rejects gets a translucent red background **in the file itself**, so you can see which one to fix instead of counting panels. The span is validated against the text before it is painted (a mark whose bytes no longer match that statement is dropped rather than placed somewhere wrong), it slides along when the header write-back shortens the block, and typing clears it
@@ -201,7 +203,14 @@ Header = `-- sql` + title + `YYYY-MM-DD HH:MM` + `[status]` + tail keys. Two tai
 
 **One statement, one panel**, and several panels stay on screen at once. That is deliberate: in a block with three `SELECT`s where the second one is broken, the first result is still worth reading, so it is not thrown away with the error. Statements queued behind a failure are marked `未执行` ("not run") instead of spinning forever, and the dock keeps the last 6 panels — the oldest are evicted.
 
-- Each panel header carries `回块` (jump back to the block it came from), `放大` / `收起` (put *this* result into its own resizable window — the way to read a wide table that the bottom strip cannot stretch to fit), `导出` (CSV), `关掉整块` (close every panel of this submission) and `✕`; clicking the header row itself collapses just that panel
+Six panels stacked in one strip is its own problem, so the dock separates them three ways at once:
+
+- **One header row per submission** — `14:03:12  demo · 「活跃用户」 · 共 3 条`. When two blocks produce nearly identical statements, the timestamp is the only thing that says which batch is which
+- **`1/3`, `2/3`, `3/3`** in each panel title, so the order within a batch survives scrolling
+- **A 2.5 pt status bar painted down the left edge** of every panel (green done / red failed / blue waiting). Titles repeat; colour does not
+
+- Each panel header carries `回块` (jump back to the block it came from), `放大` / `收起` (put *this* result into its own resizable window — the way to read a wide table that the bottom strip cannot stretch to fit), `复制` (the whole result as tab-separated text, ready to paste into a spreadsheet), `导出` (CSV), `关掉整块` (close every panel of this submission) and `✕`; clicking the header row itself collapses just that panel
+- Grid cells are single-line and truncated — that is what keeps a wide table readable — but a `TEXT` column with a paragraph in it is not gone: the `▸` at the head of each row unfolds **that row underneath the table** as `column = full value`, wrapped, selectable, and copyable cell / row / table from any cell's right-click menu. It is a per-panel toggle, so five rows can stay open while one is expanded
 - The dock bar has `全部收起 / 全部展开`, `清空` (closes finished panels and keeps the ones still waiting for a reply) and `关闭`
 - A query prints `connection · N 行 · M ms` above a scrollable grid — the dock gives it 120 pt, the popped-out window gives it whatever it asks for. Writes print `影响 N 行` plus the last insert id and the warning count when MySQL reports them
 - More than 1000 rows are cut off on purpose and labelled `（截断）`: a forgotten `LIMIT` on a big table should not pin a thread and a few hundred megabytes to a side panel. A read-only statement also carries a 30 s server-side cap and connections a 5 s TCP timeout, so a typo in the host field does not hang for two minutes
@@ -242,7 +251,20 @@ Everything database-related hangs off the single `Database` dropdown in the tool
 
 `password` accepts `env:VAR`, resolved from `VAR` and then from `EASY_EDITOR_VAR` when the connection is actually opened, so the config file does not have to hold the secret. A literal password works too — remember that `config.json` is readable by your Windows account.
 
-**`Database ▸ Sidebar database tree`** opens the `Database` tab: connection → databases → tables, each level fetched lazily the first time you expand it, with a `重试` (retry) button on the row that failed. Clicking a connection row makes it the default, which is where a block with no `conn=` goes. Double-click a table to copy its qualified name; its context menu also copies a ready-made `SELECT * FROM db.table LIMIT 100;`.
+**Whether a connection actually works is said out loud.** `测试连接` used to answer with a small grey line next to the button, which on a screen this busy meant "did nothing". Now the verdict is a colour-filled block of its own in the form and a mark on the connection's row everywhere it appears:
+
+| Mark | Meaning |
+| --- | --- |
+| `⏳ 正在测试…` | submitted, the answer is on its way — this frame is up before the thread has even started |
+| `✓ 连接可用 · 8.0.33` | opened, version read back |
+| `✗ 连不上 · 2003 …` | the server's own words, selectable so you can copy them |
+| `⚠ 配置改过了` | there *was* a verdict, but the host / port / user / password / database behind it has since changed |
+
+That last row is the point of the whole design: a verdict is claimed by a hash of the connection's fields, so editing the form retires the old `✓` instead of continuing to vouch for a server you have never contacted since. `⚠` is what "stale" looks like. The same mark shows in the sidebar row, in the `Database` dropdown header and in the status bar, all of them reading the one record — and a verdict that belongs to a connection you deleted or renamed away from is dropped, not replayed.
+
+**`Database ▸ Sidebar database tree`** opens the `Database` tab: connection → databases → tables, each level fetched lazily the first time you expand it, with a `重试` (retry) button on the row that failed. Double-click a table to copy its qualified name; its context menu also copies a ready-made `SELECT * FROM db.table LIMIT 100;`.
+
+**Which connection a block goes to is never a guess.** Clicking a connection row makes it the default — the one a block with no `conn=` is sent to — and that fact is written in three places at once: a `默认连接  demo · root@127.0.0.1:3306/shop` line at the head of the sidebar, a `默认` badge on the row itself, and the `SQL → demo ✓` chip in the status bar while the file you are looking at is SQL (by extension, by block, or by mode). The chip is a button: click it and the sidebar switches to the `Database` tab. Before any click at all, the default is the first connection in `config.json`, and that is what the badge shows — the display follows `active_conn()`, the same function `Ctrl+Enter` asks, so the two cannot drift apart.
 
 **Adding another engine** is meant to be a small change: `src/db/mod.rs` is the engine-agnostic protocol (spec → driver, statements in, events out) and `src/db/mysql.rs` is the only file that knows MySQL. A new database means one `DbKind` variant, one branch in `connect()` and one driver module — the block parser, the results dock and the CSV layer do not change. Everything runs on a background thread per connection and reports through a channel; this program has no async runtime and gets none from this feature.
 
@@ -329,8 +351,9 @@ Everything below is the default and everything is rebindable in `F1`.
 | `Ctrl+J` | Insert a journal block |
 | `Ctrl+Alt+↑` / `Ctrl+Alt+↓` | Previous / next journal block |
 | `Ctrl+Alt+D` | Toggle the journal block's done state |
+| `Ctrl+Alt+N` | New query file (`query-<timestamp>.sql`, block header already bound to the default connection) |
 | `Ctrl+Shift+J` | Insert a SQL block at the cursor |
-| `Ctrl+Enter` | Run the selected statement, or the whole block the cursor is in |
+| `Ctrl+Enter` | Run the selected statement, or the whole block the cursor is in, or — in SQL mode — the entire file |
 | `Ctrl+Shift+R` | Show / hide the results dock |
 | `` Ctrl+` `` | Focus a terminal pane, opening one if needed |
 | `` Ctrl+Shift+` `` | New terminal pane |
@@ -404,12 +427,12 @@ Everything is immediate-mode GUI: no QSS, no CSS, no webview. Widget state lives
 
 ## Code layout
 
-About 18,800 lines of Rust in a single binary crate, 22 source files:
+About 19,900 lines of Rust in a single binary crate, 22 source files:
 
 | File | Responsibility |
 |---|---|
 | `src/main.rs` | Entry point, `windows_subsystem`, window builder and icon |
-| `src/app.rs` | The application itself: layout, keybindings, open/save, project search, find/replace, journal blocks, terminal dispatch, SQL submitting |
+| `src/app.rs` | The application itself: layout, keybindings, open/save, project search, find/replace, journal blocks, terminal dispatch, SQL submitting, per-tab SQL mode and new-query files |
 | `src/pane.rs` | tmux-style recursive binary pane tree (`Leaf` / `Split`); layout only, no content |
 | `src/editor.rs` | The editor widget: line numbers + highlighting + editing + jumping + read-only virtual rendering for large files + overlay painting |
 | `src/terminal.rs` | PTY I/O, VT parsing, keyboard/mouse routing, selection and scrollbar |
@@ -418,10 +441,10 @@ About 18,800 lines of Rust in a single binary crate, 22 source files:
 | `src/search.rs` | Project-wide search: ripgrep first, built-in scanner as the fallback |
 | `src/journal.rs` | Journal block parsing and insertion |
 | `src/sql.rs` | SQL block text layer: scan and build blocks, split statements **with byte spans**, decide what is read-only. Touches neither database nor UI |
-| `src/database.rs` | Sidebar `Database` tab and the connection manager window: cached tree, in-flight requests, the connection draft |
+| `src/database.rs` | Sidebar `Database` tab and the connection manager window: cached tree, in-flight requests, the connection draft, and the stored test verdict with the fingerprint that retires it |
 | `src/db/mod.rs` | Engine-agnostic protocol: `ConnectionSpec` → `Driver`, one worker thread per connection, events back out, plus `MockDriver` so the UI is testable without a server |
 | `src/db/mysql.rs` | The only file that knows MySQL: connect options, the text protocol → cells, one statement per call |
-| `src/results.rs` | Results dock: one panel per statement, pop-out window, status write-back, RFC 4180 CSV formatting |
+| `src/results.rs` | Results dock: one panel per statement, batch headers, pop-out window, status write-back, TSV for `复制`, RFC 4180 CSV for `导出`, per-row expansion |
 | `src/nav.rs` | Cursor position history |
 | `src/format.rs` | JSON / XML formatting |
 | `src/keymap.rs` | Configurable keybindings: action ids, serialization, conflict detection |
@@ -437,7 +460,7 @@ About 18,800 lines of Rust in a single binary crate, 22 source files:
 
 ```bash
 cargo check                             # type checking only, fastest
-cargo test                              # 215 unit tests
+cargo test                              # 235 unit tests
 cargo build                             # debug build → target/debug/easy-editor.exe
 cargo build --release                   # release build → target/release/easy-editor.exe
 cargo clippy --all-targets              # requires rustup component add clippy
@@ -493,6 +516,7 @@ The two icons cover different surfaces:
 - **MySQL is the only engine** that has a driver, and the sidebar tree speaks `SHOW DATABASES` / `SHOW TABLES`. The connection form has no TLS, SSH-tunnel or `init_connect` settings either, so what you get on the wire is whatever the `mysql` crate defaults to.
 - A statement is capped at 1000 rows and the dock at 6 panels; the cap is labelled `（截断）` rather than hidden. `DELIMITER` blocks (stored procedures) are out of scope — the splitter cuts on `;`, so split those by hand.
 - Automatic execution only ever runs blocks marked `auto` **and** read-only; anything that writes needs a deliberate `Ctrl+Enter`.
+- **SQL mode is a property of the tab, not of the file.** Switching it on for `notes.txt` is remembered while that tab is open and forgotten when you close it; reopening the file falls back to whatever its extension says. Nothing is written into the file to mark it.
 - A literal password in `config.json` is readable by anyone with your Windows account — write `env:VAR` instead if that matters.
 - No plugin system, no LSP, no Git integration. Deliberately so: this is an editor someone uses every day, not a platform.
 
@@ -570,6 +594,16 @@ The byte spans painted in the editor come from the same scan that produced the s
 ### A freshly opened egui window paints nothing
 
 `Window::show` spends its first frames measuring and placing itself; content only appears once the size has settled. That is egui's business, but it is a trap for headless tests: the pop-out result window test has to burn two frames after the click before asserting that the grid text is on screen.
+
+### A connection verdict is claimed by a fingerprint, not by a name
+
+`测试连接` answers a few hundred milliseconds later, on another thread, and by then the form may have been edited, renamed, saved or cancelled. So the verdict is stored per connection *name* alongside `ConnectionSpec::stamp()` — a hash of host / port / user / password / database / kind — and every renderer asks `probe_of(spec)`, which returns nothing unless the two stamps match. Editing any field therefore downgrades `✓` to `⚠ 配置改过了` on the same frame, which is honest, instead of leaving a green tick on a server that has never been contacted since.
+
+Two things are deliberately *not* in the hash. `name` is not, because verdicts are already keyed by name — hashing it too would turn a cosmetic rename into "stale", with the connection parameters untouched; `save_draft` moves the record to the new name instead. And the hash is computed over **trimmed** fields, because saving trims them too — a fingerprint carrying the spaces the user typed would report a change that saving then erased.
+
+### SQL highlighting borrows the `.sql` extension
+
+`SyntaxRegistry` picks a grammar from the file's extension, and SQL mode is a property of the *tab*, not of the path on disk. Rather than threading a "treat this as SQL" flag through the highlighter and its cache key, `editor.rs` asks for the syntax of `path.with_extension("sql")` when `sql_mode` is on. The `PathBuf` never touches the filesystem — it is a lookup key only — so the cache stays keyed on something that genuinely describes the buffer.
 
 ## Contributing and license
 

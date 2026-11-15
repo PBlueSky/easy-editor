@@ -109,6 +109,29 @@ impl ConnectionSpec {
         format!("{}@{}:{}{db}", self.user, self.host, self.port)
     }
 
+    /// 配置指纹。测试连接的结果按它认领：改过任何一个字段，上一次那个 ✓ 就不该再亮着。
+    /// 密码也算进去——换个密码就是换个服务器身份，旧结论一样不作数。
+    ///
+    /// 刻意不含 `name`：结论本来就按名字存在 map 里，再算进指纹等于改个显示名
+    /// 就把绿勾判成过期，而连接参数一个字都没动。
+    pub fn stamp(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        // 按 trim 后的内容算：保存时这几项都会被裁一遍，指纹要还带首尾空格，
+        // 用户存完连接看到的绿勾会莫名其妙变成「配置改过了」。
+        for field in [&self.host, &self.user, &self.password, &self.database]
+            .into_iter()
+            .map(String::as_str)
+            .map(str::trim)
+        {
+            field.hash(&mut hash);
+        }
+        self.port.hash(&mut hash);
+        // 用 label 而不是 enum 本身：以后加引擎不用回来改这里
+        self.kind.label().hash(&mut hash);
+        hash.finish()
+    }
+
     /// 配置是否够连。返回 None 表示没问题，否则是缺哪一项——
     /// 给表单直接告诉他该填哪儿，比只回一个 bool 有用。
     pub fn missing(&self) -> Option<&'static str> {

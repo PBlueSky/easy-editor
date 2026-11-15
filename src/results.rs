@@ -7,12 +7,13 @@
 //! 这一层不碰数据库也不碰文件：结果由 `DatabasePanel::take_stray` 转交过来，
 //! 「回块」只是把 (路径, 字节) 原样递回给 app，真正的跳转归 app 管。
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use egui::{Align, Color32, Layout, RichText, ScrollArea, Ui};
 use egui_extras::{Column, TableBuilder};
 
-use crate::db::{preview_of, DbEvent, DbOutcome, StatementResult};
+use crate::db::{preview_of, Cell, DbEvent, DbOutcome, StatementResult};
 
 /// 屏上同时最多留几个面板。跑几次多语句块就能把旧的挤掉，留太多没人往下看。
 pub const MAX_PANELS: usize = 6;
@@ -62,6 +63,11 @@ pub struct Panel {
     pub conn: String,
     /// SQL 块标题，块外选中一段执行时是「选中内容」
     pub title: String,
+    /// 这批是哪一秒提交的。六个面板叠在一起时，这是「哪批是哪批」唯一的凭据
+    pub stamp: String,
+    /// 这批里的第几条（1 基）/ 一共几条
+    pub seq: usize,
+    pub total: usize,
     pub stmt: String,
     /// 这条语句在文件里的字节区间，报错时按它标红
     pub stmt_range: Option<(usize, usize)>,
@@ -69,6 +75,8 @@ pub struct Panel {
     pub origin: Option<Origin>,
     pub slot: Slot,
     pub collapsed: bool,
+    /// 摊开看完整内容的行号（0 基）。窄格子里被裁掉的那一截在这儿看全。
+    pub expanded: HashSet<usize>,
 }
 
 impl Panel {
@@ -166,17 +174,26 @@ impl ResultsDock {
     ) -> u64 {
         let run = self.next_run;
         self.next_run += 1;
-        let batch = parts.iter().map(|part| Panel {
-            task: part.task,
-            run,
-            conn: conn.to_string(),
-            title: title.to_string(),
-            stmt: part.stmt.clone(),
-            stmt_range: part.range,
-            origin: origin.clone(),
-            slot: Slot::Running,
-            collapsed: false,
-        });
+        let stamp = chrono::Local::now().format("%H:%M:%S").to_string();
+        let total = parts.len();
+        let batch = parts
+            .iter()
+            .enumerate()
+            .map(|(i, part)| Panel {
+                task: part.task,
+                run,
+                conn: conn.to_string(),
+                title: title.to_string(),
+                stamp: stamp.clone(),
+                seq: i + 1,
+                total,
+                stmt: part.stmt.clone(),
+                stmt_range: part.range,
+                origin: origin.clone(),
+                slot: Slot::Running,
+                collapsed: false,
+                expanded: HashSet::new(),
+            });
         self.panels.splice(0..0, batch);
         self.waiting.push(run);
         self.trim();
@@ -344,7 +361,14 @@ impl ResultsDock {
             .id_salt("db_result_panels")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                // 同批面板在列表里连着排（一批 splice 到 0，批内按语句顺序），
+                // 所以只要盯住 run 变了没，就能在每批开头插一行抬头。
+                let mut last_run = 0u64;
                 for panel in &mut self.panels {
+                    if panel.run != last_run {
+                        last_run = panel.run;
+                        batch_row(ui, panel);
+                    }
                     if panel.collapsed {
                         collapsed_row(ui, panel, &mut act);
                     } else {
@@ -386,25 +410,27 @@ impl ResultsDock {
     /// 归结果区自己管：面板和窗口得是同一份数据，抄一份出去就等着两边对不上。
     pub fn show_popup(&mut self, ctx: &egui::Context) {
         let Some(task) = self.popup else { return };
-        let Some(panel) = self.panels.iter().find(|p| p.task == task) else {
+        let Some(index) = self.panels.iter().position(|p| p.task == task) else {
             self.popup = None;
             return;
         };
         let mut open = true;
-        egui::Window::new(format!("结果 · {}", panel.title))
+        let title = self.panels[index].title.clone();
+        egui::Window::new(format!("结果 · {title}"))
             .id(egui::Id::unique(("db_result_popup", task)))
             .default_open(true)
             .default_size(egui::vec2(820.0, 460.0))
             .open(&mut open)
             .show(ctx, |ui| {
+                let panel = &mut self.panels[index];
                 ui.label(weak(summary(panel)));
                 ui.separator();
-                match &panel.slot {
-                    Slot::Done(one) if one.is_query() => {
-                        // 窗口给多少用多少，不像底部那样只留五来行
-                        grid(ui, one, task, ui.available_height() - 12.0);
-                    }
-                    _ => body(ui, panel),
+                if matches!(&panel.slot, Slot::Done(one) if one.is_query()) {
+                    // 窗口给多少用多少，不像底部那样只留五来行
+                    let height = ui.available_height() - 12.0;
+                    grid(ui, panel, height);
+                } else {
+                    body(ui, panel);
                 }
             });
         if !open {
@@ -427,6 +453,54 @@ struct Clicked {
     export: Option<Export>,
 }
 
+/// 一批结果上面那一行：几点跑的、发到哪、出自哪个块、一共几条。
+/// 六个面板叠在一起时，标题会重复、语句长得像，只有时间戳分得清哪批是哪批。
+fn batch_row(ui: &mut Ui, panel: &Panel) {
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        let accent = ui.visuals().hyperlink_color;
+        ui.label(RichText::new(&panel.stamp).size(10.5).strong().color(accent));
+        ui.label(weak(format!(
+            "{} · 「{}」 · 共 {} 条",
+            panel.conn, panel.title, panel.total
+        )));
+    });
+}
+
+/// 展开的那一行摊开成「列名 = 完整值」。
+///
+/// 表格里每格都是截断显示，长文本看不出头尾；这里不换行限制、可选中，
+/// 要拷一段出来也在这儿拷。
+fn detail(ui: &mut Ui, one: &StatementResult, index: usize) {
+    let dark = ui.visuals().dark_mode;
+    let bg = if dark {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 12)
+    } else {
+        Color32::from_rgba_unmultiplied(0, 0, 0, 10)
+    };
+    egui::Frame::new()
+        .fill(bg)
+        .corner_radius(3.0)
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.label(weak(format!("第 {} 行", index + 1)).strong());
+            for (col, cell) in one.columns.iter().zip(&one.rows[index]) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("{} =", col.name)).size(10.5).weak());
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(cell.display().to_string())
+                                .size(11.0)
+                                .monospace(),
+                        )
+                        .selectable(true),
+                    );
+                });
+            }
+        });
+    ui.add_space(2.0);
+}
+
 fn open_panel(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
     let dark = ui.visuals().dark_mode;
     let line = if dark {
@@ -434,7 +508,7 @@ fn open_panel(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
     } else {
         Color32::from_rgb(214, 218, 224)
     };
-    egui::Frame::new()
+    let inner = egui::Frame::new()
         .stroke(egui::Stroke::new(1.0, line))
         .corner_radius(4.0)
         .inner_margin(egui::Margin::symmetric(6, 2))
@@ -443,6 +517,16 @@ fn open_panel(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
             ui.separator();
             body(ui, panel);
         });
+    // 左边一条状态色。面板连着排的时候，标题和语句都长得差不多，
+    // 扫一眼颜色才分得出哪几条成了、哪条砸了。
+    let rect = inner.response.rect;
+    if rect.height() > 6.0 {
+        let bar = egui::Rect::from_min_max(
+            rect.left_top(),
+            egui::pos2(rect.left() + 2.5, rect.bottom()),
+        );
+        ui.painter().rect_filled(bar, 2.0, dot_color(panel));
+    }
 }
 
 fn collapsed_row(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
@@ -499,6 +583,15 @@ fn header(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
                     act.zoom_toggle = Some(panel.task);
                 }
                 if ui
+                    .add(egui::Button::new(RichText::new("复制").size(11.0)).frame(false))
+                    .on_hover_text("整份结果按制表符分隔拷进剪贴板，直接粘进表格软件。\n单个格子右键也有复制。")
+                    .clicked()
+                {
+                    if let Slot::Done(one) = &panel.slot {
+                        ui.ctx().copy_text(to_tsv(one));
+                    }
+                }
+                if ui
                     .add(egui::Button::new(RichText::new("导出").size(11.0)).frame(false))
                     .on_hover_text("把这份结果存成 CSV 文件")
                     .clicked()
@@ -538,6 +631,10 @@ fn header(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
                 ui.painter()
                     .circle_filled(rect.center(), 3.0, dot_color(panel));
                 ui.label(weak(badge(panel)));
+                if panel.total > 1 {
+                    // 一次跑三条，得看得出这是第几条——不然三个面板看着像同一句重复了三遍
+                    ui.label(weak(format!("{}/{}", panel.seq, panel.total)));
+                }
                 let text = panel.preview();
                 ui.add(
                     egui::Label::new(RichText::new(text).size(11.0).monospace())
@@ -550,7 +647,11 @@ fn header(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
     );
 }
 
-fn body(ui: &mut Ui, panel: &Panel) {
+fn body(ui: &mut Ui, panel: &mut Panel) {
+    if matches!(&panel.slot, Slot::Done(one) if one.is_query()) {
+        grid(ui, panel, 120.0);
+        return;
+    }
     match &panel.slot {
         Slot::Running => {
             ui.horizontal(|ui| {
@@ -578,7 +679,6 @@ fn body(ui: &mut Ui, panel: &Panel) {
                 .selectable(true),
             );
         }
-        Slot::Done(one) if one.is_query() => grid(ui, one, panel.task, 120.0),
         Slot::Done(one) => {
             ui.label(RichText::new(write_line(one)).size(11.0));
         }
@@ -587,7 +687,19 @@ fn body(ui: &mut Ui, panel: &Panel) {
 
 /// 结果网格。`height` 是这块最多能占到多高，超出行数走它自己的滚动条：
 /// 底部那一格给 120，放大窗口给整屏。
-fn grid(ui: &mut Ui, one: &StatementResult, task: u64, height: f32) {
+///
+/// 每格都是截断显示，装不下的那一截靠行首的 ▸ 摊到表格下面看全（见 [`detail`]）。
+fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
+    // 拆字段借：网格读 `slot` 里的结果，展开状态要写回 `expanded`
+    let Panel {
+        task,
+        slot,
+        expanded,
+        ..
+    } = panel;
+    let Slot::Done(one) = slot else { return };
+    let task = *task;
+    let one = &*one;
     let table = TableBuilder::new(ui)
         .id_salt(("db_result", task))
         .striped(true)
@@ -597,7 +709,7 @@ fn grid(ui: &mut Ui, one: &StatementResult, task: u64, height: f32) {
         .min_scrolled_height(0.0)
         .max_scroll_height(height)
         .cell_layout(Layout::left_to_right(Align::Center))
-        .column(Column::initial(40.0).at_least(28.0).clip(true))
+        .column(Column::initial(46.0).at_least(34.0).clip(true))
         .columns(
             Column::initial(140.0)
                 .at_least(56.0)
@@ -629,19 +741,45 @@ fn grid(ui: &mut Ui, one: &StatementResult, task: u64, height: f32) {
             body.rows(18.0, one.rows.len(), |mut row| {
                 let index = row.index();
                 row.col(|ui| {
+                    let arrow = if expanded.contains(&index) { "▾" } else { "▸" };
+                    let resp = ui.add(
+                        egui::Label::new(RichText::new(arrow).size(10.0).weak())
+                            .selectable(false)
+                            .sense(egui::Sense::click()),
+                    );
+                    if resp.on_hover_text("展开看这一行的完整内容").clicked()
+                        && !expanded.remove(&index)
+                    {
+                        expanded.insert(index);
+                    }
                     ui.label(weak(format!("{}", index + 1)));
                 });
                 for cell in &one.rows[index] {
                     let text = cell.display().to_string();
+                    let null = cell.is_null();
+                    let mut rt = RichText::new(text.clone()).size(11.0).monospace();
+                    if null {
+                        rt = rt.weak().italics();
+                    }
                     row.col(|ui| {
-                        let mut rt = RichText::new(text).size(11.0).monospace();
-                        if cell.is_null() {
-                            rt = rt.weak().italics();
-                        }
-                        let resp = ui.add(egui::Label::new(rt).truncate().selectable(true));
-                        if !cell.is_null() {
-                            resp.on_hover_cursor(egui::CursorIcon::Text);
-                        }
+                        let resp = ui
+                            .add(egui::Label::new(rt).truncate().selectable(true))
+                            .on_hover_cursor(egui::CursorIcon::Text);
+                        resp.context_menu(|ui| {
+                                if ui.button("复制单元格").clicked() {
+                                    ui.ctx().copy_text(text.clone());
+                                    ui.close();
+                                }
+                                if ui.button("复制整行").clicked() {
+                                    let line = tsv_row(one.rows[index].iter().map(Cell::display));
+                                    ui.ctx().copy_text(line);
+                                    ui.close();
+                                }
+                                if ui.button("复制整表").clicked() {
+                                    ui.ctx().copy_text(to_tsv(one));
+                                    ui.close();
+                                }
+                            });
                     });
                 }
             });
@@ -651,6 +789,39 @@ fn grid(ui: &mut Ui, one: &StatementResult, task: u64, height: f32) {
             "行数超过上限，只留了前面这些；要全量请在 SQL 里自己分页。",
         ));
     }
+    // 展开的行统一摊在表格下面：表格自己带裁剪，行中间塞不进去一整块明细
+    let mut open: Vec<usize> = expanded
+        .iter()
+        .copied()
+        .filter(|i| *i < one.rows.len())
+        .collect();
+    open.sort_unstable();
+    for index in open {
+        detail(ui, one, index);
+    }
+}
+
+/// 制表符分隔的一行。粘进表格软件天然分列，比 CSV 少一层引号转义。
+fn tsv_row<'a>(cells: impl Iterator<Item = std::borrow::Cow<'a, str>>) -> String {
+    let mut out = String::new();
+    for (i, field) in cells.enumerate() {
+        if i > 0 {
+            out.push('\t');
+        }
+        // 制表符和换行会把一行撑成几行、把列挤歪，就地换成空格
+        out.push_str(&field.replace(['\t', '\r', '\n'], " "));
+    }
+    out
+}
+
+/// 整份结果（含表头）排成制表符分隔，给「复制」按钮。
+fn to_tsv(one: &StatementResult) -> String {
+    let mut out = tsv_row(one.columns.iter().map(|c| c.name.as_str().into()));
+    for row in &one.rows {
+        out.push('\n');
+        out.push_str(&tsv_row(row.iter().map(Cell::display)));
+    }
+    out
 }
 
 /// 结果排成 CSV（RFC 4180）：只拼文本，选路径和写文件归 app。
@@ -1164,5 +1335,52 @@ mod tests {
         assert_eq!(csv_name("查 用户", 3), "查 用户.csv");
         assert_eq!(csv_name("a/b:c*d", 3), "a_b_c_d.csv");
         assert_eq!(csv_name("  ", 3), "result_3.csv", "空标题也得有个文件名");
+    }
+
+    /// 一次执行三条：每个面板都得知道自己排第几、一共几条、是哪一批。
+    /// 光靠标题分不出来——同一个块里的语句预览长得很像。
+    #[test]
+    fn each_panel_of_a_batch_knows_its_own_place() {
+        let mut dock = dock();
+        assert_eq!(dock.panels.len(), 3);
+        assert!(
+            dock.panels.iter().all(|p| p.total == 3),
+            "同一批每条都该写着「共 3 条」"
+        );
+        let seq = dock
+            .panels
+            .iter()
+            .map(|p| p.seq)
+            .collect::<Vec<usize>>();
+        assert_eq!(seq, vec![1, 2, 3], "面板从上到下就是语句顺序");
+        let first = dock.panels[0].stamp.clone();
+        assert!(!first.is_empty(), "批次抬头要有一个时间戳");
+        assert!(
+            dock.panels.iter().skip(1).all(|p| p.stamp == first),
+            "一批一次提交，抬头只有一个时间"
+        );
+
+        // 第二次执行是另一批：单条不该显示「1/3」这种分数
+        dock.start_run("本机", "查订单", &parts(&["SELECT 9"]), None);
+        assert_eq!(dock.panels[0].total, 1);
+        assert_ne!(dock.panels[0].run, dock.panels[1].run);
+    }
+
+    /// 「复制」按钮交出去的那份文本：粘进表格软件天然分列，
+    /// 所以字段里再出现制表符和换行必须压掉，不然一行撑成几行。
+    #[test]
+    fn copy_hands_over_the_whole_result_as_one_tab_separated_block() {
+        let one = table(
+            &["name", "n"],
+            vec![
+                vec![Cell::Text("张三\t工程师".into()), Cell::Text("1".into())],
+                vec![Cell::Text("第一行\n第二行".into()), Cell::Null],
+            ],
+        );
+        assert_eq!(
+            to_tsv(&one),
+            "name\tn\n张三 工程师\t1\n第一行 第二行\tNULL",
+            "表头在首行，NULL 跟网格里写的一样"
+        );
     }
 }
