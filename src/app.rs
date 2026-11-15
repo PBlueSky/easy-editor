@@ -833,11 +833,9 @@ impl EasyEditorApp {
             ui.label(RichText::new("还没有数据库连接").size(11.5).color(warn));
             return;
         };
-        let target = self
-            .database
-            .spec_of(&name)
-            .map(|s| s.target())
-            .unwrap_or_default();
+        // 说「生效的那份」配置：树上换过当前库，这里就得跟着换，不然它指旧库。
+        let eff = self.database.effective_spec(&name);
+        let target = eff.as_ref().map(|s| s.target()).unwrap_or_default();
         let accent = ui.visuals().hyperlink_color;
         ui.horizontal(|ui| {
             ui.label(RichText::new("默认连接").size(11.0).weak());
@@ -859,10 +857,20 @@ impl EasyEditorApp {
         })
     }
 
-    /// 执行 SQL：选中一段就跑那段，其次光标所在的整块，SQL 模式下跑整份文件。
-    ///
-    /// 拆句和发号都在 `DatabasePanel::run` 里，这里只把返回的 (id, 语句) 一批挂上结果区。
+    /// 执行 SQL：`Ctrl+Enter`——选中的那段优先，其次只跑光标所在的那一句。
     fn sql_run(&mut self) {
+        self.run_sql(false);
+    }
+
+    /// 执行 SQL：`Ctrl+Shift+Enter`——整块交出去（SQL 模式下没有块就是整份文件）。
+    ///
+    /// 分两条键是有原因的：块状态的 `[待执行]` → `[已执行]` 回写说的得是整块，
+    /// 光标那一句跑完就宣布整块执行完，比不回写更坏。
+    fn sql_run_block(&mut self) {
+        self.run_sql(true);
+    }
+
+    fn run_sql(&mut self, whole: bool) {
         let Some(idx) = self.focused_tab() else {
             self.status = "先打开一个文件，里面写个 SQL 块".into();
             return;
@@ -871,12 +879,13 @@ impl EasyEditorApp {
         let text = self.tabs[idx].text.clone();
         let path = self.tabs[idx].path.clone();
         let line = self.tabs[idx].line.saturating_sub(1);
+        let caret = self.tabs[idx].caret_byte;
         let blocks = sql::scan(&text);
         let in_block = sql::block_at(&blocks, line);
         let selection = self.tabs[idx].selection_range;
-        // 查询文件本来就是一整篇 SQL：没有选区也没有块时，SQL 模式直接跑全文
+        // 查询文件本来就是一整篇 SQL：没有选区也没有块时，范围就是整份文件
         let whole_file = selection.is_none() && in_block.is_none() && self.tabs[idx].sql_mode;
-        let (body, title, origin) = match (selection, in_block) {
+        let body = match (selection, in_block) {
             (Some(range), block) => (
                 range,
                 "选中内容".to_string(),
@@ -899,36 +908,56 @@ impl EasyEditorApp {
             ),
             (None, None) => {
                 self.status =
-                    "光标不在 SQL 块里，也没选中语句。Ctrl+Shift+J 插一个块，或开本文件 SQL 模式跑全文".into();
+                    "光标这一句没有 SQL，也没有选区。Ctrl+Shift+J 插一个块，或开本文件 SQL 模式。".into();
                 return;
             }
         };
-        let conn = match in_block.map(|b| b.conn.clone()).filter(|c| !c.is_empty()) {
-            Some(conn) => conn,
-            None => self.database.active_conn().unwrap_or_default().to_string(),
+        // 只有整块交出去才回写状态；跑光标那一句不代表这块跑完
+        let mut block_head = match (selection, in_block) {
+            (None, Some(b)) if whole => Some(b.head_start),
+            _ => None,
         };
-        // 范围和这份文本快照是同一帧取的，理论上不会越界；真越界也只夹不炸
-        let a = body.0.min(text.len());
-        let b = body.1.clamp(a, text.len());
-        let where_ = if whole_file {
+        let mut where_ = if whole_file {
             "（整个文件）".to_string()
         } else if in_block.is_some() {
             format!("（{}）", sql::describe(&blocks, line))
         } else {
             String::new()
         };
-        // 只有整块交出去才回写状态；块外挑一段跑，跑完不代表这块跑完
-        let block_head = match (self.tabs[idx].selection_range, in_block) {
-            (None, Some(b)) => Some(b.head_start),
-            _ => None,
+        // 范围和这份文本快照是同一帧取的，理论上不会越界；真越界也只夹不炸
+        let (a, b) = body.0;
+        let mut from = a.min(text.len());
+        let mut to = b.min(text.len()).max(from);
+        // 没选区又不是显式整块执行：按分号切，只留光标那一行关联的那一句
+        if !whole && selection.is_none() {
+            let rel = caret.saturating_sub(from).min(to - from);
+            let ranges = sql::split_ranges(&text[from..to]);
+            match sql::statement_index_at(&text[from..to], &ranges, rel) {
+                Some(index) => {
+                    let (x, y) = ranges[index];
+                    from += x;
+                    to = from + (y - x);
+                    block_head = None;
+                    where_ = format!("（第 {}/{} 句）", index + 1, ranges.len());
+                }
+                // 这一句都挑不出来，整块更不该偷偷跑掉
+                None => {
+                    self.status = "这一行没有可执行的 SQL 语句。".into();
+                    return;
+                }
+            }
+        }
+        let conn = match in_block.map(|b| b.conn.clone()).filter(|c| !c.is_empty()) {
+            Some(conn) => conn,
+            None => self.database.active_conn().unwrap_or_default().to_string(),
         };
         let sub = Submission {
             path,
             conn,
-            title,
-            base: lead(&text, a, b),
-            sql: text[a..b].trim().to_string(),
-            jump: origin,
+            title: body.1,
+            base: lead(&text, from, to),
+            sql: text[from..to].trim().to_string(),
+            jump: body.2,
             block_head,
             where_,
         };
@@ -1306,6 +1335,9 @@ impl EasyEditorApp {
         }
         if self.keymap.consume(ctx, "sql_run") {
             self.sql_run();
+        }
+        if self.keymap.consume(ctx, "sql_run_block") {
+            self.sql_run_block();
         }
         if self.keymap.consume(ctx, "results_toggle") {
             self.results.open = !self.results.open;
@@ -2457,7 +2489,7 @@ impl EasyEditorApp {
                     ui.close();
                 }
                 let h_sql_run = format!(
-                    "跑选中的语句、光标所在的整块；SQL 模式下没有选区就跑整份文件  {}",
+                    "只跑选中的那段；没有选区就跑光标所在的这一句（按分号认）  {}",
                     hint("sql_run")
                 );
                 if ui
@@ -2466,6 +2498,18 @@ impl EasyEditorApp {
                     .clicked()
                 {
                     self.sql_run();
+                    ui.close();
+                }
+                let h_sql_block = format!(
+                    "整个块的语句一起交出去，跑完回写块头的状态；SQL 模式的查询文件跑整份  {}",
+                    hint("sql_run_block")
+                );
+                if ui
+                    .add_enabled(self.active.is_some(), egui::Button::new("执行整个块"))
+                    .on_hover_text(h_sql_block)
+                    .clicked()
+                {
+                    self.sql_run_block();
                     ui.close();
                 }
                 let n = self.results.count();
@@ -3262,7 +3306,15 @@ impl EasyEditorApp {
             None => ("", ui.visuals().warn_fg_color),
         };
         let label = match &name {
-            Some(name) => format!("SQL → {name}{mark}"),
+            // 库名一起写：同一条连接上换库是常事，只报连接等于报了一半
+            Some(name) => {
+                let db = self.database.current_db(name);
+                if db.is_empty() {
+                    format!("SQL → {name}{mark}")
+                } else {
+                    format!("SQL → {name}/{db}{mark}")
+                }
+            }
             None => "SQL → 未配置连接".to_string(),
         };
         let resp = ui
@@ -6173,7 +6225,7 @@ mod tests {
     #[test]
     fn sql_block_gets_one_result_panel_per_statement() {
         let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_two_panels");
-        app.sql_run();
+        app.sql_run_block();
         assert_eq!(app.results.count(), 2, "块里两条语句就该两个面板");
         assert!(app.results.open, "提交了结果区就该亮出来");
 
@@ -6206,7 +6258,7 @@ mod tests {
     #[test]
     fn closing_one_panel_leaves_its_neighbours() {
         let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_close_one");
-        app.sql_run();
+        app.sql_run_block();
         settle_results(&mut app, &ctx);
         let out = frame(&mut app, &ctx, vec![]);
         let mut crosses = seen(&out)
@@ -6251,7 +6303,7 @@ mod tests {
     fn a_failing_run_leaves_nothing_spinning() {
         let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_failing");
         app.database = failing_database();
-        app.sql_run();
+        app.sql_run_block();
         settle_results(&mut app, &ctx);
         let out = frame(&mut app, &ctx, vec![]);
         let shown = texts(&out);
@@ -6265,7 +6317,7 @@ mod tests {
     #[test]
     fn a_finished_block_gets_its_status_written_back() {
         let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_mark_done");
-        app.sql_run();
+        app.sql_run_block();
         settle_results(&mut app, &ctx);
         frame(&mut app, &ctx, vec![]);
         let idx = app.active.unwrap();
@@ -6280,7 +6332,7 @@ mod tests {
     fn a_failed_block_is_marked_as_failed() {
         let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_mark_failed");
         app.database = failing_database();
-        app.sql_run();
+        app.sql_run_block();
         settle_results(&mut app, &ctx);
         frame(&mut app, &ctx, vec![]);
         let idx = app.active.unwrap();
@@ -6295,7 +6347,7 @@ mod tests {
     fn a_failing_statement_goes_red_in_the_block() {
         let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_red");
         app.database = failing_database();
-        app.sql_run();
+        app.sql_run_block();
         settle_results(&mut app, &ctx);
         // 头部回写 [失败] 让正文整体前移了 3 个字节，红底得跟着挪
         frame(&mut app, &ctx, vec![]);
@@ -6313,7 +6365,7 @@ mod tests {
         // 改对了再跑一遍，旧的红色该跟着这次提交一起抹掉
         app.database = mock_database();
         app.tabs[idx].line = 2;
-        app.sql_run();
+        app.sql_run_block();
         assert!(app.tabs[idx].sql_errors.is_empty(), "重跑先清掉这一段旧的红");
         settle_results(&mut app, &ctx);
         frame(&mut app, &ctx, vec![]);
@@ -6346,7 +6398,7 @@ mod tests {
     #[test]
     fn zooming_a_result_opens_its_own_window() {
         let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_zoom");
-        app.sql_run();
+        app.sql_run_block();
         settle_results(&mut app, &ctx);
         let out = frame(&mut app, &ctx, vec![]);
         let mut buttons = seen(&out)
@@ -6389,7 +6441,7 @@ mod tests {
     #[test]
     fn a_query_result_offers_a_csv_export_button() {
         let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_export");
-        app.sql_run();
+        app.sql_run_block();
         settle_results(&mut app, &ctx);
         let out = frame(&mut app, &ctx, vec![]);
         let shown = texts(&out);
@@ -6543,7 +6595,7 @@ mod tests {
         let file = dir.join("q.sql");
         std::fs::write(&file, "SELECT id FROM a;\nSELECT name FROM b;\n").unwrap();
         app.open_file(file, None);
-        app.sql_run();
+        app.sql_run_block();
         assert_eq!(
             app.results.count(),
             2,
@@ -6615,7 +6667,7 @@ mod tests {
     #[test]
     fn a_batch_of_results_gets_one_header_row() {
         let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_batch_head");
-        app.sql_run();
+        app.sql_run_block();
         settle_results(&mut app, &ctx);
         let out = frame(&mut app, &ctx, vec![]);
         let shown = texts(&out);
@@ -6653,7 +6705,7 @@ mod tests {
     #[test]
     fn expanding_a_row_lays_out_its_full_values() {
         let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_expand");
-        app.sql_run();
+        app.sql_run_block();
         settle_results(&mut app, &ctx);
         let out = frame(&mut app, &ctx, vec![]);
         // 表格每行行首那个 ▸（面板标题行用的是同一串，但它排得更靠上）
@@ -6709,7 +6761,7 @@ mod tests {
         app.open_file(dir.join("q.sql"), None);
         let shown = texts(&frame(&mut app, &ctx, vec![]));
         assert!(
-            shown.iter().any(|t| t == "SQL → 本机"),
+            shown.iter().any(|t| t == "SQL → 本机/test"),
             "状态栏少了 SQL 去向这一截：{shown:?}"
         );
         // 普通文本、又没块，就别在状态栏挂个跟当前文件无关的尾巴

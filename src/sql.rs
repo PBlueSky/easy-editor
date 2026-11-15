@@ -476,6 +476,50 @@ fn push_range(out: &mut Vec<(usize, usize)>, sql: &str, start: usize, end: usize
     out.push((a, a + stmt.len()));
 }
 
+/// 从切好的语句里挑出「和光标那一行有关系」的那一条，返回它在 `ranges` 里的下标。
+///
+/// 判据先看行：光标停在第 2 句那一行，就只该跑第 2 句，而不是把整块端出去。
+/// 同一行写了好几条时，优先光标落在其中的那条；光标卡在两句中间就往后取。
+/// 这一行压根没有语句（空行、纯注释行）时，取它下面最近的一条；下面也没了才回头给最后一条。
+/// 没有任何语句时返回 `None`，让上层去说「这里没东西可跑」，而不是默默跑点别的。
+pub fn statement_index_at(sql: &str, ranges: &[(usize, usize)], caret: usize) -> Option<usize> {
+    if ranges.is_empty() {
+        return None;
+    }
+    let caret = caret.min(sql.len());
+    let line_start = sql[..caret].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = sql[caret..].find('\n').map_or(sql.len(), |i| caret + i);
+
+    let on_line: Vec<usize> = ranges
+        .iter()
+        .enumerate()
+        .filter(|&(_, &(a, b))| a < line_end && line_start < b)
+        .map(|(i, _)| i)
+        .collect();
+    // 光标落在句子里头（含首尾那个字符）最没有歧义，先认它
+    if let Some(index) = on_line
+        .iter()
+        .copied()
+        .find(|&i| ranges[i].0 <= caret && caret <= ranges[i].1)
+    {
+        return Some(index);
+    }
+    // 卡在两句中间的空白里算下一句：光标往右挪一格就开始写它了
+    if let Some(index) = on_line.iter().copied().find(|&i| caret < ranges[i].0) {
+        return Some(index);
+    }
+    if let Some(&index) = on_line.last() {
+        return Some(index);
+    }
+    // 这一行压根没有语句：往下找最近的一条，底下没了才回头给最后一条
+    Some(
+        ranges
+            .iter()
+            .position(|&(a, _)| caret < a)
+            .unwrap_or(ranges.len() - 1),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,5 +742,58 @@ SELECT 2;
         // `--` 后面紧跟空白才是注释，否则整份文件在客户端里就报错了
         assert!(head.starts_with("-- sql "), "{head}");
         assert!(parse_head(&head).is_some());
+    }
+
+    /// 光标停在哪个字节，`statement_index_at` 该给出第几句。
+    fn pick(sql: &str, caret: usize) -> Option<usize> {
+        statement_index_at(sql, &split_ranges(sql), caret)
+    }
+
+    #[test]
+    fn caret_line_picks_its_own_statement() {
+        let sql = "SELECT 1;\nSELECT 2;\nSELECT 3;";
+        // 第一句里的任意一处（开头、中间、句尾的分号）都只认第一句
+        assert_eq!(pick(sql, 0), Some(0));
+        assert_eq!(sql[..9].get(7..), Some("1;"));
+        assert_eq!(pick(sql, 1), Some(0));
+        assert_eq!(pick(sql, 8), Some(0), "句尾的分号还算第一句");
+        assert_eq!(pick(sql, 10), Some(1));
+        assert_eq!(pick(sql, 17), Some(1), "第二句的末尾");
+        assert_eq!(pick(sql, 29), Some(2), "最后一句之后的那一格");
+    }
+
+    #[test]
+    fn one_line_with_several_statements_still_splits() {
+        let sql = "SELECT 1; SELECT 2;";
+        assert_eq!(pick(sql, 2), Some(0), "光标在第一句里面");
+        assert_eq!(pick(sql, 8), Some(0), "第一句末尾的分号算第一句");
+        assert_eq!(pick(sql, 9), Some(1), "夹在两句中间的空格算下一句");
+        assert_eq!(pick(sql, 16), Some(1));
+    }
+
+    #[test]
+    fn blank_and_comment_lines_fall_through_to_the_nearest_one() {
+        let sql = "SELECT 1;\n\n-- 说明\nSELECT 2;\n";
+        // 空行往下找：落在 SELECT 2，而不是把两条一起端出去
+        assert_eq!(pick(sql, 10), Some(1), "空行该抓下面最近的那句");
+        assert_eq!(pick(sql, sql.len()), Some(1), "尾行没有语句，回头给最后一条");
+        // 光标在第一句自带的那行注释里：还在第一句范围内
+        let head = "-- 说明\nSELECT 1;\nSELECT 2;";
+        assert_eq!(pick(head, 3), Some(0));
+    }
+
+    #[test]
+    fn no_statement_means_nothing_to_run() {
+        let sql = "\n-- 只是注释\n";
+        assert_eq!(pick(sql, 4), None);
+        assert_eq!(pick("", 0), None);
+    }
+
+    #[test]
+    fn multiline_statement_is_taken_whole() {
+        let sql = "SELECT a,\n       b\n  FROM t;\nSELECT 2;";
+        assert_eq!(pick(sql, 12), Some(0), "跨行语句的中间一行也归它");
+        assert_eq!(pick(sql, 27), Some(0), "结束的分号");
+        assert_eq!(pick(sql, 29), Some(1));
     }
 }

@@ -98,7 +98,7 @@ With no arguments, the startup folder is chosen by: **command-line argument > cu
 
 - **Top toolbar**, left to right: `Open folder` `Save` `←` `→` (cursor history back / forward) `New file` `New folder` `Sidebar` `Wrap` `Terminal` `+Terminal` `‖ Split` `═ Split` `Quick open` `Project search` `Find` `Journal block` `Database`. The `Database` entry is a dropdown (default connection line / `new query` / `insert SQL block` / `run SQL` / `results dock` / `connection manager…` / `sidebar database tree` / `this file is SQL`) — that is the only new button the whole database feature costs. The right-hand group is `Dark` / `Light` (theme), `?` (keybinding settings), the `shell:` dropdown, `⚙` (terminal settings), font size `- 14 +`, and the workspace name.
 - **Sidebar** has four tabs: `Files` (the tree), `Search` (project-wide results), `Journal` (blocks in the current file), `Database` (connections → databases → tables → columns). `Ctrl+B` shows or hides it.
-- Narrow the window until one row no longer fits and the remaining buttons wrap onto a second row — they never squash together and text is never overdrawn. The right-hand group still anchors right-to-left after wrapping. A workspace name that is too long gets truncated; hover it for the full path.
+- Narrow the window until one row no longer fits and the remaining buttons wrap onto a second row — they never squash together and text is never overdrawn. The right-hand group still anchors right-to-left after wrapping. The file-tree header does the same trick in one row that cannot wrap: `刷新` / `新文件夹` / `新文件` are laid right-to-left first, then the workspace name is placed in the rectangle that is left over and truncated there — a long folder name used to draw straight through `新文件`. Too little room and the name is dropped rather than overlapped; hover it for the full path.
 
 ### File tree
 
@@ -192,10 +192,10 @@ Header = `-- sql` + title + `YYYY-MM-DD HH:MM` + `[status]` + tail keys. Two tai
 
 - `Ctrl+Alt+N` (or `Database ▸ New query`, or right-click a folder → `新建 SQL 查询`) creates `query-20261115-140312.sql`, already holding an empty block bound to the default connection, opens it and parks the caret on the line below the header. Two in the same second get `-2` appended rather than overwriting each other
 - `.sql` files open in **SQL mode**; any other file can switch it on from `Database ▸ 本文件按 SQL 处理`. SQL mode is per-tab and does not touch the file: the buffer is highlighted as SQL (`Ctrl+Enter` runs statements, not lines), and it is what unlocks running a file that has no blocks in it
-- `Ctrl+Enter` runs **the selection if there is one, otherwise the whole block the cursor is in, otherwise — in SQL mode only — the entire file**. The status bar says how many statements were handed over and which of the three it picked
+- `Ctrl+Enter` runs **the selection if there is one, otherwise only the one statement the caret is sitting on** — split by semicolons inside the block (or the whole file, in SQL mode). The status bar reports `已提交 n 条语句到「conn」（第 2/3 句）`, so you always know which slice went out. `Ctrl+Shift+Enter` is the deliberate "hand over the whole block" key
 - `Ctrl+Shift+J` (or `Database ▸ Insert SQL block`) drops a block at the cursor, already carrying today's date / time and the default connection
 - Statements are split by a scanner that knows `'…'`, `"…"`, `` `…` ``, `--`, `#` and `/* … */`, so a semicolon inside a string or a comment does not cut a statement in half; the same scanner produces both the panel titles and the byte spans, which is why the two can never disagree
-- Once every statement of a **whole-block** run is back, the header status is rewritten `[待执行]` → `[已执行]` / `[失败]` (pending → done / failed). Running a selection deliberately leaves the block status alone — a piece of the block finishing is not the block finishing
+- Once every statement of a **whole-block** run (`Ctrl+Shift+Enter`) is back, the header status is rewritten `[待执行]` → `[已执行]` / `[失败]` (pending → done / failed). Running one statement with `Ctrl+Enter` deliberately leaves the status alone — one statement of the block finishing is not the block finishing
 - A statement that the server rejects gets a translucent red background **in the file itself**, so you can see which one to fix instead of counting panels. The span is validated against the text before it is painted (a mark whose bytes no longer match that statement is dropped rather than placed somewhere wrong), it slides along when the header write-back shortens the block, and typing clears it
 - `Ctrl+Shift+R` shows or hides the results dock; `Database ▸ Results dock (n)` does the same
 
@@ -211,6 +211,8 @@ Six panels stacked in one strip is its own problem, so the dock separates them t
 
 - Each panel header carries `回块` (jump back to the block it came from), `放大` / `收起` (put *this* result into its own resizable window — the way to read a wide table that the bottom strip cannot stretch to fit), `复制` (the whole result as tab-separated text, ready to paste into a spreadsheet), `导出` (CSV), `关掉整块` (close every panel of this submission) and `✕`; clicking the header row itself collapses just that panel
 - Grid cells are single-line and truncated — that is what keeps a wide table readable — but a `TEXT` column with a paragraph in it is not gone: the `▸` at the head of each row unfolds **that row underneath the table** as `column = full value`, wrapped, selectable, and copyable cell / row / table from any cell's right-click menu. It is a per-panel toggle, so five rows can stay open while one is expanded
+- A cell that is genuinely too narrow for its content shows a hover tooltip with the head of the value, and **double-clicking it opens that one cell in its own window** — wrapped, scrollable, select-all, with `复制本格` putting the *untruncated* value on the clipboard (the same item is on the right-click menu as `查看完整内容`). Same-grid, same-data: the window reads the panel it came from
+- The bottom strip is resizable even before anything has run — dragging the divider up used to spring back to the default height, because an empty dock only measured one line of text and the panel booked that
 - The dock bar has `全部收起 / 全部展开`, `清空` (closes finished panels and keeps the ones still waiting for a reply) and `关闭`
 - A query prints `connection · N 行 · M ms` above a scrollable grid — the dock gives it 120 pt, the popped-out window gives it whatever it asks for. Writes print `影响 N 行` plus the last insert id and the warning count when MySQL reports them
 - More than 1000 rows are cut off on purpose and labelled `（截断）`: a forgotten `LIMIT` on a big table should not pin a thread and a few hundred megabytes to a side panel. A read-only statement also carries a 30 s server-side cap and connections a 5 s TCP timeout, so a typo in the host field does not hang for two minutes
@@ -264,7 +266,16 @@ That last row is the point of the whole design: a verdict is claimed by a hash o
 
 **`Database ▸ Sidebar database tree`** opens the `Database` tab: connection → databases → tables, each level fetched lazily the first time you expand it, with a `重试` (retry) button on the row that failed. Double-click a table to copy its qualified name; its context menu also copies a ready-made `SELECT * FROM db.table LIMIT 100;`.
 
-**Which connection a block goes to is never a guess.** Clicking a connection row makes it the default — the one a block with no `conn=` is sent to — and that fact is written in three places at once: a `默认连接  demo · root@127.0.0.1:3306/shop` line at the head of the sidebar, a `默认` badge on the row itself, and the `SQL → demo ✓` chip in the status bar while the file you are looking at is SQL (by extension, by block, or by mode). The chip is a button: click it and the sidebar switches to the `Database` tab. Before any click at all, the default is the first connection in `config.json`, and that is what the badge shows — the display follows `active_conn()`, the same function `Ctrl+Enter` asks, so the two cannot drift apart.
+The tree is three columns of meaning, not a wall of labels: a `▸` / `▾` chevron in its own column (expand only — clicking it never changes what a block would hit), one glyph per level (`◆` connection, `▤` database, `▦` table) tinted by the accent when that row is the live one, and the name. The whole row is the button, so the hit target is a row rather than 14 px of text, and the selected row gets a filled background instead of a colour the theme may already be using elsewhere.
+
+Two rows answer "where does my SQL go", and they answer it separately:
+
+- **connection** — click the name and it becomes the default; a block without `conn=` is sent there
+- **database** — click the name and it becomes *that connection's* current database, overriding the `database` field in `config.json` for everything sent to it. Nothing is written to disk: it is a session choice, and it is what `effective_spec()` builds the outgoing connection from, so the tree, the status chip and the wire cannot disagree
+
+Both are restated at the head of the tab — `默认连接 demo · root@127.0.0.1:3306` and `当前库 shop` — because a tree that only shows the connection is a tree that hides half the answer.
+
+**Which connection a block goes to is never a guess.** That fact is written in three places at once: the `默认连接` / `当前库` card at the head of the sidebar (above), a `默认` badge on the connection row itself, and the `SQL → demo ✓` chip in the status bar while the file you are looking at is SQL (by extension, by block, or by mode). The chip is a button: click it and the sidebar switches to the `Database` tab. Before any click at all, the default is the first connection in `config.json`, and that is what the badge shows — the display follows `active_conn()`, the same function `Ctrl+Enter` asks, so the two cannot drift apart.
 
 **Adding another engine** is meant to be a small change: `src/db/mod.rs` is the engine-agnostic protocol (spec → driver, statements in, events out) and `src/db/mysql.rs` is the only file that knows MySQL. A new database means one `DbKind` variant, one branch in `connect()` and one driver module — the block parser, the results dock and the CSV layer do not change. Everything runs on a background thread per connection and reports through a channel; this program has no async runtime and gets none from this feature.
 
@@ -353,7 +364,8 @@ Everything below is the default and everything is rebindable in `F1`.
 | `Ctrl+Alt+D` | Toggle the journal block's done state |
 | `Ctrl+Alt+N` | New query file (`query-<timestamp>.sql`, block header already bound to the default connection) |
 | `Ctrl+Shift+J` | Insert a SQL block at the cursor |
-| `Ctrl+Enter` | Run the selected statement, or the whole block the cursor is in, or — in SQL mode — the entire file |
+| `Ctrl+Enter` | Run the selection, or just the statement the caret is on (split by `;`) — in SQL mode with no block, that reads from the whole file |
+| `Ctrl+Shift+Enter` | Hand the entire block (or the whole file in SQL mode) to the server and write the block status back |
 | `Ctrl+Shift+R` | Show / hide the results dock |
 | `` Ctrl+` `` | Focus a terminal pane, opening one if needed |
 | `` Ctrl+Shift+` `` | New terminal pane |
@@ -440,7 +452,7 @@ About 19,900 lines of Rust in a single binary crate, 22 source files:
 | `src/find.rs` | Find/replace within the current file (match positions are byte offsets) |
 | `src/search.rs` | Project-wide search: ripgrep first, built-in scanner as the fallback |
 | `src/journal.rs` | Journal block parsing and insertion |
-| `src/sql.rs` | SQL block text layer: scan and build blocks, split statements **with byte spans**, decide what is read-only. Touches neither database nor UI |
+| `src/sql.rs` | SQL block text layer: scan and build blocks, split statements **with byte spans**, pick out the one a byte offset falls in, decide what is read-only. Touches neither database nor UI |
 | `src/database.rs` | Sidebar `Database` tab and the connection manager window: cached tree, in-flight requests, the connection draft, and the stored test verdict with the fingerprint that retires it |
 | `src/db/mod.rs` | Engine-agnostic protocol: `ConnectionSpec` → `Driver`, one worker thread per connection, events back out, plus `MockDriver` so the UI is testable without a server |
 | `src/db/mysql.rs` | The only file that knows MySQL: connect options, the text protocol → cells, one statement per call |
@@ -604,6 +616,12 @@ Two things are deliberately *not* in the hash. `name` is not, because verdicts a
 ### SQL highlighting borrows the `.sql` extension
 
 `SyntaxRegistry` picks a grammar from the file's extension, and SQL mode is a property of the *tab*, not of the path on disk. Rather than threading a "treat this as SQL" flag through the highlighter and its cache key, `editor.rs` asks for the syntax of `path.with_extension("sql")` when `sql_mode` is on. The `PathBuf` never touches the filesystem — it is a lookup key only — so the cache stays keyed on something that genuinely describes the buffer.
+
+### One header row, two directions
+
+The file-tree header has a name that grows and three buttons that must not move, in a row egui will never wrap. Left-to-right cannot do it: the layout does not know how wide the button cluster is until it has laid it out, so a long workspace name simply draws over `新文件`. Right-to-left fixes the buttons but then the *name* is the thing being pushed, and a bare `with_layout(right_to_left)` on the panel ui also claims every pixel of height the panel has left and vertically centres the row in the middle of the sidebar.
+
+So the row is `ui.horizontal` (one line of height) containing a right-to-left scope for the buttons, whose used rect is then subtracted from the panel width, and the name is drawn in a second scope whose `max_rect` is that leftover rectangle. The height of that rect has to be pinned by hand: `available_rect_before_wrap` returns the whole remaining panel, and egui books the child's *used* rect — give the name the panel's full height and the search box and every file row below it are pushed off-panel.
 
 ## Contributing and license
 

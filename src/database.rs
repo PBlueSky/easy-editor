@@ -15,7 +15,18 @@ use eframe::egui::{self, RichText, Ui};
 use crate::db::{ConnectionSpec, DbEvent, DbHub, DbKind, DbOutcome, MAX_ROWS};
 
 /// 子层缩进（库 1 格、表 2 格）。
-const INDENT: f32 = 14.0;
+const INDENT: f32 = 18.0;
+/// 树里一行的高。整行都能点，行高给足才好命中。
+const ROW_H: f32 = 22.0;
+/// 行首那个 ▸/▾ 占的宽度，图标和名字都排在它后面。
+const ARROW_W: f32 = 14.0;
+/// 层图标占的宽度。
+const ICON_W: f32 = 17.0;
+
+/// 树每层的图标。选中态只改颜色，不换字形，位置才不会跳。
+const CONN_ICON: &str = "◆";
+const DB_ICON: &str = "▤";
+const TABLE_ICON: &str = "▦";
 
 /// 一层列表（库名、表名）的加载状态。
 ///
@@ -47,8 +58,173 @@ struct ConnTree {
     databases: Load,
     /// 展开的库
     open: HashSet<String>,
+    /// 树上点选过的当前库。`None` 表示跟着配置里的默认库走。
+    ///
+    /// 只影响本进程的发送目标，不写回 config.json：在树里点两下就把用户的
+    /// 配置改了，比不改更糟。
+    current_db: Option<String>,
     /// 库名 -> 该库的表
     tables: HashMap<String, Load>,
+}
+
+/// 树的一行骨架：整行矩形、命中、悬停底色、以及祖先各层的淡竖线。
+///
+/// 以前每层靠 `add_space` 推空格，父子关系全凭数格子，行与行还高低不齐；
+/// 现在一次 `allocate_exact_size` 把整行拿到手，内容按固定列摆，
+/// 缩进处再画一根引导线，一眼看出这行挂在谁下面。
+/// 返回的 `x` 是这一层箭头列的左边界。
+fn tree_row(ui: &mut Ui, depth: usize) -> (egui::Response, f32) {
+    let width = ui.available_width().max(120.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::Vec2::new(width, ROW_H), egui::Sense::click());
+    paint_row_shell(ui, &resp, depth);
+    (resp, rect.left() + 4.0 + INDENT * depth as f32)
+}
+
+/// 整行的底色与缩进引导线，`tree_row` 和只读的 `muted_row` 共用。
+fn paint_row_shell(ui: &Ui, resp: &egui::Response, depth: usize) {
+    let rect = resp.rect;
+    if rect.width() <= 0.0 {
+        return;
+    }
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, 3.0, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    let left = rect.left() + 4.0;
+    let guide = ui.visuals().text_color().gamma_multiply(0.22);
+    for level in 0..depth {
+        let x = left + INDENT * level as f32 + ARROW_W * 0.5;
+        ui.painter().line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            (1.0, guide),
+        );
+    }
+}
+
+/// 箭头列的命中区间：点在箭头上是「展开 / 收起」，点在名字那一截是「选中」。
+fn hit_arrow(resp: &egui::Response, x: f32) -> bool {
+    match resp.interact_pointer_pos() {
+        Some(pos) => pos.x < x + ARROW_W,
+        // 键盘触发的点击没有指针位置，按选中处理
+        None => false,
+    }
+}
+
+/// ▸ / ▾。整行都能点之后它只报状态，不再是个单独的按钮。
+fn arrow_glyph(ui: &Ui, cy: f32, x: f32, expanded: bool) {
+    ui.painter().text(
+        egui::pos2(x + ARROW_W * 0.5, cy),
+        egui::Align2::CENTER_CENTER,
+        if expanded { "▾" } else { "▸" },
+        egui::FontId::proportional(9.5),
+        ui.visuals().text_color().gamma_multiply(0.7),
+    );
+}
+
+/// 行图标。当前那一支染主色，其余压暗，层级同时靠字形和颜色分开。
+fn tree_icon(ui: &Ui, cy: f32, x: f32, glyph: &str, on: bool, accent: egui::Color32) {
+    let color = if on {
+        accent
+    } else {
+        ui.visuals().text_color().gamma_multiply(0.55)
+    };
+    ui.painter().text(
+        egui::pos2(x, cy),
+        egui::Align2::LEFT_CENTER,
+        glyph,
+        egui::FontId::proportional(10.5),
+        color,
+    );
+}
+
+/// 把名字摆进 `[x, right]` 那一格：太长就截断，绝不换行——
+/// 行一高，后面所有行的缩进和底色就全错位了。
+fn put_name(
+    ui: &mut Ui,
+    resp: &egui::Response,
+    x: f32,
+    right: f32,
+    name: &str,
+    size: f32,
+    strong: bool,
+) -> egui::Response {
+    let rect = egui::Rect::from_min_max(
+        egui::pos2(x, resp.rect.top()),
+        egui::pos2(right.max(x + 24.0), resp.rect.bottom()),
+    );
+    let text = RichText::new(name.to_owned()).size(size);
+    let text = if strong { text.strong() } else { text };
+    left_label(ui, rect, text)
+}
+
+/// 在给定那一格里摆一段左对齐、放不下就截断的文字。
+///
+/// 不能用 `Ui::put`：它是「居中 + 撑满」，名字会被推到行的正中间，
+/// 整棵树的列就歪了。这里换成左起排的横向布局，截断宽度也按这一格算。
+fn left_label(ui: &mut Ui, rect: egui::Rect, text: RichText) -> egui::Response {
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        |ui| {
+            ui.add(
+                egui::Label::new(text)
+                    .truncate()
+                    .halign(egui::Align::LEFT)
+                    .selectable(false),
+            )
+        },
+    )
+    .inner
+}
+
+/// 行最右边的记号，从右往左一个个摆。返回下一个记号该摆到的 x。
+fn trail_label(
+    ui: &Ui,
+    resp: &egui::Response,
+    right: f32,
+    text: &str,
+    color: egui::Color32,
+) -> f32 {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), egui::FontId::proportional(9.5), color);
+    let w = galley.size().x;
+    ui.painter().galley(
+        egui::pos2(right - w, resp.rect.center().y - galley.size().y * 0.5),
+        galley,
+        color,
+    );
+    right - w - 8.0
+}
+
+/// 读取失败那一行：说清哪儿坏了，旁边留一个真的能点的重试。
+fn failed_row(ui: &mut Ui, depth: usize, err: &str, retry: impl FnOnce()) {
+    let width = ui.available_width().max(120.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::Vec2::new(width, ROW_H), egui::Sense::hover());
+    paint_row_shell(ui, &resp, depth);
+    let color = ui.visuals().error_fg_color;
+    let btn_w = 44.0;
+    left_label(
+        ui,
+        egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 4.0 + INDENT * depth as f32, rect.top()),
+            egui::pos2(rect.right() - btn_w - 4.0, rect.bottom()),
+        ),
+        RichText::new(err.to_owned()).size(11.0).color(color),
+    );
+    if ui
+        .put(
+            egui::Rect::from_min_size(
+                egui::pos2(rect.right() - btn_w - 2.0, rect.center().y - 9.0),
+                egui::vec2(btn_w, 18.0),
+            ),
+            egui::Button::new(RichText::new("重试").size(11.0)),
+        )
+        .clicked()
+    {
+        retry();
+    }
 }
 
 /// 已发出、等回执的后台任务分别该落到哪儿。
@@ -152,12 +328,44 @@ impl DatabasePanel {
             .or_else(|| self.connections.first().map(|c| c.name.as_str()))
     }
 
+    /// 这条连接现在实际发往哪个库：树上点过谁就是谁，没点过则是配置里的默认库。
+    ///
+    /// 树、下拉、状态栏都说这一个数，免得三处各摆一个牌子却指向不同的库。
+    pub fn current_db(&self, conn: &str) -> String {
+        self.trees
+            .get(conn)
+            .and_then(|t| t.current_db.clone())
+            .or_else(|| self.spec_of(conn).map(|s| s.database.clone()))
+            .unwrap_or_default()
+    }
+
+    /// 实际交给驱动的那份配置。
+    ///
+    /// 树上换过当前库就按换后的发：hub 按整份配置判断连接是否过期，
+    /// 库名不同会重开一条连接，这正是「发往另一个库」该有的意思。
+    pub fn effective_spec(&self, conn: &str) -> Option<ConnectionSpec> {
+        let base = self.spec_of(conn).cloned()?;
+        Some(match self.trees.get(conn).and_then(|t| t.current_db.clone()) {
+            Some(db) if db != base.database => ConnectionSpec { database: db, ..base },
+            _ => base,
+        })
+    }
+
+    /// 树上点库名：把它认作这条连接的当前库。不碰 config.json。
+    fn set_current_db(&mut self, conn: &str, database: &str) {
+        self.trees
+            .entry(conn.to_string())
+            .or_default()
+            .current_db = Some(database.to_string());
+        self.status = format!("「{conn}」的当前库已切到「{database}」");
+    }
+
     /// 把一个块交给某条连接执行，返回 `Vec[(任务 id, 语句原文)]`（按执行顺序）。
     ///
     /// 切分交给 hub：它返回的语句就是实际送进服务器的那些，结果面板的标题、
     /// 「未执行」的个数都以它为准，两边不会各切各的数出不同的条数。
     pub fn run(&mut self, conn: &str, block: &str) -> Result<Vec<(u64, String)>, String> {
-        let Some(spec) = self.spec_of(conn).cloned() else {
+        let Some(spec) = self.effective_spec(conn) else {
             return Err(if self.connections.is_empty() {
                 "还没配数据库连接，先在顶栏「数据库 → 连接管理」里加一个".into()
             } else {
@@ -559,9 +767,8 @@ impl DatabasePanel {
 
     /// 侧栏「数据库」页签的内容。
     pub fn sidebar(&mut self, ui: &mut Ui) {
+        // 标题行和文件树那头一个写法：按钮先占住右边，标题最后拿剩下的宽度。
         ui.horizontal(|ui| {
-            ui.add_space(2.0);
-            ui.label(RichText::new("数据库连接").strong().size(12.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add(egui::Button::new(RichText::new("管理").size(11.5)).frame(false))
@@ -580,6 +787,7 @@ impl DatabasePanel {
                         self.refresh(&name);
                     }
                 }
+                ui.label(RichText::new("数据库连接").strong().size(12.0));
             });
         });
         ui.separator();
@@ -596,23 +804,48 @@ impl DatabasePanel {
             return;
         }
 
-        // 默认连接单独说一行：块头没写 conn= 时发去哪儿，是最不该靠底色去猜的事。
+        // SQL 到底发去哪条连接的哪个库，是这棵树最该一眼看见的两件事，
+        // 所以单独框一块，而不是靠某一行底色去暗示。
         // 认 `active_conn()` 而不是 `active`：一条都没点过时，发号处其实落在列表第一条，
-        // 这一行必须和那个事实一致，否则「看得见的那条」和「真正那条」会劈叉。
+        // 这一块必须和那个事实一致，否则「看得见的连接」和「真正那条」会劈叉。
         if let Some(active) = self.active_conn().map(str::to_string) {
-            let target = self.spec_of(&active).map(|s| s.target()).unwrap_or_default();
+            // 说的是「生效的那份配置」：树上换过当前库，这一行得跟着换，
+            // 不然它指着配置里的旧库，树里却亮着另一个。
+            let eff = self.effective_spec(&active);
+            let target = eff.as_ref().map(|s| s.target()).unwrap_or_default();
+            let database = self.current_db(&active);
             let color = ui.visuals().hyperlink_color;
-            ui.horizontal_wrapped(|ui| {
-                ui.add_space(2.0);
-                ui.label(RichText::new("默认连接").size(10.5).weak());
-                ui.label(
-                    RichText::new(format!("{active} · {target}"))
-                        .size(11.0)
-                        .strong()
-                        .color(color),
-                );
-            });
-            ui.add_space(1.0);
+            egui::Frame::group(ui.style())
+                .inner_margin(egui::Margin::same(6))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("默认连接").size(10.5).weak());
+                            ui.label(
+                                RichText::new(format!("{active} · {target}"))
+                                    .size(11.0)
+                                    .strong()
+                                    .color(color),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("当前库").size(10.5).weak());
+                            ui.label(
+                                RichText::new(if database.is_empty() {
+                                    "（配置里没填库）".to_owned()
+                                } else {
+                                    database.clone()
+                                })
+                                .size(11.0)
+                                .strong()
+                                .color(color),
+                            );
+                        });
+                    });
+                });
+            ui.add_space(2.0);
         }
 
         egui::ScrollArea::vertical()
@@ -639,64 +872,68 @@ impl DatabasePanel {
         let name = spec.name.clone();
         let expanded = self.trees.get(&name).is_some_and(|t| t.expanded);
         let selected = self.active_conn() == Some(name.as_str());
-        // 名字右边还要放「默认」和测试结论，宽度不留够就把它们挤到面板外面裁掉了
-        let rows_width = (ui.available_width() - 98.0).max(50.0);
+        let probe = self.probe_view(ui, spec);
 
-        ui.horizontal(|ui| {
-            ui.add_space(2.0);
-            let arrow = if expanded { "▾" } else { "▸" };
-            if ui
-                .add(egui::Button::new(RichText::new(arrow).size(11.0)).frame(false))
-                .on_hover_text(if expanded { "收起" } else { "展开库列表" })
-                .clicked()
-            {
+        let (resp, x) = tree_row(ui, 0);
+        let cy = resp.rect.center().y;
+        let accent = ui.visuals().hyperlink_color;
+        if selected {
+            // 底色、主色图标、右边的牌子，三处一起指认「SQL 就发到这里」
+            ui.painter()
+                .rect_filled(resp.rect, 3.0, accent.gamma_multiply(0.13));
+        }
+        arrow_glyph(ui, cy, x, expanded);
+        tree_icon(ui, cy, x + ARROW_W, CONN_ICON, selected, accent);
+
+        // 行尾记号从右往左摆，名字拿剩下的那一截：再长的连接名也不会把牌子挤出面板
+        let mut right = resp.rect.right() - 8.0;
+        if let Some((icon, _, color)) = &probe {
+            right = trail_label(ui, &resp, right, icon, *color);
+        }
+        if selected {
+            right = trail_label(ui, &resp, right, "默认", accent);
+        }
+        let hover = format!(
+            "{} · {}\n点名字 = 设为默认连接（SQL 块没写 conn= 就发到这里）\n点箭头 = {}",
+            spec.kind.label(),
+            spec.target(),
+            if expanded { "收起库列表" } else { "展开库列表" }
+        );
+        put_name(ui, &resp, x + ARROW_W + ICON_W, right, &name, 12.5, true)
+            .on_hover_text(hover);
+
+        if resp.clicked() {
+            if hit_arrow(&resp, x) {
                 self.toggle_conn(&name);
-            }
-            let row = ui
-                .add(
-                    egui::Button::selectable(selected, RichText::new(&name).size(12.5).strong())
-                        .min_size(egui::vec2(rows_width, 0.0)),
-                )
-                .on_hover_text(format!(
-                    "{} · {}\n点行 = 设为默认连接（SQL 块没写 conn= 就发到这里）",
-                    spec.kind.label(),
-                    spec.target()
-                ));
-            if row.clicked() {
+            } else {
                 self.active = Some(name.clone());
                 self.status = format!("已把「{name}」设为默认连接");
-            }
-            if selected {
-                let accent = ui.visuals().hyperlink_color;
-                ui.label(RichText::new("默认").size(9.5).strong().color(accent))
-                    .on_hover_text("块头没写 conn= 的 SQL 都发到这里");
-            }
-            if let Some((icon, text, color)) = self.probe_view(ui, spec) {
-                ui.label(RichText::new(icon).size(11.5).strong().color(color))
-                    .on_hover_text(text);
-            }
-            row.context_menu(|ui| {
-                if ui.button("刷新库列表").clicked() {
-                    self.refresh(&name);
-                    ui.close();
+                if !expanded {
+                    self.toggle_conn(&name);
                 }
-                if ui.button("测试连接").clicked() {
-                    let saved = self.spec_of(&name).cloned();
-                    ui.close();
-                    if let Some(saved) = saved {
-                        self.test_connection(&saved);
-                    }
+            }
+        }
+        resp.context_menu(|ui| {
+            if ui.button("刷新库列表").clicked() {
+                self.refresh(&name);
+                ui.close();
+            }
+            if ui.button("测试连接").clicked() {
+                let saved = self.spec_of(&name).cloned();
+                ui.close();
+                if let Some(saved) = saved {
+                    self.test_connection(&saved);
                 }
-                ui.separator();
-                if ui.button("编辑连接…").clicked() {
-                    let index = self.connections.iter().position(|c| c.name == name);
-                    ui.close();
-                    if let Some(index) = index {
-                        self.begin_edit(index);
-                        self.open_manager();
-                    }
+            }
+            ui.separator();
+            if ui.button("编辑连接…").clicked() {
+                let index = self.connections.iter().position(|c| c.name == name);
+                ui.close();
+                if let Some(index) = index {
+                    self.begin_edit(index);
+                    self.open_manager();
                 }
-            });
+            }
         });
 
         if !expanded {
@@ -712,53 +949,61 @@ impl DatabasePanel {
             // 刚展开时 `toggle_conn` 已经发过请求，这里没什么可显示失败的
             Load::Idle => {}
             Load::Loading => muted_row(ui, 1, "读取库列表…"),
-            Load::Failed(err) => {
-                ui.horizontal(|ui| {
-                    ui.add_space(INDENT);
-                    let color = ui.visuals().error_fg_color;
-                    ui.label(RichText::new(err.clone()).size(11.0).color(color));
-                    if ui.small_button("重试").clicked() {
-                        self.load_databases(&name);
-                    }
-                });
-            }
+            Load::Failed(err) => failed_row(ui, 1, err, || self.load_databases(&name)),
             Load::Ready(list) => {
+                let current = self.current_db(&name);
                 for database in list {
-                    self.db_rows(ui, spec, database, open.contains(database));
+                    let is_current = *database == current;
+                    self.db_rows(ui, spec, database, open.contains(database), is_current);
                 }
             }
         }
     }
 
-    fn db_rows(&mut self, ui: &mut Ui, spec: &ConnectionSpec, database: &str, is_open: bool) {
+    fn db_rows(
+        &mut self,
+        ui: &mut Ui,
+        spec: &ConnectionSpec,
+        database: &str,
+        is_open: bool,
+        is_current: bool,
+    ) {
         let conn = spec.name.clone();
         let db = database.to_string();
-        let is_default = spec.database == db;
-        let rows_width = (ui.available_width() - 84.0).max(60.0);
 
-        ui.horizontal(|ui| {
-            ui.add_space(INDENT);
-            let arrow = if is_open { "▾" } else { "▸" };
-            if ui
-                .add(egui::Button::new(RichText::new(arrow).size(10.5)).frame(false))
-                .clicked()
-            {
+        let (resp, x) = tree_row(ui, 1);
+        let cy = resp.rect.center().y;
+        let accent = ui.visuals().hyperlink_color;
+        if is_current {
+            ui.painter()
+                .rect_filled(resp.rect, 3.0, accent.gamma_multiply(0.10));
+        }
+        arrow_glyph(ui, cy, x, is_open);
+        tree_icon(ui, cy, x + ARROW_W, DB_ICON, is_current, accent);
+        let mut right = resp.rect.right() - 8.0;
+        if is_current {
+            right = trail_label(ui, &resp, right, "当前", accent);
+        }
+        let hover = format!(
+            "{}\n点名字 = 设为这条连接的当前库（不写 conn= 的 SQL 就发到这里）\n点箭头 = {}",
+            db,
+            if is_open { "收起表列表" } else { "展开表列表" }
+        );
+        put_name(ui, &resp, x + ARROW_W + ICON_W, right, &db, 12.0, false)
+            .on_hover_text(hover);
+
+        if resp.clicked() {
+            if hit_arrow(&resp, x) {
                 self.toggle_db(&conn, &db);
+            } else {
+                if !is_current {
+                    self.set_current_db(&conn, &db);
+                }
+                if !is_open {
+                    self.toggle_db(&conn, &db);
+                }
             }
-            let row = ui
-                .add(
-                    egui::Button::selectable(is_open, RichText::new(&db).size(12.0))
-                        .min_size(egui::vec2(rows_width, 0.0)),
-                )
-                .on_hover_text(if is_default {
-                    "这个连接默认打开的库；展开看它的表"
-                } else {
-                    "展开看这个库里的表"
-                });
-            if row.clicked() {
-                self.toggle_db(&conn, &db);
-            }
-        });
+        }
 
         if !is_open {
             return;
@@ -771,16 +1016,7 @@ impl DatabasePanel {
             .unwrap_or_default();
         match &state {
             Load::Idle | Load::Loading => muted_row(ui, 2, "读取表列表…"),
-            Load::Failed(err) => {
-                ui.horizontal(|ui| {
-                    ui.add_space(INDENT * 2.0);
-                    let color = ui.visuals().error_fg_color;
-                    ui.label(RichText::new(err.clone()).size(11.0).color(color));
-                    if ui.small_button("重试").clicked() {
-                        self.load_tables(&conn, &db);
-                    }
-                });
-            }
+            Load::Failed(err) => failed_row(ui, 2, err, || self.load_tables(&conn, &db)),
             Load::Ready(list) => {
                 for table in list {
                     table_row(ui, &db, table);
@@ -1015,36 +1251,50 @@ impl DatabasePanel {
     }
 }
 
-/// 表名一行。双击或右键复制，暂时不碰编辑器——结果区是下一步的事。
+/// 表名一行。整行只有名字，双击或右键复制，暂时不碰编辑器——结果区是下一步的事。
 fn table_row(ui: &mut Ui, database: &str, table: &str) {
     let qualified = format!("`{database}`.`{table}`");
-    ui.horizontal(|ui| {
-        ui.add_space(INDENT * 2.0);
-        let row = ui
-            .label(RichText::new(table).size(12.0))
-            .on_hover_text(format!("双击复制 {qualified}；右键可复制查询语句"));
-        if row.double_clicked() {
+    let (resp, x) = tree_row(ui, 2);
+    let cy = resp.rect.center().y;
+    tree_icon(ui, cy, x + ARROW_W, TABLE_ICON, false, ui.visuals().hyperlink_color);
+    put_name(
+        ui,
+        &resp,
+        x + ARROW_W + ICON_W,
+        resp.rect.right() - 8.0,
+        table,
+        12.0,
+        false,
+    )
+    .on_hover_text(format!("双击复制 {qualified}；右键可复制查询语句"));
+    if resp.double_clicked() {
+        ui.ctx().copy_text(qualified.clone());
+    }
+    resp.context_menu(|ui| {
+        if ui.button("复制表名").clicked() {
             ui.ctx().copy_text(qualified.clone());
+            ui.close();
         }
-        row.context_menu(|ui| {
-            if ui.button("复制表名").clicked() {
-                ui.ctx().copy_text(qualified.clone());
-                ui.close();
-            }
-            if ui.button("复制 SELECT 语句").clicked() {
-                ui.ctx()
-                    .copy_text(format!("SELECT * FROM {qualified} LIMIT 100;"));
-                ui.close();
-            }
-        });
+        if ui.button("复制 SELECT 语句").clicked() {
+            ui.ctx()
+                .copy_text(format!("SELECT * FROM {qualified} LIMIT 100;"));
+            ui.close();
+        }
     });
 }
 
+/// 树里那句不带操作的话：正在读、还没读出来、或者压根没有连接。
 fn muted_row(ui: &mut Ui, depth: usize, text: &str) {
-    ui.horizontal(|ui| {
-        ui.add_space(INDENT * depth as f32);
-        ui.label(RichText::new(text).size(11.0).weak().italics());
-    });
+    let width = ui.available_width().max(120.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::Vec2::new(width, ROW_H), egui::Sense::hover());
+    paint_row_shell(ui, &resp, depth);
+    ui.painter().text(
+        egui::pos2(rect.left() + 4.0 + INDENT * depth as f32, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::proportional(11.0),
+        ui.visuals().weak_text_color(),
+    );
 }
 
 fn weak(text: &str) -> RichText {
@@ -1418,18 +1668,18 @@ mod tests {
         assert_eq!(panel.active.as_deref(), Some("留着"), "选中的连接该顺延到下一条");
     }
 
-    /// 把侧栏单独画一帧，收它往屏上丢的所有文字。
-    ///
-    /// 测试结论、默认连接这些最后都落成一个记号加一行小字。
-    /// 只断言 `probes` 里有条目证明不了用户看得见——画没画出来得看这一帧。
-    fn sidebar_texts(panel: &mut DatabasePanel) -> Vec<String> {
-        let ctx = egui::Context::default();
-        ctx.set_pixels_per_point(1.0);
+    /// 侧栏单独画一帧。指针状态在 begin_pass 就算好了，只能事前塞进 RawInput。
+    fn sidebar_pass(
+        ctx: &egui::Context,
+        panel: &mut DatabasePanel,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(420.0, 620.0),
             )),
+            events,
             ..Default::default()
         };
         let mut out = ctx.run_pass(raw, |ctx| {
@@ -1437,23 +1687,74 @@ mod tests {
         });
         // 没有真的渲染器消费字体图集的增量，epaint 会在 drop 时断言
         out.textures_delta.clear();
+        out
+    }
 
-        fn walk(shape: &egui::Shape, v: &mut Vec<String>) {
-            match shape {
-                egui::Shape::Text(text) => v.push(text.galley.job.text.clone()),
-                egui::Shape::Vec(shapes) => {
-                    for s in shapes {
-                        walk(s, v);
-                    }
-                }
-                _ => {}
+    fn walk_text(shape: &egui::Shape, v: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(text) => {
+                v.push((
+                    text.galley.job.text.clone(),
+                    text.galley.rect.translate(text.pos.to_vec2()),
+                ))
             }
+            egui::Shape::Vec(shapes) => {
+                for s in shapes {
+                    walk_text(s, v);
+                }
+            }
+            _ => {}
         }
-        let mut texts = Vec::new();
+    }
+
+    fn seen(out: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+        let mut v = Vec::new();
         for group in &out.shapes {
-            walk(&group.shape, &mut texts);
+            walk_text(&group.shape, &mut v);
         }
-        texts
+        v
+    }
+
+    /// 把侧栏单独画一帧，收它往屏上丢的所有文字。
+    ///
+    /// 测试结论、默认连接这些最后都落成一个记号加一行小字。
+    /// 只断言 `probes` 里有条目证明不了用户看得见——画没画出来得看这一帧。
+    fn sidebar_texts(panel: &mut DatabasePanel) -> Vec<String> {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let out = sidebar_pass(&ctx, panel, vec![]);
+        seen(&out).into_iter().map(|(t, _)| t).collect()
+    }
+
+    /// 在侧栏里点中某段文字（按段落中心命中）。点到返回 true。
+    ///
+    /// 按下和松开必须分两帧，且用的是同一个 Context，不然 egui 认不出这是一次点击。
+    fn sidebar_click(panel: &mut DatabasePanel, needle: &str) -> bool {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let mut point = |what: &str| {
+            seen(&sidebar_pass(&ctx, panel, vec![]))
+                .into_iter()
+                .find(|(t, _)| t == what)
+                .map(|(_, r)| r.center())
+        };
+        let Some(pos) = point(needle) else {
+            return false;
+        };
+        let at = |pressed: bool| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        sidebar_pass(&ctx, panel, at(true));
+        sidebar_pass(&ctx, panel, at(false));
+        true
     }
 
     #[test]
@@ -1505,6 +1806,93 @@ mod tests {
         assert!(
             texts.iter().any(|t| t == "⚠") && !texts.iter().any(|t| t == "✓"),
             "改了库名还挂着绿勾：{texts:?}"
+        );
+    }
+
+    /// 树里点库名：当前库换了、牌子上屏、发往的配置也跟着换。
+    ///
+    /// 「看得见」和「真正发往」必须是同一个数，所以三条一起断言。
+    #[test]
+    fn clicking_a_database_in_the_tree_moves_where_sql_goes() {
+        let mut panel = panel(&["点库"]);
+        panel.toggle_conn("点库");
+        settle(&mut panel);
+        assert_eq!(panel.current_db("点库"), "demo", "没点过就该跟着配置走");
+
+        assert!(
+            sidebar_click(&mut panel, "information_schema"),
+            "树里没点到库名"
+        );
+        assert_eq!(panel.current_db("点库"), "information_schema");
+        assert_eq!(
+            panel
+                .effective_spec("点库")
+                .expect("连接在")
+                .database
+                .as_str(),
+            "information_schema",
+            "树上的当前库没影响到真正发出去的配置"
+        );
+        assert_eq!(
+            panel.spec_of("点库").expect("连接在").database,
+            "demo",
+            "点两下就把 config.json 的默认库改了，比不改更糟"
+        );
+        let texts = sidebar_texts(&mut panel);
+        assert!(
+            texts.iter().any(|t| t == "当前库") && texts.iter().any(|t| t == "information_schema"),
+            "卡片没说当前库是谁：{texts:?}"
+        );
+        assert_eq!(
+            texts.iter().filter(|t| *t == "当前").count(),
+            1,
+            "行尾的「当前」牌子只能有一块：{texts:?}"
+        );
+    }
+
+    /// 箭头那一列只管展开收起，不该顺手把当前库换掉。
+    #[test]
+    fn the_arrow_toggles_without_touching_the_current_database() {
+        let mut panel = panel(&["点箭头"]);
+        panel.toggle_conn("点箭头");
+        settle(&mut panel);
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let out = sidebar_pass(&ctx, &mut panel, vec![]);
+        let db_line = seen(&out)
+            .into_iter()
+            .find(|(t, _)| t == "information_schema")
+            .map(|(_, r)| r)
+            .expect("库名该在屏上");
+        // 箭头列在这一行最左边，横向坐标就是它
+        let pos = egui::pos2(db_line.min.x - 24.0, db_line.center().y);
+        let at = |pressed: bool| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        sidebar_pass(&ctx, &mut panel, at(true));
+        sidebar_pass(&ctx, &mut panel, at(false));
+        // 箭头那一列只做展开这一件事：库列表读出来了，当前库却一个字节没动
+        assert!(
+            panel
+                .trees
+                .get("点箭头")
+                .expect("树在")
+                .open
+                .contains("information_schema"),
+            "点在箭头上却没展开表列表"
+        );
+        assert_eq!(
+            panel.current_db("点箭头"),
+            "demo",
+            "点箭头不该把当前库换掉"
         );
     }
 

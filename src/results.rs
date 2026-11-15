@@ -77,12 +77,24 @@ pub struct Panel {
     pub collapsed: bool,
     /// 摊开看完整内容的行号（0 基）。窄格子里被裁掉的那一截在这儿看全。
     pub expanded: HashSet<usize>,
+    /// 单独看的那一格（双击格子开出来的弹窗）。列太窄时整行摊开还是不好读，
+    /// 就盯着一格看。
+    pub peek: Option<Peek>,
 }
 
 impl Panel {
     pub fn preview(&self) -> String {
         preview_of(&self.stmt)
     }
+}
+
+/// 单独查看某一格。
+#[derive(Clone, Copy)]
+pub struct Peek {
+    pub row: usize,
+    pub col: usize,
+    /// 按下那一帧的光标位置：弹窗头一次开在它边上，之后归用户拖
+    pub at: egui::Pos2,
 }
 
 /// 一批结果全部到家，app 可以拿去做收尾（比如把块头部的 `[待执行]` 改掉）。
@@ -193,6 +205,7 @@ impl ResultsDock {
                 slot: Slot::Running,
                 collapsed: false,
                 expanded: HashSet::new(),
+                peek: None,
             });
         self.panels.splice(0..0, batch);
         self.waiting.push(run);
@@ -310,7 +323,7 @@ impl ResultsDock {
                 format!("结果 · {count} 个")
             };
             ui.label(RichText::new(head).size(11.5).strong());
-            ui.label(weak("一条语句一个面板，点标题行收起"));
+            ui.label(weak("一条语句一个面板 · 双击格子看整格全文 · 行首 ▸ 展开整行"));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
                     .add(egui::Button::new(RichText::new("关闭").size(11.5)).frame(false))
@@ -340,16 +353,7 @@ impl ResultsDock {
         });
         ui.separator();
 
-        // 这里重新读一次，不用上头算好的 count：这一帧刚点「清空」的话，
-        // 该当场把引导文案亮出来，而不是留一片空白。
-        if self.is_empty() {
-            ui.label(weak(format!(
-                "还没有结果。在文件里写一个 SQL 块（顶栏「数据库 → 插入 SQL 块」），光标放进去按 {run_hint}。\
-                 选中一段 SQL 也能按它，那时只跑选中的部分。"
-            )));
-            return;
-        }
-
+        let empty = self.is_empty();
         let mut act = Clicked {
             popup: self.popup,
             ..Default::default()
@@ -357,10 +361,19 @@ impl ResultsDock {
         // 铺满底部面板给的那一格，装不下的走这里的滚动条（面板高度用户能拖）。
         // 缩成内容高反而不行：面板先按起始尺寸预留，多出来的那一截掉在窗口下沿
         // 外面，看着就是「只画了第一个面板」。
+        // 还没有结果时也得进这个 ScrollArea：底部面板是松手那一帧才按当场量到的
+        // 尺寸记账的，空状态只剩一行小字的话，用户往上拖宽它就立刻回弹成那行高。
         ScrollArea::vertical()
             .id_salt("db_result_panels")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                if empty {
+                    ui.label(weak(format!(
+                        "还没有结果。在文件里写一个 SQL 块（顶栏「数据库 → 插入 SQL 块」），光标放进哪句就按 {run_hint} 跑哪句。\
+                         选中一段只跑那段，整块一起交出去用 Ctrl+Shift+Enter。"
+                    )));
+                    return;
+                }
                 // 同批面板在列表里连着排（一批 splice 到 0，批内按语句顺序），
                 // 所以只要盯住 run 变了没，就能在每批开头插一行抬头。
                 let mut last_run = 0u64;
@@ -403,6 +416,7 @@ impl ResultsDock {
             }
             self.close_run(run);
         }
+        self.draw_peek(ui.ctx());
     }
 
     /// 单独拉出来的结果窗口：底部那一格窄，宽表放这儿看。
@@ -435,6 +449,81 @@ impl ResultsDock {
             });
         if !open {
             self.popup = None;
+        }
+    }
+
+    /// 双击格子开出来的「这一格全文」小窗。
+    ///
+    /// 为什么单开一个窗口：底部那一格窄，长值列宽装不下；贴着格子展开更不行，
+    /// 表格自己带裁剪，展开的那块经常在滚动区外面，等于点了没反应。
+    /// 窗口只画一份、归结果区管，放大出来的那份结果和底部面板共用同一个状态。
+    fn draw_peek(&mut self, ctx: &egui::Context) {
+        for panel in &mut self.panels {
+            let Some(peek) = panel.peek else { continue };
+            let one = match &panel.slot {
+                Slot::Done(one) => one,
+                _ => {
+                    panel.peek = None;
+                    continue;
+                }
+            };
+            let (Some(row), Some(column)) = (one.rows.get(peek.row), one.columns.get(peek.col))
+            else {
+                panel.peek = None;
+                continue;
+            };
+            let value = row[peek.col].display().to_string();
+            let count = value.chars().count();
+            // 一格也可能是几万字节的 JSON 或日志，全铺开会把这帧拖死
+            let shown: String = value.chars().take(PEEK_LIMIT).collect();
+            let cut = count > PEEK_LIMIT;
+            let title = format!("{} · 第 {} 行", column.name, peek.row + 1);
+            let type_name = column.type_name.clone();
+            let mut open = true;
+            egui::Window::new(title)
+                .id(egui::Id::unique((
+                    "db_cell_peek",
+                    panel.task,
+                    peek.row,
+                    peek.col,
+                )))
+                .default_pos(peek.at + egui::vec2(10.0, 12.0))
+                .default_size(egui::vec2(460.0, 170.0))
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    // 底下那行按钮得先留出地方：整块高度都给滚动区的话，
+                    // 按钮被顶到窗口裁剪区外面，看着就像窗口里只有一段文字。
+                    let footer = ui.spacing().interact_size.y + 14.0;
+                    ScrollArea::vertical()
+                        .max_height((ui.available_height() - footer).max(60.0))
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(RichText::new(shown).size(11.5).monospace())
+                                    .selectable(true),
+                            );
+                            if cut {
+                                ui.label(weak(format!(
+                                    "内容太长，这里只列前 {PEEK_LIMIT} 字。全部请用下面的「复制本格」或导出 CSV。"
+                                )));
+                            }
+                        });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if !type_name.is_empty() {
+                            ui.label(weak(type_name));
+                        }
+                        ui.label(weak(format!("共 {count} 字")));
+                        if ui
+                            .add(egui::Button::new(RichText::new("复制本格").size(11.0)).frame(false))
+                            .on_hover_text("原文拷进剪贴板，不受上面显示长度的限制")
+                            .clicked()
+                        {
+                            ui.ctx().copy_text(value.clone());
+                        }
+                    });
+                });
+            panel.peek = open.then_some(peek);
         }
     }
 }
@@ -688,13 +777,15 @@ fn body(ui: &mut Ui, panel: &mut Panel) {
 /// 结果网格。`height` 是这块最多能占到多高，超出行数走它自己的滚动条：
 /// 底部那一格给 120，放大窗口给整屏。
 ///
-/// 每格都是截断显示，装不下的那一截靠行首的 ▸ 摊到表格下面看全（见 [`detail`]）。
+/// 每格都是截断显示，装不下的那一截有两条路看全：行首的 ▸ 把整行摊到表格下面
+/// （见 [`detail`]），双击格子把这一格单独弹出来看（见 [`ResultsDock::draw_peek`]）。
 fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
     // 拆字段借：网格读 `slot` 里的结果，展开状态要写回 `expanded`
     let Panel {
         task,
         slot,
         expanded,
+        peek,
         ..
     } = panel;
     let Slot::Done(one) = slot else { return };
@@ -754,7 +845,7 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                     }
                     ui.label(weak(format!("{}", index + 1)));
                 });
-                for cell in &one.rows[index] {
+                for (col_index, cell) in one.rows[index].iter().enumerate() {
                     let text = cell.display().to_string();
                     let null = cell.is_null();
                     let mut rt = RichText::new(text.clone()).size(11.0).monospace();
@@ -765,21 +856,55 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                         let resp = ui
                             .add(egui::Label::new(rt).truncate().selectable(true))
                             .on_hover_cursor(egui::CursorIcon::Text);
-                        resp.context_menu(|ui| {
-                                if ui.button("复制单元格").clicked() {
-                                    ui.ctx().copy_text(text.clone());
-                                    ui.close();
-                                }
-                                if ui.button("复制整行").clicked() {
-                                    let line = tsv_row(one.rows[index].iter().map(Cell::display));
-                                    ui.ctx().copy_text(line);
-                                    ui.close();
-                                }
-                                if ui.button("复制整表").clicked() {
-                                    ui.ctx().copy_text(to_tsv(one));
-                                    ui.close();
-                                }
+                        // 只有真被列宽裁掉的格子才给悬浮，短值多弹一个框反而碍事。
+                        // 表格只给可见行跑这段，量一行的宽度不贵。
+                        let full = ui
+                            .painter()
+                            .layout_no_wrap(text.clone(), egui::FontId::monospace(11.0), Color32::WHITE)
+                            .size()
+                            .x;
+                        let resp = if full <= resp.rect.width() - 6.0 {
+                            resp
+                        } else {
+                            resp.on_hover_text(hover_preview(&text))
+                        };
+                        let at = resp
+                            .interact_pointer_pos()
+                            .unwrap_or_else(|| resp.rect.right_bottom());
+                        if resp.double_clicked() {
+                            *peek = Some(Peek {
+                                row: index,
+                                col: col_index,
+                                at,
                             });
+                        }
+                        resp.context_menu(|ui| {
+                            if ui
+                                .button("查看完整内容")
+                                .on_hover_text("单独开一个窗口放这一格：能换行、能滚动、整段选中拷贝")
+                                .clicked()
+                            {
+                                *peek = Some(Peek {
+                                    row: index,
+                                    col: col_index,
+                                    at,
+                                });
+                                ui.close();
+                            }
+                            if ui.button("复制单元格").clicked() {
+                                ui.ctx().copy_text(text.clone());
+                                ui.close();
+                            }
+                            if ui.button("复制整行").clicked() {
+                                let line = tsv_row(one.rows[index].iter().map(Cell::display));
+                                ui.ctx().copy_text(line);
+                                ui.close();
+                            }
+                            if ui.button("复制整表").clicked() {
+                                ui.ctx().copy_text(to_tsv(one));
+                                ui.close();
+                            }
+                        });
                     });
                 }
             });
@@ -943,6 +1068,23 @@ fn weak(text: impl Into<String>) -> RichText {
     RichText::new(text.into()).size(10.5).weak()
 }
 
+/// 「这一格全文」窗口最多铺多少字。
+const PEEK_LIMIT: usize = 20_000;
+
+/// 悬浮框里的那一截。
+///
+/// 悬浮框是跟着光标走的，几万字的 JSON 全塞进去能把整片结果区盖住，
+/// 所以只列个开头；要看全或要拷贝，双击格子开的那个窗口才是干这个的。
+fn hover_preview(text: &str) -> String {
+    const HOVER_LIMIT: usize = 400;
+    let head: String = text.chars().take(HOVER_LIMIT).collect();
+    if text.chars().count() > HOVER_LIMIT {
+        format!("{head}…\n\n太长，悬浮框只列前 {HOVER_LIMIT} 字。双击格子开窗口看全文。")
+    } else {
+        format!("{head}\n\n双击格子单独看这一格。")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -996,6 +1138,135 @@ mod tests {
             Some(block_origin(12)),
         );
         dock
+    }
+
+    /// 把整个结果区画一帧。底部面板给的位置换成一块够大的中央面板，
+    /// 免得网格被裁到看不见。
+    fn show_pass(
+        dock: &mut ResultsDock,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        time: f64,
+    ) -> egui::FullOutput {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 620.0),
+            )),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_pass(raw, |ctx| {
+            ctx.root_ui(|ui| {
+                egui::CentralPanel::default().show(ui, |ui| dock.show(ui, "Ctrl+Enter"));
+            });
+        });
+        // 没有真的渲染器消费字体图集的增量，epaint 会在 drop 时断言
+        out.textures_delta.clear();
+        out
+    }
+
+    fn walk_text(shape: &egui::Shape, v: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(text) => {
+                v.push((
+                    text.galley.job.text.clone(),
+                    text.galley.rect.translate(text.pos.to_vec2()),
+                ))
+            }
+            egui::Shape::Vec(shapes) => {
+                for s in shapes {
+                    walk_text(s, v);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn seen(out: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+        let mut v = Vec::new();
+        for group in &out.shapes {
+            walk_text(&group.shape, &mut v);
+        }
+        v
+    }
+
+    /// 在结果区里连点两下某段文字（按段落中心命中），点完再多跑几帧让窗口把内容画出来。
+    ///
+    /// 按下、松开各占一帧，两次才算双击。Context 由调用方拿着：窗口是画在这个
+    /// Context 上的， helper 里自建一个，函数一返回窗口就没了。
+    fn double_click(dock: &mut ResultsDock, ctx: &egui::Context, needle: &str) -> bool {
+        let pos = match seen(&show_pass(dock, ctx, vec![], 0.0))
+            .into_iter()
+            .find(|(t, _)| t == needle)
+        {
+            Some((_, rect)) => rect.center(),
+            None => return false,
+        };
+        let at = |pressed: bool| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        for (step, pressed) in [(1.00, true), (1.05, false), (1.10, true), (1.15, false)] {
+            show_pass(dock, ctx, at(pressed), step);
+        }
+        // 新开的窗口头几帧只在量尺寸、摆位置，尺寸落定才轮到画内容
+        for step in [1.20, 1.25, 1.30] {
+            show_pass(dock, ctx, vec![], step);
+        }
+        true
+    }
+
+    fn on_screen(dock: &mut ResultsDock, ctx: &egui::Context) -> Vec<String> {
+        seen(&show_pass(dock, ctx, vec![], 9.0))
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect()
+    }
+
+    /// 列太窄，长值在网格里只看得到开头。双击把那一条完整内容开成一个小窗口，
+    /// 里面能换行、能滚动、能整段选中——底部那一格里头没有第二个地方办得到。
+    #[test]
+    fn double_clicking_a_cell_puts_the_whole_value_in_a_window() {
+        let mut dock = ResultsDock::new();
+        let long = "备注".repeat(60);
+        let batch = parts(&["SELECT note FROM t"]);
+        dock.start_run("本机", "查备注", &batch, None);
+        let one = table(&["note"], vec![vec![Cell::Text(long.clone())]]);
+        dock.on_event(&event(1, Ok(DbOutcome::Statement(one))));
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        assert!(
+            double_click(&mut dock, &ctx, &long),
+            "长值那一格没画出来，双击无从下手"
+        );
+        let shown = on_screen(&mut dock, &ctx);
+        assert!(
+            shown.iter().any(|t| t == "note · 第 1 行"),
+            "双击没开出这一格的窗口：{shown:?}"
+        );
+        assert!(
+            shown.iter().any(|t| t == "复制本格"),
+            "窗口里没带拷贝的那一条：{shown:?}"
+        );
+        assert_eq!(
+            shown.iter().filter(|t| *t == &long).count(),
+            2,
+            "一份在网格里（裁过），一份在窗口里（全文）"
+        );
+
+        // 关掉窗口的那一帧记在面板上，别留一个开着的弹窗在状态里
+        dock.panels[0].peek = None;
+        assert!(!on_screen(&mut dock, &ctx).contains(&"note · 第 1 行".to_string()));
     }
 
     /// 整块提交：块头在第 12 字节，回块也跳那儿

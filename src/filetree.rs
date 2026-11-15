@@ -266,37 +266,73 @@ impl FileTree {
     pub fn ui(&mut self, ui: &mut Ui, dark: bool) -> Option<TreeAction> {
         let mut action = None;
 
+        // 一行两头：工作区名钉在最左，按钮从最右边往左排。
+        // 名字不能跟按钮排在同一条横向布局里——那一坨按钮多宽要等排完才知道，
+        // 名字一长就压到按钮上面；所以先排按钮，再把剩下的那块矩形交给名字。
+        // 名字用 max_rect 单独摆：`Ui::put` 那套是居中+两端对齐的，
+        // 只有显式的 left_to_right 子 ui 才真的把它按在最左边。
+        // 外面这层 horizontal 不能省：它把行高定成一行，
+        // 单用 with_layout 会让这一行吃掉面板剩下的全部高度、还被垂直居中到中间。
+        let row = ui.available_rect_before_wrap();
         ui.horizontal(|ui| {
-            ui.add_space(2.0);
-            let name = self
-                .root
-                .file_name()
-                .map(|s| s.to_string_lossy().to_uppercase())
-                .unwrap_or_else(|| "工作区".into());
-            ui.label(RichText::new(name).strong().size(12.0));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add(egui::Button::new(RichText::new("刷新").size(11.5)).frame(false))
-                    .on_hover_text("刷新目录")
-                    .clicked()
-                {
-                    self.refresh();
-                }
-                if ui
-                    .add(egui::Button::new(RichText::new("新文件夹").size(11.5)).frame(false))
-                    .on_hover_text("新建文件夹 Ctrl+Shift+N")
-                    .clicked()
-                {
-                    self.request_new(true);
-                }
-                if ui
-                    .add(egui::Button::new(RichText::new("新文件").size(11.5)).frame(false))
-                    .on_hover_text("新建文件 Ctrl+N")
-                    .clicked()
-                {
-                    self.request_new(false);
-                }
-            });
+            let buttons = ui.scope_builder(
+                egui::UiBuilder::new()
+                    .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                |ui| {
+                    ui.add_space(4.0);
+                    if ui
+                        .add(egui::Button::new(RichText::new("刷新").size(11.5)).frame(false))
+                        .on_hover_text("刷新目录")
+                        .clicked()
+                    {
+                        self.refresh();
+                    }
+                    if ui
+                        .add(egui::Button::new(RichText::new("新文件夹").size(11.5)).frame(false))
+                        .on_hover_text("新建文件夹 Ctrl+Shift+N")
+                        .clicked()
+                    {
+                        self.request_new(true);
+                    }
+                    if ui
+                        .add(egui::Button::new(RichText::new("新文件").size(11.5)).frame(false))
+                        .on_hover_text("新建文件 Ctrl+N")
+                        .clicked()
+                    {
+                        self.request_new(false);
+                    }
+                    ui.min_rect()
+                },
+            );
+            // 名字剩下多少用多少，窄到没位置就干脆不画，别和按钮叠在一起。
+            // 矩形的高度必须自己钉死在这一行上：`available_rect_before_wrap` 给的是
+            // 面板剩下的整块，直接拿它的下沿会把名字撑成一层楼高，
+            // 后面的搜索框和文件行全被顶到面板外面（egui 按 used_rect 记账）。
+            let right = buttons.inner.left() - 6.0;
+            let row_h = ui.spacing().interact_size.y.min(24.0);
+            if right > row.left() + 24.0 {
+                let rect =
+                    egui::Rect::from_min_size(row.left_top(), egui::vec2(right - row.left(), row_h));
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    |ui| {
+                        let name = self
+                            .root
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_uppercase())
+                            .unwrap_or_else(|| "工作区".into());
+                        let full = self.root.display().to_string();
+                        ui.add(
+                            egui::Label::new(RichText::new(name).strong().size(12.0))
+                                .truncate()
+                                .selectable(false),
+                        )
+                        .on_hover_text(full);
+                    },
+                );
+            }
         });
 
         // 根目录也支持右键新建，工作区为空时也能操作

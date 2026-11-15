@@ -41,7 +41,8 @@ pub const ACTIONS: &[ActionDef] = &[
     // 数据库
     ActionDef { id: "sql_new_query", label: "新建查询文件", group: "数据库", default: "Ctrl+Alt+N" },
     ActionDef { id: "sql_insert", label: "插入 SQL 块", group: "数据库", default: "Ctrl+Shift+J" },
-    ActionDef { id: "sql_run", label: "执行 SQL（块或选中语句）", group: "数据库", default: "Ctrl+Enter" },
+    ActionDef { id: "sql_run", label: "执行 SQL（选中语句或光标那一句）", group: "数据库", default: "Ctrl+Enter" },
+    ActionDef { id: "sql_run_block", label: "执行整个 SQL 块", group: "数据库", default: "Ctrl+Shift+Enter" },
     ActionDef { id: "results_toggle", label: "显示 / 隐藏结果区", group: "数据库", default: "Ctrl+Shift+R" },
     // 视图
     ActionDef { id: "side_toggle", label: "显示 / 隐藏侧栏", group: "视图", default: "Ctrl+B" },
