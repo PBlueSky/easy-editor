@@ -1,159 +1,159 @@
 # EasyEditor
 
-**中文** | [English](README.en-US.md)
+**English** | [中文](README.zh-CN.md)
 
-一个用 **Rust + egui** 写的 Windows 桌面编辑器。功能不多，但每一样都能天天用：文件树、多终端、递归分屏、文本内工作日志块、光标位置前后跳转、全局搜索、查找替换、语法高亮，快捷键全部可改。
+A Windows desktop editor written in **Rust + egui**. It does not have many features — it has the ones you use every day: file tree, multiple terminals, recursive split panes, journal blocks inside plain text files, cursor position back/forward, project-wide search, find and replace, syntax highlighting, and every keybinding is yours to change.
 
-**当前版本** v0.2.2 ｜ **平台** Windows 10 / 11 x64 ｜ **许可** MIT
+**Current version** v0.2.2 | **Platform** Windows 10 / 11 x64 | **License** MIT
 
-发布包是**单文件 exe**（约 11 MB，压缩后 4.7 MB），不需要 .NET、Electron 或任何运行时。
+The release package is a **single exe** (about 11 MB, 4.7 MB zipped). No .NET, no Electron, no runtime of any kind.
 
-## 目录
+## Table of contents
 
-- [核心功能](#核心功能)
-- [快速开始](#快速开始)
-- [使用方法](#使用方法)
-- [配置](#配置)
-- [技术栈](#技术栈)
-- [代码结构](#代码结构)
-- [构建、测试与打包](#构建测试与打包)
-- [已知限制](#已知限制)
-- [实现手记](#实现手记踩过的坑)
-- [贡献与许可](#贡献与许可)
+- [Highlights](#highlights)
+- [Quick start](#quick-start)
+- [Usage](#usage)
+- [Configuration](#configuration)
+- [Tech stack](#tech-stack)
+- [Code layout](#code-layout)
+- [Build, test and packaging](#build-test-and-packaging)
+- [Known limitations](#known-limitations)
+- [Implementation notes](#implementation-notes)
+- [Contributing and license](#contributing-and-license)
 
-## 核心功能
+## Highlights
 
-| 功能 | 一句话 | 详见 |
+| Feature | In one line | Details |
 |---|---|---|
-| 代码编辑 | 行号、当前行高亮、syntect 语法高亮，长行可以折行也可以横向滚 | [#编辑](#编辑) |
-| 多终端 | `portable-pty` 起真实 PTY，`alacritty_terminal` 做 VT 解析，能开好几块各跑各的 | [#终端](#终端) |
-| 递归分屏 | tmux / i3 那套二分面板树，切多少次都行，默认键位和 Windows Terminal 一致 | [#分屏](#分屏) |
-| 工作日志块 | 直接写在普通文本文件里的任务块，能和正文混排、跟着 git 走 | [#工作日志块](#工作日志块) |
-| 光标位置历史 | 像 IDEA 的 Navigate Back / Forward，光标停够 350ms 才算一个落脚点 | [#光标位置历史](#光标位置历史) |
-| 查找替换 | 大小写、正则、全部匹配高亮、键盘不离输入框 | [#查找与替换](#查找与替换) |
-| 全局搜索 | 优先 `rg --json` 流式显示，没有 ripgrep 就回退内置字节级扫描 | [#全局搜索](#全局搜索) |
-| 选词高亮 | 鼠标选中一个词，全文所有相同词立刻标出来 | [#查找与替换](#查找与替换) |
-| JSON / XML 格式化 | 只改内存里的 buffer，`Ctrl+S` 才落盘 | [#格式化](#格式化) |
-| 中文输入法 | 新建对话框、编辑器正文、终端三处都能直接打拼音 | [#输入法](#输入法) |
-| 中英文混排对齐 | 基线校正过，中文不会掉到行底 | [#中英文基线](#中英文基线) |
-| 深浅主题 | 连 Windows 系统标题栏的底色和按钮字形一起刷 | [#系统标题栏得自己刷](#系统标题栏得自己刷) |
-| 键位自定义 | `F1` 打开设置面板，点一下再按新组合即可，撞车会标红 | [#改快捷键](#改快捷键) |
-| 配置持久化 | 字号、主题、终端偏好、改过的键位全存进 `%APPDATA%\easy-editor\config.json` | [#配置](#配置) |
+| Code editing | Line numbers, current-line highlight, syntect grammar highlighting; long lines either wrap or scroll sideways | [Editing](#editing) |
+| Multiple terminals | Real PTYs via `portable-pty`, VT parsing via `alacritty_terminal`; open several and let each run its own thing | [Terminal](#terminal) |
+| Recursive split panes | The tmux / i3 binary pane tree — split as deep as you like, default keys match Windows Terminal | [Split panes](#split-panes) |
+| Journal blocks | Task blocks written directly into ordinary text files, mixed with prose and versioned with git | [Journal blocks](#journal-blocks) |
+| Cursor position history | Like IDEA's Navigate Back / Forward; a position only counts as a stop after the cursor sits there for 350 ms | [Cursor position history](#cursor-position-history) |
+| Find and replace | Case sensitivity, regex, all matches highlighted, hands stay in the input box | [Find and replace](#find-and-replace) |
+| Project-wide search | Streams `rg --json` first, falls back to a built-in byte-level scanner when ripgrep is absent | [Project-wide search](#project-wide-search) |
+| Word occurrence highlight | Select a word with the mouse and every identical word in the file is marked immediately | [Find and replace](#find-and-replace) |
+| JSON / XML formatting | Edits the in-memory buffer only; nothing touches the disk until `Ctrl+S` | [Formatting](#formatting) |
+| East Asian input methods | Pinyin and Japanese work in the new-file dialog, the rename box, the editor body and the terminal | [Input methods](#input-methods) |
+| CJK / Latin alignment | Baselines are corrected, so Chinese glyphs do not sink to the bottom of the line | [CJK baseline](#cjk-baseline) |
+| Light and dark themes | Repaints the Windows system title bar colour and button glyphs along with them | [System title bar](#the-system-title-bar-has-to-be-repainted-by-hand) |
+| Custom keybindings | `F1` opens the settings panel: click, press the new chord, done. Conflicts are flagged in red | [Customizing keybindings](#customizing-keybindings) |
+| Persistent settings | Font size, theme, terminal preferences and your key changes all live in `%APPDATA%\easy-editor\config.json` | [Configuration](#configuration) |
 
-## 快速开始
+## Quick start
 
-### 直接下载
+### Download
 
-到 [Releases](https://github.com/PBlueSky/easy-editor/releases) 页面下其中一个包，解压后双击 `EasyEditor/EasyEditor.exe`：
+Grab one of the packages from the [Releases](https://github.com/PBlueSky/easy-editor/releases) page, unzip it, and double-click `EasyEditor/EasyEditor.exe`:
 
-| 包 | 内容 | 适合谁 |
+| Package | Contents | For whom |
 |---|---|---|
-| `EasyEditor-<版本>-windows-x64.zip` | 单 exe + 中英两份 README + LICENSE | 大多数人 |
-| `EasyEditor-<版本>-windows-x64-with-rg.zip` | 上面这些，外加 `rg.exe` 和 `THIRD-PARTY-NOTICES.txt` | 想要全局搜索跑满速 |
+| `EasyEditor-<version>-windows-x64.zip` | The exe + both READMEs (zh / en) + LICENSE | Most people |
+| `EasyEditor-<version>-windows-x64-with-rg.zip` | The above plus `rg.exe` and `THIRD-PARTY-NOTICES.txt` | Anyone who wants project search at full speed |
 
-两个包都能用：没带 `rg.exe` 时全局搜索自动回退到内置扫描，只是大仓里慢一些。每个包旁边有同名 `.sha256.txt`，校验一下：
+Both packages work: without `rg.exe`, project-wide search silently falls back to the built-in scanner — a bit slower on large repos. Each package ships with a matching `.sha256.txt`; verify it:
 
 ```powershell
 Get-FileHash .\EasyEditor-0.2.2-windows-x64.zip -Algorithm SHA256
 ```
 
-### 从源码跑
+### Run from source
 
-装好 Rust stable 工具链（`rustup`），然后：
+Install a Rust stable toolchain (`rustup`), then:
 
 ```bash
 git clone https://github.com/PBlueSky/easy-editor.git
 cd easy-editor
-cargo run --release       # 首次要编译依赖，之后很快
+cargo run --release       # first run compiles dependencies, after that it is fast
 ```
 
-调试构建已经把依赖库设成 `opt-level = 2`（见 `Cargo.toml`），`cargo run` 也不卡。
+The debug profile already pins dependencies to `opt-level = 2` (see `Cargo.toml`), so plain `cargo run` is not sluggish either.
 
 ```bash
-cargo run -- D:\path\to\some-project    # 启动并打开某个文件夹
-cargo run -- src\app.rs                 # 启动并打开某个文件
+cargo run -- D:\path\to\some-project    # start and open a folder
+cargo run -- src\app.rs                 # start and open a file
 ```
 
-不带参数时的启动目录优先级：**命令行参数 > 当前目录像个工程（有 `Cargo.toml` 或 `.git`）> 上次打开的工作目录**。
+With no arguments, the startup folder is chosen by: **command-line argument > current directory if it looks like a project (`Cargo.toml` or `.git`) > last workspace you opened**.
 
-## 使用方法
+## Usage
 
-### 界面
+### Interface
 
-![EasyEditor 主界面：左侧文件树、中间分屏的编辑器与终端、底部状态栏](assets/screenshot.png)
+![EasyEditor main window: file tree on the left, split editor and terminal panes in the middle, status bar at the bottom](assets/screenshot.png)
 
 ```
-┌──────────────────── 顶部工具栏（按钮排不下就换第二排）────────────────────────────────┐
-├──────────┬────────────────────────── 中央：面板树（可递归拆分）─────────────────────┤
-│ 侧栏     │  标签条 + 编辑器 / 终端面板…                                             │
-│ 文件     │                                                                          │
-│ 搜索     ├────────────────────────── 底部：状态栏 + 查找替换条 ─────────────────────┤
-│ 日志     │                                                                          │
-└──────────┴──────────────────────────────────────────────────────────────────────────┘
+┌──────────────── Top toolbar (wraps to a second row when it runs out of room) ─────────┐
+├──────────┬──────────────────── Centre: pane tree (recursively splittable) ───────────┤
+│ Sidebar  │  Tab strip + editor / terminal panes…                                      │
+│ Files    │                                                                            │
+│ Search   ├──────────────────── Bottom: status bar + find/replace bar ─────────────────┤
+│ Journal  │                                                                            │
+└──────────┴───────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **顶部工具栏**从左到右：`打开文件夹` `保存` `←` `→`（光标位置后退 / 前进）`新文件` `新文件夹` `侧栏` `折行` `终端` `+终端` `‖ 拆分` `═ 拆分` `快速打开` `全局搜索` `查找` `日志块`，右边那组是 `深色` / `浅色`（切主题）、`?`（快捷键设置）、`shell:` 下拉、`⚙`（终端设置）、字号 `- 14 +` 和工作区名。
-- **侧栏**三个页签：`文件`（文件树）、`搜索`（全局搜索结果）、`日志`（当前文件的日志块），`Ctrl+B` 显示或隐藏。
-- 窗口拖窄到一排装不下时，剩下的按钮换到第二排继续排，不会挤成一团、也不会把字叠着画；右边那组换排后照旧从右往左钉。工作区名太长就截断，鼠标悬浮看完整路径。
+- **Top toolbar**, left to right: `Open folder` `Save` `←` `→` (cursor history back / forward) `New file` `New folder` `Sidebar` `Wrap` `Terminal` `+Terminal` `‖ Split` `═ Split` `Quick open` `Project search` `Find` `Journal block`. The right-hand group is `Dark` / `Light` (theme), `?` (keybinding settings), the `shell:` dropdown, `⚙` (terminal settings), font size `- 14 +`, and the workspace name.
+- **Sidebar** has three tabs: `Files` (the tree), `Search` (project-wide results), `Journal` (blocks in the current file). `Ctrl+B` shows or hides it.
+- Narrow the window until one row no longer fits and the remaining buttons wrap onto a second row — they never squash together and text is never overdrawn. The right-hand group still anchors right-to-left after wrapping. A workspace name that is too long gets truncated; hover it for the full path.
 
-### 文件树
+### File tree
 
-`walkdir` 懒加载，默认隐藏 `.` 开头的条目。新建文件 / 文件夹有三个入口：工具栏按钮、文件树顶部按钮、任意条目的右键菜单；右键里还有「格式化」（只在文件上出现，且仅限 JSON / XML）、「重命名」（只在文件上出现）、「在资源管理器中显示」和「在此处打开终端」。根目录那一行的右键多两个开关：「显示隐藏文件」和「刷新」。
+Lazy-loaded with `walkdir`; dotfiles are hidden by default. Three entry points create a file or folder: the toolbar button, the button at the top of the tree, and the context menu on any entry. The context menu also offers "Format" (files only, JSON / XML only), "Rename" (files only), "Reveal in Explorer" and "Open terminal here". The root row's context menu adds "Show hidden files" and "Refresh".
 
-新建对话框弹出后输入框立刻拿到键盘焦点，直接敲文件名就行：`Enter` 创建、`Esc` 取消，不需要先点一下输入框。拼音 / 日文输入法也正常（见 [输入法](#输入法)）。
+When the create dialog opens, the input box has keyboard focus immediately — just type the name. `Enter` creates, `Esc` cancels; there is no need to click the box first. Pinyin and Japanese input methods work normally (see [Input methods](#input-methods)).
 
-「重命名」的输入框就画在这个条目原来那一行上，预填当前名字，`Enter` 落盘、`Esc` 取消，点别处等于确认。名字里带 `/ \ : * ? " < > |`、或者空串、`.`、`..`、撞上已有文件的都不落盘，提示写在文件树底部。**已经在标签页里打开的文件会跟着换路径**，未保存的改动存盘时写进新名字，不会又冒出一个旧名字的副本；快速打开的索引也一起重扫。目录暂不支持改名。
+The "Rename" box is drawn on the entry's own row, pre-filled with the current name: `Enter` commits, `Esc` cancels, clicking elsewhere commits. Names containing `/ \ : * ? " < > |`, empty names, `.` and `..`, and names that collide with an existing file are rejected with a message at the bottom of the tree — the original file is never touched. **Files already open in a tab follow the new path**, so unsaved changes are written to the new name instead of resurrecting a copy under the old one, and the quick-open index is rescanned. Renaming directories is not supported yet.
 
-「在此处打开终端」在焦点面板右侧切出一块新终端，shell 的工作目录就是这个条目所在的目录（点目录条目就是它自己），不动工具栏选的那个默认目录。
+"Open terminal here" splits a new terminal pane to the right of the focused pane, with the shell's working directory set to the folder you clicked (or the parent folder, for a file). It does not change the default directory chosen in the toolbar.
 
-文件树顶部有**搜索框**：输入名称或相对路径片段就扫描整个工作区（跳过 `.git` / `target` / `node_modules` 等目录），大小写不敏感，最多列 500 条；点文件直接打开，点目录会展开到它在树里的位置并退出搜索。结果按查询串缓存，连续打字不会每帧重新遍历目录。
+There is a **search box** at the top of the tree: type part of a name or relative path and it scans the whole workspace (skipping `.git` / `target` / `node_modules` and similar), case-insensitively, listing up to 500 hits. Click a file to open it; click a directory to expand the tree to its location and leave search mode. Results are cached per query string, so typing continuously does not re-walk the tree every frame.
 
-`Ctrl+P` 的「快速打开」走另一条路：工作区一打开就先建一份文件索引（上限 5 万条），输入按**子序列模糊匹配**打分排序，上下键选、`Enter` 打开。
+`Ctrl+P` "Quick open" takes a different path: the index is built once when the workspace opens (up to 50,000 entries), input is scored by **fuzzy subsequence match**, and you pick with the arrow keys and open with `Enter`.
 
-配色跟 shell 里 `ls --color` 一个思路：目录蓝、可执行文件绿、普通文件正文色（具体色值见 [文件树配色](#文件树配色)）。
+Colours follow the same idea as `ls --color` in a shell: directories blue, executables green, plain files in the body colour (exact values in [File tree colours](#file-tree-colours)).
 
-### 编辑
+### Editing
 
-行号、当前行高亮、syntect 语法高亮、`Ctrl+S` 保存、未保存标记、关闭前确认。同时最多开 40 个标签。
+Line numbers, current-line highlight, syntect grammar highlighting, `Ctrl+S` to save, unsaved markers, confirmation before closing. Up to 40 tabs at once.
 
-长行有两种看法，用工具栏的**「折行」**或 `Alt+Z` 切换，选中的那种会存进配置：
+Long lines have two display modes, toggled by the **Wrap** toolbar button or `Alt+Z`; the one you pick is saved to config:
 
-- **不折行**（默认）：长行按原样排到面板外面，底下出横向滚动条。行号栏画在滚动区**外面**，滚多远都钉在左边不动。按住左键拖选时，指针靠近视口左 / 右边缘 28pt 以内会自动把正文往反方向推（每帧 14pt），选区能一路圈到屏幕外。
-- **折行**：长行折进面板宽度，横向滚动条自己消失。一个逻辑行折成几个视觉行，行号和当前行底色跟着盖那几个视觉行，不会还按「一行一行高」往下排。
+- **No wrap** (default): long lines extend past the pane and a horizontal scrollbar appears below. The gutter is drawn *outside* the scroll area, so it stays pinned left however far you scroll. While drag-selecting with the left button held, moving the pointer within 28 pt of the viewport's left or right edge pushes the body the other way (14 pt per frame), so a selection can run off-screen.
+- **Wrap**: long lines fold into the pane width and the horizontal scrollbar goes away on its own. One logical line becomes several visual ones, and the line numbers plus the current-line background cover all of those visual rows instead of continuing to highlight "one row per line".
 
-跳转（全局搜索、查找替换、日志块前后跳、光标后退 / 前进）滚的是「那一行」，横向位置不动，免得跳一次行把水平滚动位置甩掉。
+Jumping (project search, find/replace, journal back/forward, cursor history) scrolls to *the line* and leaves the horizontal position alone, so a jump never throws away your horizontal scroll offset.
 
-字号用 `Ctrl` + `+` / `-`，只改编辑器和终端正文，不会把整个窗口一起缩放。
+Font size uses `Ctrl` + `+` / `-` and changes only the editor and terminal text — it does not zoom the whole window.
 
-### 查找与替换
+### Find and replace
 
-`Ctrl+F` 查找、`Ctrl+H` 替换，输入条固定在编辑区**底部**（状态栏上方）。键盘操作，不用离开输入框：
+`Ctrl+F` to find, `Ctrl+H` to replace. The input bar is pinned to the **bottom** of the editor area, above the status bar. It is keyboard-driven, so your hands stay in the input box:
 
-| 按键 | 在查找框里 | 在替换框里 |
+| Key | In the find box | In the replace box |
 |---|---|---|
-| `Enter` | 下一个匹配 | 替换当前并跳到下一个 |
-| `Shift+Enter` | 上一个匹配 | 上一个匹配 |
-| `Ctrl+Enter` | — | 全部替换 |
-| `Tab` | 切到替换框 | 切回查找框 |
-| `Esc` | 关闭查找栏 | 关闭查找栏 |
+| `Enter` | Next match | Replace current, then jump to next |
+| `Shift+Enter` | Previous match | Previous match |
+| `Ctrl+Enter` | — | Replace all |
+| `Tab` | Move to the replace box | Move back to the find box |
+| `Esc` | Close the find bar | Close the find bar |
 
-支持区分大小写、正则（替换串可用 `$1` `$2`）、上下跳转、单个替换、全部替换；所有匹配都高亮，当前项用橙色区分。
+Case sensitivity, regex (replacements may use `$1` `$2`), next/previous navigation, replace one, replace all. Every match is highlighted and the current one is marked in orange.
 
-**选词高亮**：鼠标选中一个词，全文所有相同词立刻用淡蓝底标出来（双击一次取整个词）。规则和查找栏一致——选中的词全小写就忽略大小写，含大写就精确匹配；选区正好覆盖一个完整单词时按词边界匹配，选 `id` 不会误标 `width` 里的 `id`；只圈到半截词（比如从 `foo_bar` 里选 `foo`）退回子串匹配。跨行、纯空白、超过 64 字符的选区不参与；命中封顶 2000 处，免得为一个单字母把全文扫穿。选词高亮和查找高亮是两套底色，叠在一起时查找优先。
+**Word occurrence highlight**: select a word with the mouse and every identical word in the file is immediately marked with a pale blue background (a double-click grabs the whole word). The rules match the find bar — an all-lowercase selection ignores case, a selection containing a capital matches exactly; when the selection covers a complete word, matching is word-bounded, so selecting `id` does not mark the `id` inside `width`; a partial selection (`foo` inside `foo_bar`) falls back to substring matching. Multi-line selections, whitespace-only selections and selections longer than 64 characters are ignored, and hits are capped at 2000 so a single letter does not scan the whole file. Occurrence highlighting and find highlighting use different backgrounds; where they overlap, find wins.
 
-### 全局搜索
+### Project-wide search
 
-`Ctrl+Shift+F`。优先调用 `rg --json` 并流式读取，边搜边显示；找不到 ripgrep 时回退内置扫描（`regex::bytes` + `memchr` 建行索引，跳过 `.git` / `target` / `node_modules` 等目录和二进制文件）。
+`Ctrl+Shift+F`. Runs `rg --json` and reads it as a stream, showing results as they arrive. When ripgrep cannot be found, it falls back to the built-in scanner (`regex::bytes` + `memchr` for line indexing, skipping `.git` / `target` / `node_modules` and binary files).
 
-结果统计显示命中数、耗时和用的哪个引擎，例如 `166 处结果 · 75 ms · ripgrep`。
+The summary line reports hit count, elapsed time and which engine ran, e.g. `166 results · 75 ms · ripgrep`.
 
-- 「位置」列窄，长路径会截断成 `a_very_long_directory_…`，悬浮在这一格上会浮出**完整绝对路径**
-- 拖动「位置」和「内容」之间的分隔线可以加宽列，宽度记在表格里保持住
-- 点任意一格直接打开对应文件并跳到命中行
+- The "Location" column is narrow, so long paths truncate to `a_very_long_directory_…`; hovering that cell reveals the **full absolute path**
+- Drag the divider between "Location" and "Content" to widen a column; the width sticks
+- Click any cell to open the file and jump to the matching line
 
-### 工作日志块
+### Journal blocks
 
-不是独立的任务数据库，而是**写在普通文本文件里**的一种约定格式，可以和正文混排、跟着文件走、用 git 管理：
+Not a separate task database — a convention **written into ordinary text files**, so it mixes with prose, travels with the file and is managed by git:
 
 ```
 ===================================================工作日志1 2026-11-01 13:09 [待处理]
@@ -164,31 +164,33 @@ cargo run -- src\app.rs                 # 启动并打开某个文件
 1、一段文字内容
 ```
 
-头部 = 51 个 `=` + 标题 + 空格 + `YYYY-MM-DD HH:MM` + 空格 + `[状态]`。
+The markers are Chinese and stay Chinese in the file: `工作日志` = "work log", `待处理` = "open", `已完成` = "done", and `1、` is the Chinese enumeration comma.
 
-- `Ctrl+J`（或顶栏「日志块」按钮、侧栏「日志」页签里的插入按钮）在光标处插入一个新块，光标落在 `1、` 后面，紧接着就能打字；插入后视图**留在原地**，文件里有大量折行长也不会被甩回顶部
-- `Ctrl+Alt+↑` / `Ctrl+Alt+↓` 在块之间前后跳转
-- `Ctrl+Alt+D` 切换当前块的 `[待处理]` ↔ `[已完成]`
-- 侧栏「日志」页签列出当前文件的所有块，点击跳转
+The header is 51 `=` characters + title + space + `YYYY-MM-DD HH:MM` + space + `[status]`.
 
-### 终端
+- `Ctrl+J` (or the `Journal block` toolbar button, or the insert button in the sidebar's `Journal` tab) inserts a new block at the cursor, which lands right after `1、` so you can start typing; the view **stays where it was**, so a file full of wrapped lines does not fling you back to the top
+- `Ctrl+Alt+↑` / `Ctrl+Alt+↓` jump between blocks
+- `Ctrl+Alt+D` toggles the current block between `[待处理]` (open) and `[已完成]` (done)
+- The sidebar's `Journal` tab lists every block in the current file; click one to jump
 
-`Ctrl+`` ` 聚焦终端面板（没有就新开一块），`Ctrl+Shift+`` ` 直接新开一块。文件树里右键某个目录（或目录里的文件）选「在此处打开终端」，新面板的 shell 直接开在那个目录里。
+### Terminal
 
-终端不是单独的底部面板，而是和编辑器一样是**面板树里的一块**：默认切在当前面板右侧，可以同时并排好几块，各跑各的 shell。顶部工具栏的 `shell:` 下拉框选的是「下一个新建终端用哪个 shell」，自动检测本机可用的 PowerShell 7 / Windows PowerShell / 命令提示符 / Git Bash / WSL；已经开着的终端不受影响。
+``Ctrl+` `` focuses a terminal pane (opening one if there is none), ``Ctrl+Shift+` `` always opens a new one. Right-clicking a folder in the file tree — or a file inside one — and choosing "Open terminal here" starts the new shell in that directory.
 
-终端有焦点时，`Tab`（补全）、方向键（历史 / 光标移动）、`Esc` 都由终端自己处理，不会被 egui 拿去切换控件焦点。鼠标拖选文字后：
+The terminal is not a dedicated bottom panel: it is **a pane in the same tree as the editor**. By default it splits to the right of the current pane, and you can line up several, each running its own shell. The `shell:` dropdown in the toolbar picks *which shell the next terminal uses*, auto-detecting PowerShell 7 / Windows PowerShell / cmd / Git Bash / WSL on your machine; already-open terminals are unaffected.
 
-- `Ctrl+C`：有选区就复制，没有选区照常发送中断（`^C`）
-- `Ctrl+V`：粘贴
-- `Ctrl+Shift+C` / `Ctrl+Shift+V`：复制 / 粘贴（与 Windows Terminal 一致）
-- 右键菜单里也有「复制」「粘贴」，`Ctrl+Insert` / `Shift+Insert` 同样可用
+When a terminal has focus, `Tab` (completion), the arrow keys (history / cursor movement) and `Esc` are handled by the terminal itself and are not stolen by egui to move widget focus. After selecting text with the mouse:
 
-选区按绝对行坐标记录，滚动回滚历史后仍指向原来的文字；复制中文等宽字符时不会把占位格算进去，行尾空白会裁掉。
+- `Ctrl+C` copies if there is a selection, otherwise sends the interrupt (`^C`) as usual
+- `Ctrl+V` pastes
+- `Ctrl+Shift+C` / `Ctrl+Shift+V` copy / paste (same as Windows Terminal)
+- The context menu offers Copy and Paste; `Ctrl+Insert` / `Shift+Insert` work too
 
-回滚历史：鼠标滚轮**一格 3 行**（走原始滚轮事件，触控板按 14 px 一行折算），只要有过期输出，面板右缘就有一条悬浮滚动条，拖滑块、单点轨道、滚轮都能用；它画在文字之上，不占排版宽度。往上翻过历史之后屏幕会钉在旧内容上（alacritty 的行为），此时只要敲一下键盘（粘贴进来的字符也算），视图就自动归位到最新一行。
+Selections are recorded in absolute row coordinates, so they still point at the same text after you scroll through the backlog. Copying CJK text does not drag along placeholder cells, and trailing whitespace is trimmed.
 
-自动探测不一定找得到（比如 Git Bash 没进 PATH）。工具栏 `⚙` 打开「终端设置」，给选中的 shell 单独指定**程序路径**和**启动参数**，留空就回到自动探测 / 内置参数，改动直接写进 `config.json`：
+Scrollback: the mouse wheel moves **3 rows per notch** (raw wheel events; trackpads are converted at 14 px per row). Whenever there is scrolled-back output, a floating scrollbar appears on the right edge of the pane — drag the thumb, click the track, or use the wheel. It is painted over the text and takes no layout width. Once you scroll up into history the screen stays pinned to the old content (alacritty's behaviour); pressing any key — even a pasted character — snaps the view back to the newest line.
+
+Auto-detection does not always find things (Git Bash missing from PATH, for example). `⚙` in the toolbar opens Terminal Settings, where you can give each shell its own **program path** and **startup arguments**; leave them empty to go back to auto-detection / built-in args. Changes are written straight into `config.json`:
 
 ```json
 {
@@ -198,89 +200,89 @@ cargo run -- src\app.rs                 # 启动并打开某个文件
 }
 ```
 
-种类 id 是 `pwsh` / `powershell` / `cmd` / `gitbash` / `wsl`；`terminal_args` 用空格分隔，带空格的参数用双引号包住。
+Shell ids are `pwsh` / `powershell` / `cmd` / `gitbash` / `wsl`; `terminal_args` is space-separated, quote arguments that contain spaces.
 
-### 分屏
+### Split panes
 
-中央区域是**一棵递归的二分面板树**，思路来自 tmux / i3：每块面板要么在看文件，要么在跑 shell，任意一块都能继续往右或往下切一刀，所以「左边写代码、右上一个终端、右下一个终端」是常态。
+The centre area is **a recursive binary pane tree**, in the tmux / i3 tradition: every pane is either looking at a file or running a shell, and any of them can be split again left/right or up/down — so "code on the left, one terminal top-right, another bottom-right" is the normal state, not a special case.
 
-默认键位**和 Windows Terminal 一致**：
+Default keys **match Windows Terminal**:
 
-| 按键 | 作用 |
+| Key | What it does |
 |---|---|
-| `Alt+Shift+D` | 自动拆分：当前面板宽就左右切、高就上下切，切完两块都更接近方形 |
-| `Alt+Shift++` / `Alt+Shift+-` | 向右 / 向下拆分 |
-| `Alt+←↑↓→` | 按几何位置聚焦左 / 上 / 下 / 右那块面板 |
-| `Ctrl+Shift+W` | 关闭当前面板（最外面那块不会被关掉，只退回空白面板） |
-| `Ctrl+Shift+Tab` / `Ctrl+Alt+Shift+Tab` | 循环聚焦下一块 / 上一块 |
+| `Alt+Shift+D` | Auto-split: vertical if the pane is wide, horizontal if it is tall, so both halves end up closer to square |
+| `Alt+Shift++` / `Alt+Shift+-` | Split right / split down |
+| `Alt+←↑↓→` | Focus the pane to the left / above / below / right, by geometry |
+| `Ctrl+Shift+W` | Close the current pane (the last one is never closed; it falls back to an empty pane) |
+| `Ctrl+Shift+Tab` / `Ctrl+Alt+Shift+Tab` | Cycle focus to the next / previous pane |
 
-拆的是**当前聚焦的那块面板**。编辑面板拆出来的新面板显示同一个文件，方便左右对比；终端面板拆出来的直接是一个新 shell。
+The split applies to **the currently focused pane**. Splitting an editor pane shows the same file in both, which is what you want for side-by-side comparison; splitting a terminal pane gives you a fresh shell.
 
-- 每块面板顶部有自己的标题条（文件名 + 未保存标记，或 `⌨ shell 标题`），右侧三个小按钮：`左右` `上下` 拆分、`×` 关闭
-- 右键标题条可以把这块面板**移到工作区最右 / 最左 / 最上 / 最下方**
-- 分割线可拖动，比例按当前像素换算，限制在 5%~95%
-- 鼠标点在哪块面板上就聚焦哪块
-- 标签是全局的（和 VSCode 一样）：关掉一块面板不会关掉标签，同一个标签也能同时出现在几块面板上，标题条上标 `×2`
+- Each pane has its own title bar (file name + unsaved marker, or `⌨ shell title`) with three small buttons on the right: split left/right, split up/down, and `×` to close
+- Right-click a pane's title bar to move it to the **far right / far left / top / bottom** of the workspace
+- Dividers are draggable; the ratio is computed from live pixel geometry and clamped to 5%–95%
+- Clicking a pane focuses it
+- Tabs are global (like VSCode): closing a pane does not close the tab, and the same tab can be visible in several panes at once, marked `×2` in the title bar
 
-> 和 WT 一样，`Alt+←` `Alt+→` 这些键在全局快捷键层就被吃掉了，不会转发给终端。Git Bash / WSL 里习惯用它们跳词的话，在 `F1` 里把 `focus_pane_left/right` 改成别的键或留空解绑。
+> As in Windows Terminal, `Alt+←` and friends are consumed at the global keybinding layer and never reach the terminal. If you rely on them for word-jumping in Git Bash / WSL, rebind or unbind `focus_pane_left/right` in `F1`.
 
-### 光标位置历史
+### Cursor position history
 
-像 IDEA 的 Navigate Back / Forward：`Ctrl+Alt+←` 回到上一个停留过的位置，`Ctrl+Alt+→` 再往前走。
+Like IDEA's Navigate Back / Forward: `Ctrl+Alt+←` returns to the previous position you rested on, `Ctrl+Alt+→` walks forward again.
 
-不是每按一下方向键就记一条——光标在某个位置**停够 350ms** 才算一个落脚点，这样连按方向键扫过十几行不会把历史刷爆。同一行里左右挪光标只更新偏移、不新增条目。历史上限 200 条，在历史中间又走了新路时后面的分支作废（和浏览器一致）。状态栏显示 `历史 ←3 →1`，工具栏的 `←` `→` 按钮也能点。
+Not every arrow press is recorded — the cursor has to **sit still for 350 ms** before a position counts as a stop, so raking through a dozen lines does not flood the history. Moving left/right within the same line updates the offset instead of adding an entry. History is capped at 200 entries, and taking a new route from the middle of history discards the branch ahead of you (same as a browser). The status bar shows the history depth (`历史 ←3 →1`, where `历史` is "history"), and the toolbar `←` `→` buttons are clickable.
 
-### 格式化
+### Formatting
 
-`Alt+Shift+F` 格式化**当前面板里的整个文件**：直接在 buffer 上改、标成未保存，按 `Ctrl+S` 才落盘，不会新开面板或新标签。文件树右键的「格式化」对 JSON / XML 有效：已打开的文件走上面这条路径，没打开就原地读、格式化、写回。支持 JSON（`serde_json`）和 XML（轻量 token 流缩进），按扩展名或内容特征判断格式；只读预览的大文件会明确拒绝而不是静默失败。
+`Alt+Shift+F` formats **the whole file in the current pane**: it edits the buffer directly, marks it unsaved, and only reaches the disk when you press `Ctrl+S`. It never opens a new pane or tab. "Format" in the file tree context menu works on JSON / XML: an already-open file goes through the path above, a closed one is read, formatted and written back in place. JSON (`serde_json`) and XML (lightweight token-stream indentation) are detected by extension or content signature. Read-only large-file previews are refused explicitly rather than failing silently.
 
-### 输入法
+### Input methods
 
-拼音 / 日文这类输入法在**新建文件对话框**、**文件树里的改名框**、**编辑器正文**、**终端**这几个地方都能正常打字。对话框和「快速打开」只在输入框真的没焦点时才要焦点（要焦点会顺手打断组字），组字期间的 `Enter` / `Esc` 归输入法（确认候选词 / 撤销组字），不会被误当成「创建文件」；快速打开的上下键同样让位给候选词翻页。终端那边则要把光标格作为输入法锚点报给系统，选定后的整串中文原样写进 PTY——不报锚点的话系统压根没把输入法关联到这个窗口。
+Pinyin and Japanese input work in the **new-file dialog**, the **rename box in the file tree**, the **editor body** and the **terminal**. The dialogs and Quick open request focus only when the input box genuinely does not have it (requesting focus interrupts an in-progress composition). While composing, `Enter` / `Esc` belong to the IME (commit candidate / cancel composition) and are not mistaken for "create the file"; the arrow keys in Quick open likewise yield to candidate paging. The terminal has to publish its cursor cell as the IME anchor and then write the whole committed string into the PTY — without the anchor, the system never associates the IME with this window at all.
 
-### 快捷键一览
+### Default keybindings
 
-全部可在 `F1` 里改，下表是默认值。
+Everything below is the default and everything is rebindable in `F1`.
 
-| 快捷键 | 功能 |
+| Key | Action |
 |---|---|
-| `Ctrl+O` | 打开文件夹 |
-| `Ctrl+S` / `Ctrl+Shift+S` | 保存 / 全部保存 |
-| `Ctrl+P` | 快速打开文件 |
-| `Ctrl+Shift+F` | 全局搜索 |
-| `Ctrl+F` / `Ctrl+H` | 当前文件查找 / 替换 |
-| `Ctrl+Alt+←` / `Ctrl+Alt+→` | 光标位置后退 / 前进 |
-| `Ctrl+N` / `Ctrl+Shift+N` | 新建文件 / 新建文件夹 |
-| `Ctrl+J` | 插入工作日志块 |
-| `Ctrl+Alt+↑` / `Ctrl+Alt+↓` | 上一个 / 下一个日志块 |
-| `Ctrl+Alt+D` | 切换日志块完成状态 |
-| `` Ctrl+` `` | 聚焦终端面板，没有就新开一块 |
-| `` Ctrl+Shift+` `` | 新建终端面板 |
-| `Ctrl+B` | 显示 / 隐藏侧栏 |
-| `Ctrl+W` | 关闭标签 |
-| `Ctrl+Shift+W` | 关闭当前面板 |
-| `Ctrl` + `+` / `-` | 字号（只动编辑器和终端正文） |
-| `Alt+Z` | 切换自动换行 |
-| `Alt+Shift+D` | 自动拆分当前面板 |
-| `Alt+Shift++` / `Alt+Shift+-` | 向右 / 向下拆分 |
-| `Alt+← / ↑ / ↓ / →` | 聚焦左 / 上 / 下 / 右侧面板 |
-| `Ctrl+Shift+Tab` / `Ctrl+Alt+Shift+Tab` | 下一个 / 上一个面板 |
-| `Alt+Shift+F` | 格式化（JSON / XML，只改 buffer） |
-| `F1` | 快捷键设置 |
-| `F12` | 截图，存到 `%APPDATA%\easy-editor\screenshot.bmp` |
+| `Ctrl+O` | Open folder |
+| `Ctrl+S` / `Ctrl+Shift+S` | Save / save all |
+| `Ctrl+P` | Quick open file |
+| `Ctrl+Shift+F` | Project-wide search |
+| `Ctrl+F` / `Ctrl+H` | Find / replace in the current file |
+| `Ctrl+Alt+←` / `Ctrl+Alt+→` | Cursor history back / forward |
+| `Ctrl+N` / `Ctrl+Shift+N` | New file / new folder |
+| `Ctrl+J` | Insert a journal block |
+| `Ctrl+Alt+↑` / `Ctrl+Alt+↓` | Previous / next journal block |
+| `Ctrl+Alt+D` | Toggle the journal block's done state |
+| `` Ctrl+` `` | Focus a terminal pane, opening one if needed |
+| `` Ctrl+Shift+` `` | New terminal pane |
+| `Ctrl+B` | Show / hide the sidebar |
+| `Ctrl+W` | Close tab |
+| `Ctrl+Shift+W` | Close the current pane |
+| `Ctrl` + `+` / `-` | Font size (editor and terminal text only) |
+| `Alt+Z` | Toggle word wrap |
+| `Alt+Shift+D` | Auto-split the current pane |
+| `Alt+Shift++` / `Alt+Shift+-` | Split right / split down |
+| `Alt+← / ↑ / ↓ / →` | Focus the left / top / bottom / right pane |
+| `Ctrl+Shift+Tab` / `Ctrl+Alt+Shift+Tab` | Next / previous pane |
+| `Alt+Shift+F` | Format (JSON / XML, buffer only) |
+| `F1` | Keybinding settings |
+| `F12` | Screenshot, saved to `%APPDATA%\easy-editor\screenshot.bmp` |
 
-### 改快捷键
+### Customizing keybindings
 
-`F1` 打开设置面板，点一下组合键，然后直接按下新的组合即可。
+`F1` opens the settings panel. Click a chord, then press the new combination.
 
-- `Esc` 取消录制，`Backspace` / `Delete` 解绑该动作
-- 撞车会标红提示「与「xxx」冲突」
-- 每项可以单独「重置」，也可以「全部恢复默认」
-- 只把改过的项写进 `config.json`，以后加新动作不会破坏老配置
+- `Esc` cancels recording; `Backspace` / `Delete` unbinds the action
+- Conflicts are highlighted in red with "conflicts with 'xxx'"
+- Each action can be reset individually, or you can restore all defaults
+- Only entries that differ from the defaults are written to `config.json`, so adding new actions later never corrupts old configs
 
-## 配置
+## Configuration
 
-字号、深浅主题、侧栏展开状态、侧栏页签、是否显示隐藏文件、是否折行、上次打开的工作目录、终端偏好、改过的快捷键，都自动存到 `%APPDATA%\easy-editor\config.json`，下次启动原样恢复；没写的字段走默认值（`word_wrap: false`，即长行横向滚动）。写盘有 600ms 防抖（拖字号时不会狂写磁盘），退出时再补一次。
+Font size, theme, sidebar visibility, active sidebar tab, hidden-file visibility, word wrap, last workspace, terminal preferences and your keybinding changes are stored automatically in `%APPDATA%\easy-editor\config.json` and restored on the next start. Fields that are not written fall back to defaults (`word_wrap: false`, i.e. long lines scroll sideways). Writes are debounced by 600 ms (so dragging the font size does not hammer the disk) and flushed once more on exit.
 
 ```json
 {
@@ -294,190 +296,190 @@ cargo run -- src\app.rs                 # 启动并打开某个文件
 }
 ```
 
-`keymap` 里只记和默认值不一样的项，可以手改。空串表示主动解绑；组合写法是 `Ctrl+Alt+Shift+键名`，键名大小写不敏感，方向键写 `Left`/`Right`/`Up`/`Down`，其余用 `Enter`、`Tab`、`Esc`、`F1`、`Backtick`、`Plus`、`A`、`0` 这种。
+`keymap` records only the entries that differ from the defaults, and you may hand-edit it. An empty string means "deliberately unbound". Chords are written `Ctrl+Alt+Shift+Key`; key names are case-insensitive, arrow keys are `Left`/`Right`/`Up`/`Down`, and everything else looks like `Enter`, `Tab`, `Esc`, `F1`, `Backtick`, `Plus`, `A`, `0`.
 
-**可选环境变量**
+**Optional environment variables**
 
-| 变量 | 作用 |
+| Variable | Effect |
 |---|---|
-| `EASY_EDITOR_RG` | 指定 `rg.exe` 的完整路径。不设的话先在 PATH 里找，再找本程序同目录；都没有就用内置扫描 |
-| `EASY_EDITOR_SHOT=1` | 启动后自动截一张图（调试用） |
-| `EASY_EDITOR_VERIFY=<脚本>` | 启动后自动跑一段脚本并截图：`split` / `word` / `nav` / `enter` / `keys` / `findflow` / `insert` / `replace`（调试用，旧前缀 `CODE_EASY_*` 仍兼容） |
+| `EASY_EDITOR_RG` | Full path to `rg.exe`. Otherwise PATH is searched first, then the program's own directory; if neither has it, the built-in scanner runs |
+| `EASY_EDITOR_SHOT=1` | Take one screenshot right after startup (debugging) |
+| `EASY_EDITOR_VERIFY=<script>` | Run a scripted interaction and screenshot after startup: `split` / `word` / `nav` / `enter` / `keys` / `findflow` / `insert` / `replace` (debugging; the legacy `CODE_EASY_*` prefix still works) |
 
-## 技术栈
+## Tech stack
 
-| 用途 | 库 |
+| Purpose | Library |
 |---|---|
-| 窗口框架 | `eframe` 0.37（关掉默认 wgpu，走 `glow` 后端） |
+| Windowing | `eframe` 0.37 (default wgpu disabled, `glow` backend) |
 | UI | `egui` 0.37 / `egui_extras` 0.37 |
-| 代码高亮 | `syntect` 5.3 |
-| 文件树 | `walkdir` 2.5 |
-| 终端 | `alacritty_terminal` 0.26 + `portable-pty` 0.9 |
-| 全局搜索 | 外部 `ripgrep` 二进制，缺失时回退 `regex` 1 + `memchr` 2 的内置扫描 |
-| 中文宽度 | `unicode-width` 0.2 |
-| 配置 / 序列化 | `serde` 1 + `serde_json` 1 |
-| 时间戳 | `chrono` 0.4 |
-| 原生文件对话框 | `rfd` 0.15 |
-| Windows 标题栏配色 | `raw-window-handle` 0.6 + `DwmSetWindowAttribute` |
-| exe 图标与属性页 | `winresource` 0.1（build 依赖） |
+| Syntax highlighting | `syntect` 5.3 |
+| File tree | `walkdir` 2.5 |
+| Terminal | `alacritty_terminal` 0.26 + `portable-pty` 0.9 |
+| Project search | External `ripgrep` binary, falling back to `regex` 1 + `memchr` 2 |
+| East Asian widths | `unicode-width` 0.2 |
+| Config / serialization | `serde` 1 + `serde_json` 1 |
+| Timestamps | `chrono` 0.4 |
+| Native file dialogs | `rfd` 0.15 |
+| Windows title bar colours | `raw-window-handle` 0.6 + `DwmSetWindowAttribute` |
+| exe icon and version info | `winresource` 0.1 (build dependency) |
 
-界面全部是即时模式 GUI：没有 QSS / CSS，没有 webview，控件状态存在 `egui::Id` 关联的 state 里。渲染走 glow（OpenGL），重绘是按需的——没有终端在跑、也没有光标在闪的时候，静止的界面不再画新帧。
+Everything is immediate-mode GUI: no QSS, no CSS, no webview. Widget state lives in states keyed by `egui::Id`. Rendering goes through glow (OpenGL) and repaints are on demand — with no terminal running and no cursor blinking, a still interface does not draw new frames.
 
-## 代码结构
+## Code layout
 
-约 13200 行 Rust，单个 binary crate，17 个模块：
+About 13,000 lines of Rust in a single binary crate, 17 modules:
 
-| 文件 | 职责 |
+| File | Responsibility |
 |---|---|
-| `src/main.rs` | 入口、`windows_subsystem`、窗口构建与图标 |
-| `src/app.rs` | 应用主体：布局、快捷键、打开 / 保存、全局搜索、查找替换、日志块、终端调度 |
-| `src/pane.rs` | tmux 风格的递归二分面板树（`Leaf` / `Split`），只管布局不管内容 |
-| `src/editor.rs` | 编辑器控件：行号 + 高亮 + 编辑 + 跳转 + 大文件只读虚拟渲染 + 覆盖层绘制 |
-| `src/terminal.rs` | PTY 读写、VT 解析、键盘鼠标事件路由、选区与滚动条 |
-| `src/filetree.rs` | 目录树、懒加载、文件搜索、类型配色 |
-| `src/find.rs` | 当前文件内查找替换（匹配位置统一用字节偏移） |
-| `src/search.rs` | 全局搜索：ripgrep 优先，内置扫描兜底 |
-| `src/journal.rs` | 工作日志块的解析与插入 |
-| `src/nav.rs` | 光标位置历史 |
-| `src/format.rs` | JSON / XML 格式化 |
-| `src/keymap.rs` | 可配置快捷键：动作 id、序列化、冲突检测 |
-| `src/config.rs` | 配置读写与防抖 |
-| `src/theme.rs` | 字体、配色、中英文基线推导 |
-| `src/syntax.rs` | syntect 高亮，按行缓存成 egui 着色片段 |
-| `src/ime.rs` | 输入法组字状态判断、锚点处理 |
-| `src/titlebar.rs` | 系统标题栏配色（仅 Windows） |
+| `src/main.rs` | Entry point, `windows_subsystem`, window builder and icon |
+| `src/app.rs` | The application itself: layout, keybindings, open/save, project search, find/replace, journal blocks, terminal dispatch |
+| `src/pane.rs` | tmux-style recursive binary pane tree (`Leaf` / `Split`); layout only, no content |
+| `src/editor.rs` | The editor widget: line numbers + highlighting + editing + jumping + read-only virtual rendering for large files + overlay painting |
+| `src/terminal.rs` | PTY I/O, VT parsing, keyboard/mouse routing, selection and scrollbar |
+| `src/filetree.rs` | Directory tree, lazy loading, file search, type colours |
+| `src/find.rs` | Find/replace within the current file (match positions are byte offsets) |
+| `src/search.rs` | Project-wide search: ripgrep first, built-in scanner as the fallback |
+| `src/journal.rs` | Journal block parsing and insertion |
+| `src/nav.rs` | Cursor position history |
+| `src/format.rs` | JSON / XML formatting |
+| `src/keymap.rs` | Configurable keybindings: action ids, serialization, conflict detection |
+| `src/config.rs` | Config read/write with debouncing |
+| `src/theme.rs` | Fonts, colours, CJK baseline derivation |
+| `src/syntax.rs` | syntect highlighting, cached per line into egui galley spans |
+| `src/ime.rs` | IME composition state, anchor handling |
+| `src/titlebar.rs` | System title bar colours (Windows only) |
 
-## 构建、测试与打包
+## Build, test and packaging
 
-### 日常命令
-
-```bash
-cargo check                             # 只做类型检查，最快
-cargo test                              # 118 个单元测试
-cargo build                             # 调试构建 → target/debug/easy-editor.exe
-cargo build --release                   # 发布构建 → target/release/easy-editor.exe
-cargo clippy --all-targets              # 需要 rustup component add clippy
-cargo fmt --check                       # 需要 rustup component add rustfmt
-```
-
-发布构建走 `windows_subsystem = "windows"`（见 `src/main.rs` 首行），双击运行不带控制台窗口。
-
-测试覆盖面板树、快捷键解析、日志块解析、格式化、标题栏配色、图标构图、终端滚动与选区、高亮底色对齐、边缘自动横向滚动、输入法锚点等。其中一批是**无头界面测试**：用 `Context::run_pass` 喂构造好的输入事件序列，检查产出的图层和 `PlatformOutput`，不需要真的开一个窗口，所以在没人盯着的机器上也能一次跑完。
+### Daily commands
 
 ```bash
-cargo test --bin easy-editor            # 这是个 binary crate，没有 lib target
-cargo test -- --ignored --nocapture     # 附带一个真起 cmd.exe PTY 的终端端到端测试
+cargo check                             # type checking only, fastest
+cargo test                              # 118 unit tests
+cargo build                             # debug build → target/debug/easy-editor.exe
+cargo build --release                   # release build → target/release/easy-editor.exe
+cargo clippy --all-targets              # requires rustup component add clippy
+cargo fmt --check                       # requires rustup component add rustfmt
 ```
 
-### 打发布包
+Release builds use `windows_subsystem = "windows"` (first line of `src/main.rs`), so double-clicking the exe does not spawn a console.
+
+Tests cover the pane tree, keybinding parsing, journal block parsing, formatting, title bar colours, icon composition, terminal scrolling and selection, highlight background alignment, edge auto-scroll, IME anchors and more. A batch of them are **headless UI tests**: they feed a constructed sequence of input events through `Context::run_pass` and inspect the resulting layers and `PlatformOutput`. No window is ever opened, so the whole suite runs unattended in one go.
+
+```bash
+cargo test --bin easy-editor            # this is a binary crate, there is no lib target
+cargo test -- --ignored --nocapture     # one end-to-end terminal test that really spawns a cmd.exe PTY
+```
+
+### Release packages
 
 ```bash
 mkdir -p dist/EasyEditor
-cp target/release/easy-editor.exe dist/EasyEditor/EasyEditor.exe   # 和窗口标题保持一致
-cp README.md README.en-US.md LICENSE dist/EasyEditor/
+cp target/release/easy-editor.exe dist/EasyEditor/EasyEditor.exe   # keep it identical to the window title
+cp README.md README.zh-CN.md LICENSE dist/EasyEditor/
 powershell -NoProfile -Command "Compress-Archive -Path dist\EasyEditor -DestinationPath dist\EasyEditor-0.2.2-windows-x64.zip -Force"
 ```
 
-带 `rg.exe` 的那档把 `rg.exe` 和 `THIRD-PARTY-NOTICES.txt` 也放进 `dist\EasyEditor\` 再压一次，后缀写 `-with-rg`；两个包各配一份 `.sha256.txt`。
+For the `-with-rg` variant, drop `rg.exe` and `THIRD-PARTY-NOTICES.txt` into `dist\EasyEditor\` and compress again. Each package gets its own `.sha256.txt`.
 
-> 别用 `tar -a -cf xxx.zip`：Git Bash 里那个 `tar` 是 GNU tar，`-a` 只认 gzip/bzip2/xz，后缀写 `.zip` 也只会吐一个纯 tar 包，Windows 双击打不开。
+> Do not use `tar -a -cf xxx.zip`: the `tar` in Git Bash is GNU tar, and its `-a` only understands gzip/bzip2/xz. With a `.zip` suffix it still emits a plain tar archive, which Windows will not open on double-click.
 
-### 应用图标
+### App icon
 
-唯一源文件是 `assets/easy-editor.svg`（1024 栅格，配色跟着编辑器的 base16-ocean 深色主题）。改完重新生成：
+The single source of truth is `assets/easy-editor.svg` (1024 grid, colours taken from the editor's base16-ocean dark theme). Regenerate after editing:
 
 ```bash
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/render-icon.ps1
 ```
 
-脚本只用本机 Chrome/Edge 无头截图渲一张 1024 母图，其余档位（16/24/32/48/64/128 和运行时用的 256）由 `tools/make-ico.mjs` 从母图按面积加权缩小，再拼成 `assets/easy-editor.ico`（小尺寸是传统 32bpp DIB + 1bpp AND 掩码，256 那档塞 PNG，脚本自己编码，不依赖任何库）。中间产物落在 `assets/build/`，不进版本库；`.ico` 和 `easy-editor-256.png` 要提交。
+The script uses a headless Chrome/Edge screenshot to render one 1024 master image; every other size (16/24/32/48/64/128 plus the 256 used at runtime) is downscaled from that master by area-weighted sampling in `tools/make-ico.mjs`, then assembled into `assets/easy-editor.ico` (small sizes are classic 32bpp DIB + 1bpp AND mask, the 256 slot carries a PNG, and the script encodes both itself with no library dependencies). Intermediates land in `assets/build/` and are not versioned; `assets/easy-editor.ico` and `easy-editor-256.png` are committed.
 
-两份图标管的地方不一样：
+The two icons cover different surfaces:
 
-- `assets/easy-editor.ico` 由 `build.rs`（build 依赖 `winresource`）编进 exe 的 PE 资源，管资源管理器、快捷方式；
-- `assets/easy-editor-256.png` 由 `src/main.rs` 用 `include_bytes!` 打进去，运行时交给 `ViewportBuilder::with_icon`，管标题栏和任务栏按钮。
+- `assets/easy-editor.ico` is compiled into the exe's PE resources by `build.rs` (build dependency `winresource`) and drives Explorer and shortcuts;
+- `assets/easy-editor-256.png` is embedded into `src/main.rs` with `include_bytes!`, handed to `ViewportBuilder::with_icon` at runtime, and drives the title bar and taskbar button.
 
-`winresource` 只有显式调用才写 manifest，这里没调用，所以 DPI 感知和链接期默认值跟没加图标时一致；它顺带把 `Cargo.toml` 的版本号写进 exe 属性页。资源管理器换图标靠图标缓存，本机看不到变化时可以 `ie4uinit.exe -show` 或换个文件名试。
+`winresource` only writes a manifest when explicitly asked, and this build does not ask, so DPI awareness and the linker defaults are exactly the same as without an icon; it does write the `Cargo.toml` version into the exe's properties page. Explorer picks up a new icon through the icon cache — if nothing changes locally, run `ie4uinit.exe -show` or try a different file name.
 
-## 已知限制
+## Known limitations
 
-- **只在 Windows 10 / 11 x64 上日常使用过。** 代码里 Windows 专属的部分（系统标题栏配色、exe 资源、控制台开关）都有 `#[cfg(windows)]` 包着，其他平台理论上能编译，但没人验证过。
-- 终端的 shell 自动探测覆盖 PowerShell 7 / Windows PowerShell / cmd / Git Bash / WSL，探测不到就在「终端设置」里手填路径。
-- 只读虚拟渲染的大文件（> 1 MB 或 > 20000 行）既不折行也不能横向滚动，长行要看全只能拖宽面板；这类文件也会拒绝格式化。
-- 超过 16 MB 的文件直接拒绝打开，状态栏给提示。
-- 中文等宽字符的宽度依赖 `unicode-width` + 微软雅黑，换别的字体时中英基线对齐参数（见 [实现手记](#中英文基线)）可能要重算。
-- 没有插件系统、没有 LSP、没有 Git 集成。刻意不做：这是一个自己日常用着顺手的编辑器，不是平台。
+- **Only Windows 10 / 11 x64 has been used day to day.** Windows-specific code (system title bar colours, exe resources, console switches) is wrapped in `#[cfg(windows)]`; other platforms should compile, but nobody has verified them.
+- Terminal shell auto-detection covers PowerShell 7 / Windows PowerShell / cmd / Git Bash / WSL. If it misses one, set the path by hand in Terminal Settings.
+- Large files rendered in read-only virtual mode (> 1 MB or > 20,000 lines) neither wrap nor scroll horizontally — widen the pane to see a long line. These files also refuse formatting.
+- Files over 16 MB are refused outright, with a message in the status bar.
+- CJK glyph widths depend on `unicode-width` plus Microsoft YaHei; switch fonts and the baseline alignment parameters (see [CJK baseline](#cjk-baseline)) probably need recomputing.
+- No plugin system, no LSP, no Git integration. Deliberately so: this is an editor someone uses every day, not a platform.
 
-## 实现手记（踩过的坑）
+## Implementation notes
 
-这一节记的是「为什么代码长这样」。都是实际问题，改相关代码前值得先看一眼。
+This section records *why the code looks the way it does*. Every entry is a real problem — worth a read before touching the related code.
 
-### 中英文基线
+### CJK baseline
 
-代码区所有文本统一 `line_height = 1.32 × 字号`，并给中文字体加 `FontTweak::y_offset_factor` 校正基线。
+All text in the code area uses `line_height = 1.32 × font size`, and the Chinese font carries a `FontTweak::y_offset_factor` to correct its baseline.
 
-因为 egui 按**字形所属字体自己的 ascent** 定位基线：Consolas 是 0.7427 em，微软雅黑是 1.0581 em，14px 下中文会下沉约 4.4px，看起来就是「英文贴顶、中文掉底」。而且只要某行含中文，该行行高会被撑大，又让同一行里的英文继续下移，导致纯英文行和混排行的基线还不一致。完整推导写在 `src/theme.rs` 顶部注释里。
+egui positions a glyph's baseline from **the ascent of the font that glyph resolved to**: Consolas is 0.7427 em, Microsoft YaHei is 1.0581 em. At 14 px Chinese sinks about 4.4 px, which reads as "Latin hugs the top, Chinese falls to the bottom". Worse, any line containing Chinese gets a taller line height, which pushes the Latin on that same line down again — so pure-Latin lines and mixed lines end up on different baselines. The full derivation is in the comment block at the top of `src/theme.rs`.
 
-### 命中高亮的底色不能用 `TextFormat::background`
+### Match highlight rectangles must not use the text format background
 
-egui 那个矩形是按「基线 − 主字体 ascent」往下数一个行高画的，而主字体（Consolas）的 ascent 比中文矮一截，实测 14 号字英文行低 0.9pt、中文行低 4.9pt，整条高亮压在下一行头上。现在改成排版完直接往每个视觉行的网格里插矩形（`editor.rs::paint_overlay`），坐标是行内的 `0 … 行高`，和字体 ascent 再无关系；插入位置排在字形三角形之前，只会盖住行、不会盖住字。跨行命中（折行、选区含换行）逐行各插一块。
+egui draws that rectangle one line-height below "baseline minus the primary font's ascent", and the primary font (Consolas) has a noticeably shorter ascent than the Chinese font. Measured at size 14, the rectangle sits 0.9 pt low on Latin lines and 4.9 pt low on Chinese lines, so the whole highlight lands on top of the next line. It is now inserted per visual row into the layout grid after galleys are built (`editor.rs::paint_overlay`), with coordinates `0 … line_height` inside the row — no longer related to any font ascent. Insertion happens before the glyph triangles, so it covers the row but never the text. Multi-line matches (wrapped lines, selections containing newlines) get one rectangle per row.
 
-### 单行 `TextEdit` 收到 `Enter` 会自己丢焦点
+### A single-line TextEdit drops focus when it receives Enter
 
-所以等控件返回后再判断 `has_focus()` 永远是 `false`，查找栏的快捷键会静默失效。做法是在 `TextEdit` **之前**把按键从事件队列里 `consume` 掉，焦点就不会丢。
+So checking `has_focus()` after the widget returns is always `false`, and the find bar's shortcuts fail silently. The fix is to `consume` the key from the event queue **before** the `TextEdit`, which keeps focus intact.
 
-### `request_focus` 会顺手打断输入法组字
+### Requesting focus interrupts IME composition
 
-egui 的 `Memory::request_focus` 文档里明写了它会 `interrupt_ime`。两件事由此而来：
+egui's `Memory::request_focus` documents that it calls `interrupt_ime`. Two consequences:
 
-- 对话框和「快速打开」必须**只在输入框没焦点时**才 `request_focus`，每帧无脑调用会让拼音候选串刚出来就被清空，中文根本填不进去（`ime::focus_input_box`）。
-- 拖选时 egui 每一帧都会对已聚焦的 `TextEdit` 调一次 `request_focus`，顺带置位「打断组字」；egui-winit 收到就 `set_ime_allowed(false)` 紧跟 `(true)`，等于每帧把输入法上下文从窗口卸下再挂回来——现象是任务栏输入法图标一闪一闪。按住鼠标这段时间本来也不打字，所以拖选的每一帧干脆不报输入法锚点，松手那一帧它自己就回来了（`ime::hide_ime_anchor_while_pointer_held`）。
+- Dialogs and Quick open must call `request_focus` **only when the box does not have focus**. Calling it unconditionally every frame clears the pinyin candidate string as soon as it appears, and Chinese simply cannot be typed (`ime::focus_input_box`).
+- While drag-selecting, egui calls `request_focus` on the already-focused `TextEdit` every frame, which also flags "interrupt composition". egui-winit responds with `set_ime_allowed(false)` immediately followed by `(true)` — the IME context is detached from the window and reattached every single frame, which shows up as the taskbar IME icon flickering. You are not typing while holding the mouse button anyway, so those frames simply do not publish an IME anchor, and it comes back on its own the frame you release (`ime::hide_ime_anchor_while_pointer_held`).
 
-### 焦点要等 `TextEdit` 自己 interact 完再要
+### Ask for focus after TextEdit has interacted
 
-点顶栏「日志块」这类按钮的那一帧，既有鼠标点击、鼠标又不在正文上，egui 的 `interact` 会对「点了别处」的那个已聚焦控件 `surrender_focus`。在 `ui.add(editor)` 之前要来的焦点会被当场抹掉，表现为块插进去了、光标却没了、字也打不了。所以插入后设光标 / 选区的 `request_focus` 必须排在 `ui.add` 之后。
+On the frame you click a button such as `Journal block` in the toolbar, there is both a mouse click and a pointer that is not over the text, so egui's `interact` calls `surrender_focus` on the previously focused widget it did not hit. Focus requested before `ui.add(editor)` is erased in the same frame: the block gets inserted, but the cursor is gone and you cannot type. The `request_focus` that sets the caret or selection after insertion must therefore run after `ui.add`.
 
-### 终端必须自己报输入法锚点
+### The terminal must publish its own IME anchor
 
-egui 只在 `TextEdit` 有焦点时才发布 `PlatformOutput.ime`。终端不是 `TextEdit`，不主动报锚点的话 `allow_IME` 就是 `false`，winit 直接把输入法上下文从窗口卸掉，敲进去只剩一串原始拼音字母。现在终端把光标那一格作为 `IMEOutput`（`purpose = Terminal`）报出去，并把 `ImeEvent::Commit` 的整串写进 PTY。
+egui only publishes `PlatformOutput.ime` while a `TextEdit` has focus. The terminal is not a `TextEdit`; without an explicit anchor, `allow_IME` stays `false`, winit detaches the IME context from the window, and everything you type arrives as raw pinyin letters. The terminal now reports its cursor cell as an `IMEOutput` (`purpose = Terminal`) and writes the whole `ImeEvent::Commit` string into the PTY.
 
-> `set_ime_purpose` 在 Windows 上是 no-op，报不报 `Terminal` 只影响别的平台，但报锚点这件事本身在所有平台都是必需的。
+> `set_ime_purpose` is a no-op on Windows, so reporting `Terminal` only matters on other platforms — but publishing an anchor at all is required everywhere.
 
-### alacritty 会把你钉在回滚历史里
+### Alacritty pins you to scrollback
 
-`display_offset > 0` 时新输出全进滚动缓冲、可视区一动不动。不主动归位的话，翻过历史的人会看到屏幕上一直杵着旧内容、敲了命令也不消失。现在只要往 PTY 写了东西就 `scroll_display(Scroll::Bottom)`。
+While `display_offset > 0`, all new output goes into the scroll buffer and the viewport does not move. If nothing resets it, anyone who scrolled up sees stale content sitting on screen while commands run underneath. Anything written to the PTY now triggers `scroll_display(Scroll::Bottom)`.
 
-### 面板聚焦按坐标命中，不靠点击冒泡
+### Pane focus is hit-tested by geometry, not by click bubbling
 
-egui 里容器自己的响应区在子控件**下面**，点在 `TextEdit` 上的点击永远不会传到面板背景。所以「点哪块面板就聚焦哪块」是自己按矩形算的。
+In egui a container's own response area sits *behind* its children, so a click on a `TextEdit` never reaches the pane background. "Click a pane, focus that pane" is therefore computed from rectangles by hand.
 
-### `Ctrl+=` 撞了 egui 的整窗缩放
+### The zoom shortcut collided with egui's whole-window zoom
 
-egui 自带 `Ctrl+=` / `Ctrl+-` / `Ctrl+0` 改 `zoom_factor`（整个界面跟着变大），和本应用的字号快捷键撞车：撞车时放大走了整窗缩放、缩小只动字号，界面卡在放大状态回不去。`bootstrap` 里把 `Options::zoom_with_keyboard` 关了，字号缩放只影响编辑器和终端正文，整窗缩放交给系统 DPI。另外 `+` 和 `=` 在键盘上是同一个物理键，归属判断按物理键走（`keymap::same_physical_key`）。
+egui ships `Ctrl+=` / `Ctrl+-` / `Ctrl+0` that change `zoom_factor` (the entire UI scales), which clashes with this app's font size binding: zooming in went through whole-window scaling while zooming out only moved the font size, leaving the interface stuck enlarged. `bootstrap` now sets `Options::zoom_with_keyboard` to false — font size affects only the editor and terminal text, and whole-window scaling is left to system DPI. Also, `+` and `=` share one physical key, so the comparison is done on the physical key (`keymap::same_physical_key`).
 
-### 系统标题栏得自己刷
+### The system title bar has to be repainted by hand
 
-最小化 / 最大化 / 关闭那一行由 Windows 的 DWM 画，egui 管不到。`winit` 只在**建窗时**按当时的主题给 uxtheme 打标记，用的又不是 DWM 认的那个属性，于是标题栏底色和按钮字形会各跟一套配色：浅色底压白字时按钮整个看不见，切主题也不会跟着变。所以 `src/titlebar.rs` 在启动和每次切主题时补发三个 `DwmSetWindowAttribute`：`USE_IMMERSIVE_DARK_MODE`（决定按钮字形取亮色还是暗色）、`CAPTION_COLOR`、`TEXT_COLOR`。底色取 `theme::panel_fill`，和顶栏同一个值，标题栏与工具栏之间看不出接缝。后两个属性要 Windows 11 22000+，老系统调用失败就忽略，只留深色开关。
+The minimize / maximize / close row is drawn by the Windows DWM, which egui does not reach. `winit` only flags uxtheme **at window creation** using the theme of that moment, and it uses an attribute the DWM does not consult — so the title bar background and the button glyphs end up following two different palettes: white glyphs on a light background make the buttons invisible, and switching themes does not update them. `src/titlebar.rs` therefore re-sends three `DwmSetWindowAttribute` calls at startup and on every theme switch: `USE_IMMERSIVE_DARK_MODE` (which decides whether button glyphs take the light or dark variant), `CAPTION_COLOR` and `TEXT_COLOR`. The background comes from `theme::panel_fill`, the same value as the toolbar, so there is no visible seam between title bar and toolbar. The last two attributes require Windows 11 22000+; on older systems the calls fail and are ignored, leaving only the dark-mode switch.
 
-### 文件树配色
+### File tree colours
 
-跟 shell 里 `ls --color` 一个思路：
+Same idea as `ls --color` in a shell:
 
-| 类型 | 浅色主题 | 深色主题 |
+| Type | Light theme | Dark theme |
 |---|---|---|
-| 目录 | 深蓝 `#0B62C4` | 亮蓝 `#6CB6FF` |
-| 可执行文件 | 深绿 `#117A3D` | 亮绿 `#7EE787` |
-| 普通文件 | 正文色 | 正文色 |
+| Directory | Deep blue `#0B62C4` | Bright blue `#6CB6FF` |
+| Executable | Deep green `#117A3D` | Bright green `#7EE787` |
+| Plain file | Body colour | Body colour |
 
-可执行文件按扩展名判定（`.exe` `.bat` `.cmd` `.com` `.ps1` `.msi` `.scr` `.vbs` `.sh`），类 Unix 下再看执行位。
+Executables are decided by extension (`.exe` `.bat` `.cmd` `.com` `.ps1` `.msi` `.scr` `.vbs` `.sh`); on Unix-like systems the executable bit is checked too.
 
-### 图标的小尺寸不能用 Chrome 逐档截
+### Small icon sizes cannot be captured by Chrome directly
 
-Chrome 无头截图在小窗口下不可靠：`--window-size=128,128`、`160,160` 稳定截出全透明的空图，`256,256` 会把整张画往右推、右边裁掉——标题栏和任务栏拿到这种图就是「图标只剩一半」。所以只让它出一张 1024 母图，其余档位全部本地缩放。`tools/render-icon.ps1` 出图后量不透明区的四边留边，`src/main.rs` 的 `window_icon_is_centered_and_not_clipped` 再盯一遍嵌进二进制的那份，构图歪了或被裁了测试直接红。
+Headless Chrome is unreliable at small window sizes: `--window-size=128,128` and `160,160` consistently produce fully transparent output, and `256,256` shifts the whole drawing right and clips it — hand the title bar or taskbar such an image and you get "half an icon". So Chrome renders only the 1024 master and every other size is scaled locally. `tools/render-icon.ps1` measures the opaque region's margins after rendering, and `window_icon_is_centered_and_not_clipped` in `src/main.rs` re-checks the copy embedded in the binary — off-centre composition or clipping turns the test red.
 
-## 贡献与许可
+## Contributing and license
 
-- 发现 bug、想要某个键位默认值不一样、或者觉得哪段说明写得不清不楚，欢迎开 [Issue](https://github.com/PBlueSky/easy-editor/issues)。
-- 提 PR 前请跑一遍 `cargo test` 和 `cargo clippy --all-targets`；改行为的地方尽量配一个上面说的那种无头界面测试。
+- Found a bug, want a different default chord, or think a passage of this document is unclear? Open an [Issue](https://github.com/PBlueSky/easy-editor/issues).
+- Before sending a PR, run `cargo test` and `cargo clippy --all-targets`; where behaviour changes, add one of those headless UI tests.
 
-MIT，见 [LICENSE](LICENSE)。
+MIT, see [LICENSE](LICENSE).
