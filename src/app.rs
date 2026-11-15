@@ -3691,6 +3691,7 @@ impl EasyEditorApp {
         self.help_window(&ctx);
         self.terminal_settings_window(&ctx);
         self.database.manager_window(&ctx);
+        self.results.show_popup(&ctx);
 
         // 编辑器在 central() 里才会把最新光标写回 OpenFile，所以放在最后收
         self.poll_caret(&ctx);
@@ -5914,6 +5915,49 @@ mod tests {
             app.tabs[idx].text.contains("[待执行]"),
             "只跑了块里挑出来的一段，整块还不算执行完：{}",
             app.tabs[idx].text
+        );
+    }
+
+    #[test]
+    fn zooming_a_result_opens_its_own_window() {
+        let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_zoom");
+        app.sql_run();
+        settle_results(&mut app, &ctx);
+        let out = frame(&mut app, &ctx, vec![]);
+        let mut buttons = seen(&out)
+            .into_iter()
+            .filter(|(t, _)| t == "放大")
+            .map(|(_, r)| r.center())
+            .collect::<Vec<_>>();
+        assert_eq!(buttons.len(), 2, "两份查询结果都该能单独放大");
+        buttons.sort_by(|a, b| a.y.total_cmp(&b.y));
+
+        frame(&mut app, &ctx, pointer(buttons[0], egui::PointerButton::Primary, true));
+        frame(&mut app, &ctx, pointer(buttons[0], egui::PointerButton::Primary, false));
+        // 新窗口头几帧只在量尺寸、摆位置，尺寸落定才轮到画内容
+        frame(&mut app, &ctx, vec![]);
+        let out = frame(&mut app, &ctx, vec![]);
+        let shown = texts(&out);
+        assert!(
+            shown.contains(&"结果 · 查用户".to_string()),
+            "放大窗口没开：{shown:?}"
+        );
+        // 窗口和底部面板看的是同一份数据：列头一共三份（底部两块 + 窗口一块）
+        assert_eq!(
+            shown.iter().filter(|t| t.as_str() == "id").count(),
+            3,
+            "窗口里该另起一份网格"
+        );
+        assert!(
+            shown.iter().any(|t| t == "收起"),
+            "开着的那块按钮要改口，不然看着像没反应"
+        );
+
+        // 一次点击只记一帧的账，窗口得在后面的帧里一直留着
+        let out = frame(&mut app, &ctx, vec![]);
+        assert!(
+            texts(&out).contains(&"结果 · 查用户".to_string()),
+            "放大窗口开完下一帧就自己关了"
         );
     }
 

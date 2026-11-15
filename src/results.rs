@@ -85,6 +85,8 @@ pub struct ResultsDock {
     pub open: bool,
     /// 「回块」按下的那一帧记在这里，app 取走去做跳转。
     pub pending_jump: Option<(PathBuf, usize)>,
+    /// 单独开窗口看的那份结果（按语句 id）。
+    popup: Option<u64>,
 }
 
 impl Default for ResultsDock {
@@ -101,6 +103,7 @@ impl ResultsDock {
             waiting: Vec::new(),
             open: false,
             pending_jump: None,
+            popup: None,
         }
     }
 
@@ -285,9 +288,10 @@ impl ResultsDock {
             return;
         }
 
-        let mut closable: Vec<u64> = Vec::new();
-        let mut close_runs: Vec<u64> = Vec::new();
-        let mut jump: Option<(PathBuf, usize)> = None;
+        let mut act = Clicked {
+            popup: self.popup,
+            ..Default::default()
+        };
         // 铺满底部面板给的那一格，装不下的走这里的滚动条（面板高度用户能拖）。
         // 缩成内容高反而不行：面板先按起始尺寸预留，多出来的那一截掉在窗口下沿
         // 外面，看着就是「只画了第一个面板」。
@@ -297,34 +301,83 @@ impl ResultsDock {
             .show(ui, |ui| {
                 for panel in &mut self.panels {
                     if panel.collapsed {
-                        collapsed_row(ui, panel, &mut closable, &mut close_runs);
+                        collapsed_row(ui, panel, &mut act);
                     } else {
-                        open_panel(ui, panel, &mut closable, &mut close_runs, &mut jump);
+                        open_panel(ui, panel, &mut act);
                     }
                     ui.add_space(3.0);
                 }
             });
 
         // 渲染期间只记账，动列表在这儿
-        if let Some(target) = jump {
+        if let Some(target) = act.jump {
             self.pending_jump = Some(target);
         }
-        for task in closable {
+        if let Some(task) = act.zoom_toggle {
+            self.popup = if self.popup == Some(task) { None } else { Some(task) };
+        }
+        for task in act.closable {
+            if self.popup == Some(task) {
+                self.popup = None; // 面板关了，单独拉出去的那个窗口跟着收
+            }
             self.close(task);
         }
-        for run in close_runs {
+        for run in act.close_runs {
+            if self
+                .popup
+                .is_some_and(|task| self.panels.iter().any(|p| p.task == task && p.run == run))
+            {
+                self.popup = None;
+            }
             self.close_run(run);
+        }
+    }
+
+    /// 单独拉出来的结果窗口：底部那一格窄，宽表放这儿看。
+    ///
+    /// 归结果区自己管：面板和窗口得是同一份数据，抄一份出去就等着两边对不上。
+    pub fn show_popup(&mut self, ctx: &egui::Context) {
+        let Some(task) = self.popup else { return };
+        let Some(panel) = self.panels.iter().find(|p| p.task == task) else {
+            self.popup = None;
+            return;
+        };
+        let mut open = true;
+        egui::Window::new(format!("结果 · {}", panel.title))
+            .id(egui::Id::unique(("db_result_popup", task)))
+            .default_open(true)
+            .default_size(egui::vec2(820.0, 460.0))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(weak(summary(panel)));
+                ui.separator();
+                match &panel.slot {
+                    Slot::Done(one) if one.is_query() => {
+                        // 窗口给多少用多少，不像底部那样只留五来行
+                        grid(ui, one, task, ui.available_height() - 12.0);
+                    }
+                    _ => body(ui, panel),
+                }
+            });
+        if !open {
+            self.popup = None;
         }
     }
 }
 
-fn open_panel(
-    ui: &mut Ui,
-    panel: &mut Panel,
-    closable: &mut Vec<u64>,
-    close_runs: &mut Vec<u64>,
-    jump: &mut Option<(PathBuf, usize)>,
-) {
+/// 一帧里从各个面板收上来的点击。渲染期间不动列表，账先记这儿。
+#[derive(Default)]
+struct Clicked {
+    closable: Vec<u64>,
+    close_runs: Vec<u64>,
+    jump: Option<(PathBuf, usize)>,
+    /// 这帧按了哪个面板的「放大」。谁都不按就是 None，窗口状态原样留着。
+    zoom_toggle: Option<u64>,
+    /// 当前开着窗口的那个面板，只拿来给按钮画按下态
+    popup: Option<u64>,
+}
+
+fn open_panel(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
     let dark = ui.visuals().dark_mode;
     let line = if dark {
         Color32::from_rgb(70, 76, 86)
@@ -336,18 +389,13 @@ fn open_panel(
         .corner_radius(4.0)
         .inner_margin(egui::Margin::symmetric(6, 2))
         .show(ui, |ui| {
-            header(ui, panel, closable, close_runs, jump);
+            header(ui, panel, act);
             ui.separator();
             body(ui, panel);
         });
 }
 
-fn collapsed_row(
-    ui: &mut Ui,
-    panel: &mut Panel,
-    closable: &mut Vec<u64>,
-    close_runs: &mut Vec<u64>,
-) {
+fn collapsed_row(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
     let dark = ui.visuals().dark_mode;
     let bg = if dark {
         Color32::from_rgba_unmultiplied(255, 255, 255, 10)
@@ -359,7 +407,7 @@ fn collapsed_row(
         .corner_radius(4.0)
         .inner_margin(egui::Margin::symmetric(6, 1))
         .show(ui, |ui| {
-            header(ui, panel, closable, close_runs, &mut None);
+            header(ui, panel, act);
         });
 }
 
@@ -369,13 +417,7 @@ fn collapsed_row(
 /// `row_h` 那块矩形是必须的：`Layout::right_to_left(Align::Center)` 在非换行布局里
 /// 会把父级剩的高度整块吃掉（egui `Layout::next_frame_ignore_wrap`），一行标题
 /// 直接变成一百多像素，第二个面板被顶到裁剪区外面，画都画不出来。
-fn header(
-    ui: &mut Ui,
-    panel: &mut Panel,
-    closable: &mut Vec<u64>,
-    close_runs: &mut Vec<u64>,
-    jump: &mut Option<(PathBuf, usize)>,
-) {
+fn header(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
     let row_h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
     let width = ui.available_width().max(80.0);
     ui.allocate_ui_with_layout(
@@ -387,14 +429,25 @@ fn header(
                 .on_hover_text("关掉这个结果面板")
                 .clicked()
             {
-                closable.push(panel.task);
+                act.closable.push(panel.task);
             }
             if ui
                 .add(egui::Button::new(RichText::new("关掉整块").size(11.0)).frame(false))
                 .on_hover_text("关掉这次执行的所有面板")
                 .clicked()
             {
-                close_runs.push(panel.run);
+                act.close_runs.push(panel.run);
+            }
+            if matches!(&panel.slot, Slot::Done(one) if one.is_query()) {
+                // 窗口开着就换成「收起」，否则点了没反应的样子会让人反复按
+                let text = if act.popup == Some(panel.task) { "收起" } else { "放大" };
+                if ui
+                    .add(egui::Button::new(RichText::new(text).size(11.0)).frame(false))
+                    .on_hover_text("单独开一个窗口看这份结果，宽表不受底部那一格的宽度限制")
+                    .clicked()
+                {
+                    act.zoom_toggle = Some(panel.task);
+                }
             }
             if let Some(origin) = panel.origin.clone() {
                 if ui
@@ -402,7 +455,7 @@ fn header(
                     .on_hover_text("跳回文件里这个 SQL 块")
                     .clicked()
                 {
-                    *jump = Some((origin.path, origin.jump));
+                    act.jump = Some((origin.path, origin.jump));
                 }
             }
             ui.label(weak(summary(panel)));
@@ -463,14 +516,16 @@ fn body(ui: &mut Ui, panel: &Panel) {
                 .selectable(true),
             );
         }
-        Slot::Done(one) if one.is_query() => grid(ui, one, panel.task),
+        Slot::Done(one) if one.is_query() => grid(ui, one, panel.task, 120.0),
         Slot::Done(one) => {
             ui.label(RichText::new(write_line(one)).size(11.0));
         }
     }
 }
 
-fn grid(ui: &mut Ui, one: &StatementResult, task: u64) {
+/// 结果网格。`height` 是这块最多能占到多高，超出行数走它自己的滚动条：
+/// 底部那一格给 120，放大窗口给整屏。
+fn grid(ui: &mut Ui, one: &StatementResult, task: u64, height: f32) {
     let table = TableBuilder::new(ui)
         .id_salt(("db_result", task))
         .striped(true)
@@ -478,7 +533,7 @@ fn grid(ui: &mut Ui, one: &StatementResult, task: u64) {
         // 行数少就照内容收，多了封顶走这块自己的滚动条。不封顶的话六个面板叠起来，
         // 结果区再怎么拖也装不下两条完整结果。
         .min_scrolled_height(0.0)
-        .max_scroll_height(120.0)
+        .max_scroll_height(height)
         .cell_layout(Layout::left_to_right(Align::Center))
         .column(Column::initial(40.0).at_least(28.0).clip(true))
         .columns(
