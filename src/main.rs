@@ -12,6 +12,9 @@ mod keymap;
 mod nav;
 mod pane;
 mod search;
+// 调用方在第 2、4 步陆续接上，先别让 dead_code 淹没 clippy 基线
+#[allow(dead_code)]
+mod sql;
 mod syntax;
 mod terminal;
 mod theme;

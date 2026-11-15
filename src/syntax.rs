@@ -173,3 +173,32 @@ fn to_color(c: syntect::highlighting::Color) -> Color32 {
 fn style_of(s: SynStyle) -> Color32 {
     to_color(s.foreground)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SQL 块的高亮全靠这条：默认语法包里没有 SQL 的话得自己带 .sublime-syntax。
+    #[test]
+    fn sql_extension_resolves_to_the_sql_grammar() {
+        let hl = Highlighter::new(true);
+        let syntax = hl.syntax_for(Some(Path::new("q.sql")), "SELECT 1;");
+        assert_ne!(syntax.name, "Plain text", "SQL 不能退回纯文本");
+        let scope = syntax.scope.to_string();
+        assert!(
+            scope.starts_with("source.sql"),
+            "实际 scope = {scope}"
+        );
+    }
+
+    #[test]
+    fn sql_highlighting_emits_more_than_one_span_per_line() {
+        let mut hl = Highlighter::new(true);
+        let spans = hl.highlight(Some(Path::new("q.sql")), "SELECT id FROM t WHERE x = 1;\n");
+        assert!(
+            spans[0].len() > 1,
+            "关键字/标识符应该被拆成多个着色片段，实际 {} 段",
+            spans[0].len()
+        );
+    }
+}
