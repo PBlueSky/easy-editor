@@ -2,7 +2,7 @@
 
 一个用 **Rust + egui** 写的 Windows 桌面编辑器。功能不多，但每一样都能天天用：文件树、多终端、递归分屏、文本内工作日志块、光标位置前后跳转、全局搜索、查找替换、语法高亮，快捷键全部可改。
 
-**当前版本** v0.2.1 ｜ **平台** Windows 10 / 11 x64 ｜ **许可** MIT
+**当前版本** v0.2.2 ｜ **平台** Windows 10 / 11 x64 ｜ **许可** MIT
 
 发布包是**单文件 exe**（约 11 MB，压缩后 4.7 MB），不需要 .NET、Electron 或任何运行时。
 
@@ -52,7 +52,7 @@
 两个包都能用：没带 `rg.exe` 时全局搜索自动回退到内置扫描，只是大仓里慢一些。每个包旁边有同名 `.sha256.txt`，校验一下：
 
 ```powershell
-Get-FileHash .\EasyEditor-0.2.1-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\EasyEditor-0.2.2-windows-x64.zip -Algorithm SHA256
 ```
 
 ### 从源码跑
@@ -77,6 +77,8 @@ cargo run -- src\app.rs                 # 启动并打开某个文件
 ## 使用方法
 
 ### 界面
+
+![EasyEditor 主界面：左侧文件树、中间分屏的编辑器与终端、底部状态栏](assets/screenshot.png)
 
 ```
 ┌──────────────────── 顶部工具栏（按钮排不下就换第二排）────────────────────────────────┐
@@ -371,7 +373,7 @@ cargo test -- --ignored --nocapture     # 附带一个真起 cmd.exe PTY 的终�
 mkdir -p dist/EasyEditor
 cp target/release/easy-editor.exe dist/EasyEditor/EasyEditor.exe   # 和窗口标题保持一致
 cp README.md LICENSE dist/EasyEditor/
-powershell -NoProfile -Command "Compress-Archive -Path dist\EasyEditor -DestinationPath dist\EasyEditor-0.2.1-windows-x64.zip -Force"
+powershell -NoProfile -Command "Compress-Archive -Path dist\EasyEditor -DestinationPath dist\EasyEditor-0.2.2-windows-x64.zip -Force"
 ```
 
 带 `rg.exe` 的那档把 `rg.exe` 和 `THIRD-PARTY-NOTICES.txt` 也放进 `dist\EasyEditor\` 再压一次，后缀写 `-with-rg`；两个包各配一份 `.sha256.txt`。
