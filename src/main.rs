@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod assoc;
 mod config;
 // SQL 功能分几步落地：这两块里有一批只被单测摸到的口子（状态回写、只读判定、
 // 连接校验收口），界面还没接上，先别报 dead_code。

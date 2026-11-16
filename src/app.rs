@@ -208,7 +208,37 @@ impl EasyEditorApp {
         let mut app = Self::bootstrap(&cc.egui_ctx, target);
         app.hwnd = native_hwnd(cc);
         titlebar::apply(app.hwnd, app.dark);
+        app.register_txt_association();
         app
+    }
+
+    /// 把自己登记进 `.txt` 的「打开方式」。放在 `new` 而不是 `bootstrap`：
+    /// 后者每个无头测试都会走一遍，那会让 `cargo test` 顺手把测试二进制
+    /// 注册成这台机器的文本编辑器。
+    fn register_txt_association(&mut self) {
+        if !self.config.data.txt_association {
+            return;
+        }
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(why) => {
+                self.status = format!("没取到自身路径，跳过文件关联：{why}");
+                return;
+            }
+        };
+        match crate::assoc::register(&exe) {
+            // 只在真建出新键的那一次报一句：这一下每回启动都会跑，从第二次起注册表里
+            // 那几个值原样躺着，天天在状态栏喊一遍就成噪音了。状态栏还空着才报，
+            // 别把更要紧的提示盖掉。
+            Ok(written) => {
+                if written.fresh > 0 && self.status.is_empty() {
+                    self.status =
+                        "已登记为 .txt 的可选程序：右键「打开方式」，或在系统「默认应用」里选 EasyEditor"
+                            .to_string();
+                }
+            }
+            Err(why) => self.status = format!(".txt 关联登记失败：{why}"),
+        }
     }
 
     /// 不碰 `eframe` 上下文的构造入口：测试里没有真实的窗口和 GL 上下文，
@@ -2769,9 +2799,23 @@ impl EasyEditorApp {
         }
     }
 
-    fn search_panel(&mut self, ui: &mut Ui) {        ui.add_space(2.0);
+    fn search_panel(&mut self, ui: &mut Ui) {
+        ui.add_space(2.0);
+        // 回车归这个框，只在这一帧焦点真在框上。以前判的是 `resp.lost_focus()`：
+        // 单行框收到 Enter 会当场交还焦点，那个条件就把「焦点这一帧刚被别人拿走」
+        // 也算了进来——用户在正文里敲的换行于是又发起一次搜索。跟查找栏一个写法：
+        // 按键在 `add` 之前摘，摘完这一帧的 Enter 就不会再往下走。
+        let query_id = egui::Id::unique("side_search_query");
+        let focused = ui.memory(|m| m.has_focus(query_id));
+        // 组字那一帧的回车是输入法在确认候选词，不是「开始搜索」
+        let composing = ime::composing(ui);
+        let enter = focused
+            && !composing
+            && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
+
         let resp = ui.add(
             egui::TextEdit::singleline(&mut self.search.query)
+                .id(query_id)
                 .hint_text("搜索内容，回车开始")
                 .desired_width(f32::INFINITY),
         );
@@ -2779,7 +2823,6 @@ impl EasyEditorApp {
             resp.request_focus();
             self.focus_search = false;
         }
-        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
         if enter {
             self.search_now();
         }
@@ -5062,6 +5105,55 @@ mod tests {
             app.search.hits.iter().any(|h| h.preview.contains("hello")),
             "全局搜索没有结果：info={:?}",
             app.search.info
+        );
+    }
+
+    /// 搜索框里按过回车以后，焦点回到正文：正文里再按回车只能换行，不该把全局搜索
+    /// 又跑一遍。以前判的是 `resp.lost_focus()`，正文那一下换行正好落进这个条件里。
+    #[test]
+    fn enter_in_the_editor_is_a_newline_not_another_search() {
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-search-enter", "hello world\nbye\n");
+        app.open_file(dir.join("a.txt"), None);
+        frame(&mut app, &ctx, vec![]);
+
+        // 侧栏搜索：填关键字 → 回车开跑 → 等结果回填
+        app.side = SideTab::Search;
+        app.show_side = true;
+        app.focus_search = true;
+        frame(&mut app, &ctx, vec![]);
+        app.search.query = "hello".into();
+        frame(&mut app, &ctx, vec![key_press(Key::Enter, Modifiers::NONE)]);
+        for _ in 0..200 {
+            frame(&mut app, &ctx, vec![]);
+            if !app.search.busy {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let started = app.search.generation;
+        assert!(started > 0, "搜索框里那下回车没把搜索跑起来");
+
+        // 回到正文：点编辑器、敲回车。点的是第一行那一带——正文只有两行时
+        // TextEdit 就只排两行高，面板正中在它下面，点了等于没点。
+        let pane = app
+            .pane_layout
+            .pane_rect(app.panes.focus().unwrap())
+            .unwrap();
+        let over = egui::pos2(pane.left() + 80.0, pane.top() + 40.0);
+        frame(&mut app, &ctx, pointer(over, egui::PointerButton::Primary, true));
+        frame(&mut app, &ctx, pointer(over, egui::PointerButton::Primary, false));
+        let before = app.tabs[app.active.unwrap()].text.clone();
+
+        frame(&mut app, &ctx, vec![key_press(Key::Enter, Modifiers::NONE)]);
+        frame(&mut app, &ctx, vec![]);
+
+        assert_eq!(
+            app.search.generation, started,
+            "正文里回车把搜索又跑了一遍"
+        );
+        assert!(
+            app.tabs[app.active.unwrap()].text.len() > before.len(),
+            "正文里那一下回车没换成行"
         );
     }
 

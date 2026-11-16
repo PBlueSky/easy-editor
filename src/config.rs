@@ -56,6 +56,10 @@ pub struct Config {
     pub terminal_args: BTreeMap<String, String>,
     /// 编辑器自动换行：长行折到面板宽度，而不是横向滚出去。
     pub word_wrap: bool,
+    /// 启动时把自己登记进 Windows 的 `.txt`「打开方式」/「默认应用」列表。
+    /// 只写当前用户的 `HKCU\Software\Classes`，不动任何文件类型的默认处理器；
+    /// 不想让这个 exe 出现在列表里就改成 false。
+    pub txt_association: bool,
     /// 数据库连接列表。`name` 是 SQL 块头部 `conn=` 引用到的键。
     pub db_connections: Vec<ConnectionSpec>,
 }
@@ -74,6 +78,7 @@ impl Default for Config {
             terminal_programs: BTreeMap::new(),
             terminal_args: BTreeMap::new(),
             word_wrap: false,
+            txt_association: true,
             db_connections: Vec::new(),
         }
     }

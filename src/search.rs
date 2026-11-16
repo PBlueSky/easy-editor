@@ -63,7 +63,7 @@ pub struct SearchState {
     pub elapsed_ms: u128,
     started_at: Option<std::time::Instant>,
     /// 生成序号，用来丢弃上一次搜索的残留结果
-    generation: u64,
+    pub generation: u64,
     rx: Option<Receiver<Msg>>,
     pub truncated: bool,
 }

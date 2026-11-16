@@ -35,6 +35,7 @@
 | 光标位置历史 | 像 IDEA 的 Navigate Back / Forward，光标停够 350ms 才算一个落脚点 | [#光标位置历史](#光标位置历史) |
 | 查找替换 | 大小写、正则、全部匹配高亮、键盘不离输入框 | [#查找与替换](#查找与替换) |
 | 全局搜索 | 优先 `rg --json` 流式显示，没有 ripgrep 就回退内置字节级扫描 | [#全局搜索](#全局搜索) |
+| `.txt` 文件关联 | 启动时把自己登记进 Windows 的「打开方式」和「默认应用」列表，双击文件带进来就直接打开 | [.txt 文件关联](#txt-文件关联) |
 | 选词高亮 | 鼠标选中一个词，全文所有相同词立刻标出来 | [#查找与替换](#查找与替换) |
 | JSON / XML 格式化 | 只改内存里的 buffer，`Ctrl+S` 才落盘 | [#格式化](#格式化) |
 | 中文输入法 | 新建对话框、编辑器正文、终端三处都能直接打拼音 | [#输入法](#输入法) |
@@ -154,6 +155,7 @@ cargo run -- src\app.rs                 # 启动并打开某个文件
 - 「位置」列窄，长路径会截断成 `a_very_long_directory_…`，悬浮在这一格上会浮出**完整绝对路径**
 - 拖动「位置」和「内容」之间的分隔线可以加宽列，宽度记在表格里保持住
 - 点任意一格直接打开对应文件并跳到命中行
+- 回车发起搜索，**只在这一帧焦点真在搜索框上**。回到正文之后回车就只是换行，输入法组字时的回车归候选词。焦点没离开搜索框时连按回车可以重跑一次，改完文件想刷新结果就用这个
 
 ### 工作日志块
 
@@ -392,9 +394,26 @@ LIMIT 50;
 - 每项可以单独「重置」，也可以「全部恢复默认」
 - 只把改过的项写进 `config.json`，以后加新动作不会破坏老配置
 
+### .txt 文件关联
+
+Windows 上启动时会把自己登记成能打开 `.txt` 的程序，于是两条路都通：
+
+- 右键 `.txt` → **打开方式** → **选择其他应用** → EasyEditor（在那里勾上「始终」就固定下来了），或者
+- **设置 → 应用 → 默认应用 → EasyEditor → `.txt`**
+
+登记只写 `HKCU\Software\Classes`——当前用户、不需要管理员、不动机器级设置。它刻意**不**去抢默认处理器：那份值叫 `UserChoice`，由系统哈希保护。第三方程序算不出这个哈希，写错了也不只是白写——Windows 一旦发现哈希不对，会把整条关联判废，这个文件类型连图标和默认程序都留不住。所以「设为默认」这一下得你自己点，程序不会把你已经选好的东西悄悄换掉。
+
+这个行为由 `config.json` 里的 `txt_association` 控制（默认 `true`）。不想让这个 exe 出现在列表里就改成 `false`——典型场景是 `target\debug\` 下的开发构建，它下一次 `cargo clean` 就没了，却已经在「打开方式」里留了个指向空位的条目：
+
+```json
+{ "txt_association": false }
+```
+
+写进去的键都带自己的名字（`EasyEditor.txt`、`Applications\<exe 文件名>`、`Clients\TextEditor\EasyEditor`，外加 `RegisteredApplications` 里的一行），事后想清掉就是删这几处，和别的编辑器不共用任何一键。真建新键时会补一声 `SHChangeNotify(SHCNE_ASSOCCHANGED)`，所以右键菜单当场就有，不用等注销重登。双击打开也照预期工作：文件路径作为第一个参数递进来，EasyEditor 直接把它打开。
+
 ## 配置
 
-字号、深浅主题、侧栏展开状态、侧栏页签、是否显示隐藏文件、是否折行、上次打开的工作目录、终端偏好、数据库连接、改过的快捷键，都自动存到 `%APPDATA%\easy-editor\config.json`，下次启动原样恢复；没写的字段走默认值（`word_wrap: false` 即长行横向滚动，`db_connections: []` 即一条连接都没有）。写盘有 600ms 防抖（拖字号时不会狂写磁盘），退出时再补一次。
+字号、深浅主题、侧栏展开状态、侧栏页签、是否显示隐藏文件、是否折行、`.txt` 关联开关、上次打开的工作目录、终端偏好、数据库连接、改过的快捷键，都自动存到 `%APPDATA%\easy-editor\config.json`，下次启动原样恢复；没写的字段走默认值（`word_wrap: false` 即长行横向滚动，`txt_association: true` 即启动时登记 `.txt` 关联，`db_connections: []` 即一条连接都没有）。写盘有 600ms 防抖（拖字号时不会狂写磁盘），退出时再补一次。
 
 ```json
 {
@@ -434,13 +453,14 @@ LIMIT 50;
 | 时间戳 | `chrono` 0.4 |
 | 原生文件对话框 | `rfd` 0.15 |
 | Windows 标题栏配色 | `raw-window-handle` 0.6 + `DwmSetWindowAttribute` |
+| `.txt` 关联 | `advapi32` 的 `RegCreateKeyExW` / `RegSetValueExW`，和标题栏那几处一样手写声明，不引注册表 crate |
 | exe 图标与属性页 | `winresource` 0.1（build 依赖） |
 
 界面全部是即时模式 GUI：没有 QSS / CSS，没有 webview，控件状态存在 `egui::Id` 关联的 state 里。渲染走 glow（OpenGL），重绘是按需的——没有终端在跑、也没有光标在闪的时候，静止的界面不再画新帧。
 
 ## 代码结构
 
-约 19900 行 Rust，单个 binary crate，22 个源文件：
+约 21600 行 Rust，单个 binary crate，23 个源文件：
 
 | 文件 | 职责 |
 |---|---|
@@ -466,6 +486,7 @@ LIMIT 50;
 | `src/syntax.rs` | syntect 高亮，按行缓存成 egui 着色片段 |
 | `src/ime.rs` | 输入法组字状态判断、锚点处理 |
 | `src/titlebar.rs` | 系统标题栏配色（仅 Windows） |
+| `src/assoc.rs` | `.txt` 关联：要写的注册表值先摊成一份纯数据清单（不动这台机器的注册表也能审），再交给一层很薄的 `advapi32` 调用写下去 |
 
 ## 构建、测试与打包
 
@@ -522,6 +543,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/render-icon.ps1
 ## 已知限制
 
 - **只在 Windows 10 / 11 x64 上日常使用过。** 代码里 Windows 专属的部分（系统标题栏配色、exe 资源、控制台开关）都有 `#[cfg(windows)]` 包着，其他平台理论上能编译，但没人验证过。
+- **`.txt` 关联是登记，不是接管。** EasyEditor 会出现在「打开方式」和设置 → 默认应用里，但不会自己变成默认文本编辑器；Win10/11 上第三方程序也做不了这件事，`UserChoice` 有哈希保护（[原因](#txt-文件关联)）。
 - 终端的 shell 自动探测覆盖 PowerShell 7 / Windows PowerShell / cmd / Git Bash / WSL，探测不到就在「终端设置」里手填路径。
 - 只读虚拟渲染的大文件（> 1 MB 或 > 20000 行）既不折行也不能横向滚动，长行要看全只能拖宽面板；这类文件也会拒绝格式化。
 - 超过 16 MB 的文件直接拒绝打开，状态栏给提示。
@@ -550,6 +572,12 @@ egui 那个矩形是按「基线 − 主字体 ascent」往下数一个行高画
 ### 单行 `TextEdit` 收到 `Enter` 会自己丢焦点
 
 所以等控件返回后再判断 `has_focus()` 永远是 `false`，查找栏的快捷键会静默失效。做法是在 `TextEdit` **之前**把按键从事件队列里 `consume` 掉，焦点就不会丢。
+
+同一个事实还有第二层后果，这一层关系到回车到底归谁。侧栏搜索框以前判的是「`lost_focus()` 且队列里有个 `Enter`」，当成「按回车再搜一次」。可正文里的回车是换行，队列里躺着一个按键也不等于有人在请求搜索——用户接着在文档里敲的那个回车，会把全局搜索又跑一遍（`generation` 当场 +1，上一批结果被清空）。现在两个输入框都在 `add` **之前**读焦点（`ui.memory(|m| m.has_focus(query_id))`），输入法组字那一帧整个跳过（`ime::composing`，那一下回车是候选词在确认），然后才 `consume_key`。id 用 `egui::Id::unique` 而不是 `ui.id()`：后者在 0.37 改名成了 `Ui::scope_id`，语义跟着布局走，不是我们要的「跨帧稳定的那一个框」。
+
+### `.txt` 登记放在 `new`，不放在 `bootstrap`
+
+`bootstrap` 是无头测试构造应用走的那条路——它不碰 `eframe`，这也正是注册表写入必须留在 `EasyEditorApp::new` 里的原因：否则每跑一次 `cargo test`，就把 `target\debug\deps\` 下那个**测试二进制**登记成了这台机器的文本编辑器。`assoc::entries()` 把整份注册表计划摊成纯数据，于是它的形状（带空格的路径要整段引起来、`RegisteredApplications` 指的就是刚填过的那份 `Capabilities`、只报 `.txt`、一律不碰 `UserChoice`）由一组根本不打开注册表键的测试覆盖。
 
 ### `request_focus` 会顺手打断输入法组字
 

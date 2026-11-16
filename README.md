@@ -35,6 +35,7 @@ The release package is a **single exe** (about 12 MB, 5.2 MB zipped). No .NET, n
 | Cursor position history | Like IDEA's Navigate Back / Forward; a position only counts as a stop after the cursor sits there for 350 ms | [Cursor position history](#cursor-position-history) |
 | Find and replace | Case sensitivity, regex, all matches highlighted, hands stay in the input box | [Find and replace](#find-and-replace) |
 | Project-wide search | Streams `rg --json` first, falls back to a built-in byte-level scanner when ripgrep is absent | [Project-wide search](#project-wide-search) |
+| `.txt` file association | Registers itself into the Windows "Open with" list and Settings → Default apps at start-up, and opens whatever file you double-clicked | [.txt file association](#txt-file-association) |
 | Word occurrence highlight | Select a word with the mouse and every identical word in the file is marked immediately | [Find and replace](#find-and-replace) |
 | JSON / XML formatting | Edits the in-memory buffer only; nothing touches the disk until `Ctrl+S` | [Formatting](#formatting) |
 | East Asian input methods | Pinyin and Japanese work in the new-file dialog, the rename box, the editor body and the terminal | [Input methods](#input-methods) |
@@ -154,6 +155,7 @@ The summary line reports hit count, elapsed time and which engine ran, e.g. `166
 - The "Location" column is narrow, so long paths truncate to `a_very_long_directory_…`; hovering that cell reveals the **full absolute path**
 - Drag the divider between "Location" and "Content" to widen a column; the width sticks
 - Click any cell to open the file and jump to the matching line
+- `Enter` in the query box starts the search — but **only on the frame that box has focus**. Once you are back in the editor, `Enter` is just a newline again, and while the IME is composing, `Enter` belongs to the candidate window. Repeated `Enter` inside the box re-runs the search, which is the quickest way to refresh after editing files
 
 ### Journal blocks
 
@@ -394,9 +396,26 @@ Everything below is the default and everything is rebindable in `F1`.
 - Each action can be reset individually, or you can restore all defaults
 - Only entries that differ from the defaults are written to `config.json`, so adding new actions later never corrupts old configs
 
+### .txt file association
+
+On Windows, start-up registers EasyEditor as a program that can open `.txt`, so you get either of these:
+
+- right-click a `.txt` → **Open with** → **Choose another app** → EasyEditor (tick "Always" there if you want it to stick), or
+- **Settings → Apps → Default apps → EasyEditor → `.txt`**
+
+Registration writes `HKCU\Software\Classes` only — the current user, no administrator, no machine-wide change. What it deliberately does **not** do is claim the default handler: that lives in a `UserChoice` value the system protects with a hash. A third-party program cannot compute it, and writing a wrong one does not merely fail — Windows invalidates the whole association and the file type loses its icon and its default program. So picking EasyEditor as the default stays a click you make, and the app never overrides a choice you already made.
+
+The behaviour is switched by `txt_association` in `config.json` (default `true`). Set it to `false` if you would rather this exe did not appear in the list at all — for example a development build under `target\debug\`, which would otherwise offer Windows a path that disappears on the next `cargo clean`:
+
+```json
+{ "txt_association": false }
+```
+
+Every key it writes is under its own names (`EasyEditor.txt`, `Applications\<exe name>`, `Clients\TextEditor\EasyEditor`, one line in `RegisteredApplications`), so removing it afterwards is a matter of deleting those — and none of them is shared with another editor. A new key also gets one `SHChangeNotify(SHCNE_ASSOCCHANGED)` broadcast, which is why the entry shows up in the right-click menu right away instead of after the next sign-in. Double-clicking a file works the way you would expect: the path arrives as the first argument and EasyEditor opens it.
+
 ## Configuration
 
-Font size, theme, sidebar visibility, active sidebar tab, hidden-file visibility, word wrap, last workspace, terminal preferences, database connections and your keybinding changes are stored automatically in `%APPDATA%\easy-editor\config.json` and restored on the next start. Fields that are not written fall back to defaults (`word_wrap: false`, i.e. long lines scroll sideways; `db_connections: []`). Writes are debounced by 600 ms (so dragging the font size does not hammer the disk) and flushed once more on exit.
+Font size, theme, sidebar visibility, active sidebar tab, hidden-file visibility, word wrap, the `.txt` association switch, last workspace, terminal preferences, database connections and your keybinding changes are stored automatically in `%APPDATA%\easy-editor\config.json` and restored on the next start. Fields that are not written fall back to defaults (`word_wrap: false`, i.e. long lines scroll sideways; `txt_association: true`; `db_connections: []`). Writes are debounced by 600 ms (so dragging the font size does not hammer the disk) and flushed once more on exit.
 
 ```json
 {
@@ -436,13 +455,14 @@ Font size, theme, sidebar visibility, active sidebar tab, hidden-file visibility
 | Timestamps | `chrono` 0.4 |
 | Native file dialogs | `rfd` 0.15 |
 | Windows title bar colours | `raw-window-handle` 0.6 + `DwmSetWindowAttribute` |
+| `.txt` association | `RegCreateKeyExW` / `RegSetValueExW` from `advapi32`, declared by hand like the title-bar calls — no registry crate |
 | exe icon and version info | `winresource` 0.1 (build dependency) |
 
 Everything is immediate-mode GUI: no QSS, no CSS, no webview. Widget state lives in states keyed by `egui::Id`. Rendering goes through glow (OpenGL) and repaints are on demand — with no terminal running and no cursor blinking, a still interface does not draw new frames.
 
 ## Code layout
 
-About 19,900 lines of Rust in a single binary crate, 22 source files:
+About 21,600 lines of Rust in a single binary crate, 23 source files:
 
 | File | Responsibility |
 |---|---|
@@ -468,6 +488,7 @@ About 19,900 lines of Rust in a single binary crate, 22 source files:
 | `src/syntax.rs` | syntect highlighting, cached per line into egui galley spans |
 | `src/ime.rs` | IME composition state, anchor handling |
 | `src/titlebar.rs` | System title bar colours (Windows only) |
+| `src/assoc.rs` | `.txt` association: the registry values to write as a plain list (unit-testable without touching this machine's registry), plus the thin `advapi32` call that writes them |
 
 ## Build, test and packaging
 
@@ -524,6 +545,7 @@ The two icons cover different surfaces:
 ## Known limitations
 
 - **Only Windows 10 / 11 x64 has been used day to day.** Windows-specific code (system title bar colours, exe resources, console switches) is wrapped in `#[cfg(windows)]`; other platforms should compile, but nobody has verified them.
+- **`.txt` association is registration, not takeover.** EasyEditor appears in "Open with" and in Settings → Default apps; it does not quietly become your default text editor, and on Win10/11 a program cannot make itself one — `UserChoice` is hash-protected ([why](#txt-file-association)).
 - Terminal shell auto-detection covers PowerShell 7 / Windows PowerShell / cmd / Git Bash / WSL. If it misses one, set the path by hand in Terminal Settings.
 - Large files rendered in read-only virtual mode (> 1 MB or > 20,000 lines) neither wrap nor scroll horizontally — widen the pane to see a long line. These files also refuse formatting.
 - Files over 16 MB are refused outright, with a message in the status bar.
@@ -552,6 +574,12 @@ egui draws that rectangle one line-height below "baseline minus the primary font
 ### A single-line TextEdit drops focus when it receives Enter
 
 So checking `has_focus()` after the widget returns is always `false`, and the find bar's shortcuts fail silently. The fix is to `consume` the key from the event queue **before** the `TextEdit`, which keeps focus intact.
+
+The same fact has a second consequence, and this one is about who owns the key at all. The sidebar's search box used to treat "`lost_focus()` and an `Enter` in the queue" as "press Enter to search again". But `Enter` in the editor is a newline, and a key press still sitting in the queue is not evidence that anyone asked for a search — the very next `Enter` you type into a document re-ran the project search instead of breaking the line. Both input boxes now read focus **before** adding the widget (`ui.memory(|m| m.has_focus(query_id))`), skip the frame entirely while the IME is composing (`ime::composing`, because that `Enter` confirms a candidate word), and only then `consume_key`. The id comes from `egui::Id::unique`, not `ui.id()`, which in 0.37 is `Ui::scope_id` and would change with the layout.
+
+### Registering `.txt` happens in `new`, not in `bootstrap`
+
+`bootstrap` is what the headless tests construct the app with — it never touches `eframe`, and that is exactly why the registry write lives in `EasyEditorApp::new` instead: otherwise every `cargo test` run would register the *test binary* sitting in `target\debug\deps\` as this machine's text editor. `assoc::entries()` returns the whole registry plan as plain data, so the shape of it (quoting a path with spaces, `RegisteredApplications` pointing at the `Capabilities` key it just filled, only `.txt` offered, nothing touching `UserChoice`) is covered by tests that never open a key.
 
 ### Requesting focus interrupts IME composition
 
