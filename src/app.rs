@@ -6702,8 +6702,10 @@ mod tests {
         );
     }
 
+    /// 行首的 ▸ 不再往表格里塞一块明细：那块收不回去，还老被表格自己的裁剪切掉。
+    /// 现在改成在屏幕右边单独开一个窗口，同一个 ▸ 再点一下收掉。
     #[test]
-    fn expanding_a_row_lays_out_its_full_values() {
+    fn the_row_arrow_opens_a_detail_window_on_the_right() {
         let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_expand");
         app.sql_run_block();
         settle_results(&mut app, &ctx);
@@ -6719,21 +6721,38 @@ mod tests {
         frame(&mut app, &ctx, pointer(arrows[0], egui::PointerButton::Primary, true));
         frame(&mut app, &ctx, pointer(arrows[0], egui::PointerButton::Primary, false));
 
-        let out = frame(&mut app, &ctx, vec![]);
-        let shown = texts(&out);
+        let shown = seen(&frame(&mut app, &ctx, vec![]));
+        let title = shown.iter().find(|(t, _)| t == "详情 · 第 1 行");
+        let Some((_, rect)) = title else {
+            panic!(
+                "行首 ▸ 没把详情窗口开出来：{:?}",
+                shown.iter().map(|(t, _)| t).collect::<Vec<_>>()
+            );
+        };
         assert!(
-            shown.iter().any(|t| t == "id =") && shown.iter().any(|t| t == "name ="),
-            "展开后没把「列名 = 值」摊出来：{shown:?}"
+            rect.center().x > SCREEN.x / 2.0,
+            "详情窗口该钉在屏幕右边，实测标题在 x={}",
+            rect.center().x
         );
-        assert!(shown.iter().any(|t| t == "第 1 行"), "{shown:?}");
+        let words = shown.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>();
+        assert!(
+            words.contains(&"id =") && words.contains(&"name ="),
+            "窗口里没把「列名 = 完整值」摊出来：{words:?}"
+        );
+        assert!(words.contains(&"复制整行"), "窗口里没带拷贝整行那一条：{words:?}");
 
-        // 再点一下收回去，明细不该留在屏上
-        let out = frame(&mut app, &ctx, vec![]);
-        click_first(&mut app, &ctx, &out, "▾");
+        // 收回去：同一个位置再点一下，窗口和「列名 = 值」都不该留在屏上
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, pointer(arrows[0], egui::PointerButton::Primary, true));
+        frame(&mut app, &ctx, pointer(arrows[0], egui::PointerButton::Primary, false));
         let shown = texts(&frame(&mut app, &ctx, vec![]));
         assert!(
             !shown.iter().any(|t| t == "id ="),
-            "收了还留着明细：{shown:?}"
+            "收了还留着详情：{shown:?}"
+        );
+        assert!(
+            !shown.iter().any(|t| t.starts_with("详情 · ")),
+            "详情窗口没收掉：{shown:?}"
         );
     }
 

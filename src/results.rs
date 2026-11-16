@@ -7,7 +7,6 @@
 //! 这一层不碰数据库也不碰文件：结果由 `DatabasePanel::take_stray` 转交过来，
 //! 「回块」只是把 (路径, 字节) 原样递回给 app，真正的跳转归 app 管。
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 use egui::{Align, Color32, Layout, RichText, ScrollArea, Ui};
@@ -75,8 +74,11 @@ pub struct Panel {
     pub origin: Option<Origin>,
     pub slot: Slot,
     pub collapsed: bool,
-    /// 摊开看完整内容的行号（0 基）。窄格子里被裁掉的那一截在这儿看全。
-    pub expanded: HashSet<usize>,
+    /// 整行选中的那一行（0 基）。选中只是高亮 + 下面那排按钮，不动剪贴板。
+    pub selected: Option<usize>,
+    /// 单独在右边看详情的那一行。一行一个面板：摊开的明细比表格还占地方，
+    /// 塞在表格下面经常掉到裁剪区外，看着就像点了没反应。
+    pub detail: Option<Detail>,
     /// 单独看的那一格（双击格子开出来的弹窗）。列太窄时整行摊开还是不好读，
     /// 就盯着一格看。
     pub peek: Option<Peek>,
@@ -86,6 +88,14 @@ impl Panel {
     pub fn preview(&self) -> String {
         preview_of(&self.stmt)
     }
+}
+
+/// 单独查看整行的详情。
+#[derive(Clone, Copy)]
+pub struct Detail {
+    pub row: usize,
+    /// 按下那一帧的光标位置：窗口固定在屏幕右侧，纵向跟着这一下走，之后归用户拖
+    pub at: egui::Pos2,
 }
 
 /// 单独查看某一格。
@@ -204,7 +214,8 @@ impl ResultsDock {
                 origin: origin.clone(),
                 slot: Slot::Running,
                 collapsed: false,
-                expanded: HashSet::new(),
+                selected: None,
+                detail: None,
                 peek: None,
             });
         self.panels.splice(0..0, batch);
@@ -323,7 +334,9 @@ impl ResultsDock {
                 format!("结果 · {count} 个")
             };
             ui.label(RichText::new(head).size(11.5).strong());
-            ui.label(weak("一条语句一个面板 · 双击格子看整格全文 · 行首 ▸ 展开整行"));
+            ui.label(weak(
+                "一条语句一个面板 · 双击格子看整格全文 · 点行号选中整行 · 行首 ▸ 在右侧开详情",
+            ));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
                     .add(egui::Button::new(RichText::new("关闭").size(11.5)).frame(false))
@@ -416,7 +429,7 @@ impl ResultsDock {
             }
             self.close_run(run);
         }
-        self.draw_peek(ui.ctx());
+        self.draw_windows(ui.ctx());
     }
 
     /// 单独拉出来的结果窗口：底部那一格窄，宽表放这儿看。
@@ -452,80 +465,158 @@ impl ResultsDock {
         }
     }
 
-    /// 双击格子开出来的「这一格全文」小窗。
+    /// 网格自己开的那两类小窗：整行详情（钉在屏幕右侧）、单格全文（贴着格子）。
     ///
-    /// 为什么单开一个窗口：底部那一格窄，长值列宽装不下；贴着格子展开更不行，
-    /// 表格自己带裁剪，展开的那块经常在滚动区外面，等于点了没反应。
+    /// 为什么都单开窗口：底部那一格窄，长值列宽装不下；贴在表格里展开更不行——
+    /// 表格自己带裁剪，展开的那块经常在滚动区外面，等于点了没反应，收回去都做不到。
     /// 窗口只画一份、归结果区管，放大出来的那份结果和底部面板共用同一个状态。
-    fn draw_peek(&mut self, ctx: &egui::Context) {
+    fn draw_windows(&mut self, ctx: &egui::Context) {
         for panel in &mut self.panels {
-            let Some(peek) = panel.peek else { continue };
-            let one = match &panel.slot {
-                Slot::Done(one) => one,
-                _ => {
-                    panel.peek = None;
-                    continue;
-                }
-            };
-            let (Some(row), Some(column)) = (one.rows.get(peek.row), one.columns.get(peek.col))
-            else {
-                panel.peek = None;
-                continue;
-            };
-            let value = row[peek.col].display().to_string();
-            let count = value.chars().count();
-            // 一格也可能是几万字节的 JSON 或日志，全铺开会把这帧拖死
-            let shown: String = value.chars().take(PEEK_LIMIT).collect();
-            let cut = count > PEEK_LIMIT;
-            let title = format!("{} · 第 {} 行", column.name, peek.row + 1);
-            let type_name = column.type_name.clone();
-            let mut open = true;
-            egui::Window::new(title)
-                .id(egui::Id::unique((
-                    "db_cell_peek",
-                    panel.task,
-                    peek.row,
-                    peek.col,
-                )))
-                .default_pos(peek.at + egui::vec2(10.0, 12.0))
-                .default_size(egui::vec2(460.0, 170.0))
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    // 底下那行按钮得先留出地方：整块高度都给滚动区的话，
-                    // 按钮被顶到窗口裁剪区外面，看着就像窗口里只有一段文字。
-                    let footer = ui.spacing().interact_size.y + 14.0;
-                    ScrollArea::vertical()
-                        .max_height((ui.available_height() - footer).max(60.0))
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::Label::new(RichText::new(shown).size(11.5).monospace())
-                                    .selectable(true),
-                            );
-                            if cut {
-                                ui.label(weak(format!(
-                                    "内容太长，这里只列前 {PEEK_LIMIT} 字。全部请用下面的「复制本格」或导出 CSV。"
-                                )));
-                            }
-                        });
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        if !type_name.is_empty() {
-                            ui.label(weak(type_name));
-                        }
-                        ui.label(weak(format!("共 {count} 字")));
-                        if ui
-                            .add(egui::Button::new(RichText::new("复制本格").size(11.0)).frame(false))
-                            .on_hover_text("原文拷进剪贴板，不受上面显示长度的限制")
-                            .clicked()
-                        {
-                            ui.ctx().copy_text(value.clone());
-                        }
-                    });
-                });
-            panel.peek = open.then_some(peek);
+            draw_row_detail(panel, ctx);
+            draw_cell_peek(panel, ctx);
         }
     }
+}
+
+/// 整行详情：单独一个窗口，钉在屏幕右边，一次一行。
+///
+/// 纵向跟着点下去的那一下走，横向固定贴右——详情比表格还宽，压在格子上就看不见
+/// 选中的是哪一行了。换一行只换内容，窗口摆哪儿归用户拖。
+fn draw_row_detail(panel: &mut Panel, ctx: &egui::Context) {
+    let Some(detail) = panel.detail else { return };
+    // 列名和值先抄成自己拥有的：对 panel.slot 的借读不能跨过整个窗口，
+    // 窗口没了还要写回 panel.detail。
+    let fields: Vec<(String, String)> = match &panel.slot {
+        Slot::Done(one) => one
+            .rows
+            .get(detail.row)
+            .map(|row| {
+                one.columns
+                    .iter()
+                    .zip(row.iter())
+                    .map(|(col, cell)| (col.name.clone(), cell.display().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    if fields.is_empty() {
+        panel.detail = None;
+        return;
+    }
+    // 贴右：宽度给足才装得下「列名 = 完整值」
+    let screen = ctx.viewport_rect();
+    let x = (screen.max.x - 452.0).max(screen.min.x);
+    let y = screen.min.y
+        + (detail.at.y - screen.min.y).clamp(8.0, (screen.height() - 130.0).max(8.0));
+    let title = format!("详情 · 第 {} 行", detail.row + 1);
+    let mut open = true;
+    egui::Window::new(title)
+        .id(egui::Id::unique(("db_row_detail", panel.task)))
+        .default_pos(egui::pos2(x, y))
+        .default_size(egui::vec2(430.0, 300.0))
+        .open(&mut open)
+        .show(ctx, |ui| {
+            // 底下那行按钮得先留出地方，不然整块高度归了滚动区，
+            // 按钮被顶到窗口裁剪区外面
+            let footer = ui.spacing().interact_size.y + 14.0;
+            ScrollArea::vertical()
+                .max_height((ui.available_height() - footer).max(60.0))
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for (name, value) in &fields {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(format!("{name} =")).size(10.5).weak());
+                            ui.add(
+                                egui::Label::new(RichText::new(value).size(11.0).monospace())
+                                    .selectable(true),
+                            );
+                        });
+                        ui.add_space(1.0);
+                    }
+                });
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(weak(format!("{} 列", fields.len())));
+                if ui
+                    .add(egui::Button::new(RichText::new("复制整行").size(11.0)).frame(false))
+                    .on_hover_text("制表符分隔的一行，直接粘进表格软件")
+                    .clicked()
+                {
+                    let line = tsv_row(fields.iter().map(|(_, v)| v.as_str().into()));
+                    ui.ctx().copy_text(line);
+                }
+            });
+        });
+    panel.detail = open.then_some(detail);
+}
+
+/// 双击格子开出来的「这一格全文」小窗。
+fn draw_cell_peek(panel: &mut Panel, ctx: &egui::Context) {
+    let Some(peek) = panel.peek else { return };
+    let one = match &panel.slot {
+        Slot::Done(one) => one,
+        _ => {
+            panel.peek = None;
+            return;
+        }
+    };
+    let (Some(row), Some(column)) = (one.rows.get(peek.row), one.columns.get(peek.col)) else {
+        panel.peek = None;
+        return;
+    };
+    let value = row[peek.col].display().to_string();
+    let count = value.chars().count();
+    // 一格也可能是几万字节的 JSON 或日志，全铺开会把这帧拖死
+    let shown: String = value.chars().take(PEEK_LIMIT).collect();
+    let cut = count > PEEK_LIMIT;
+    let title = format!("{} · 第 {} 行", column.name, peek.row + 1);
+    let type_name = column.type_name.clone();
+    let mut open = true;
+    egui::Window::new(title)
+        .id(egui::Id::unique((
+            "db_cell_peek",
+            panel.task,
+            peek.row,
+            peek.col,
+        )))
+        .default_pos(peek.at + egui::vec2(10.0, 12.0))
+        .default_size(egui::vec2(460.0, 170.0))
+        .open(&mut open)
+        .show(ctx, |ui| {
+            // 底下那行按钮得先留出地方：整块高度都给滚动区的话，
+            // 按钮被顶到窗口裁剪区外面，看着就像窗口里只有一段文字。
+            let footer = ui.spacing().interact_size.y + 14.0;
+            ScrollArea::vertical()
+                .max_height((ui.available_height() - footer).max(60.0))
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(shown).size(11.5).monospace())
+                            .selectable(true),
+                    );
+                    if cut {
+                        ui.label(weak(format!(
+                            "内容太长，这里只列前 {PEEK_LIMIT} 字。全部请用下面的「复制本格」或导出 CSV。"
+                        )));
+                    }
+                });
+            ui.separator();
+            ui.horizontal(|ui| {
+                if !type_name.is_empty() {
+                    ui.label(weak(type_name));
+                }
+                ui.label(weak(format!("共 {count} 字")));
+                if ui
+                    .add(egui::Button::new(RichText::new("复制本格").size(11.0)).frame(false))
+                    .on_hover_text("原文拷进剪贴板，不受上面显示长度的限制")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(value.clone());
+                }
+            });
+        });
+    panel.peek = open.then_some(peek);
 }
 
 /// 一帧里从各个面板收上来的点击。渲染期间不动列表，账先记这儿。
@@ -554,40 +645,6 @@ fn batch_row(ui: &mut Ui, panel: &Panel) {
             panel.conn, panel.title, panel.total
         )));
     });
-}
-
-/// 展开的那一行摊开成「列名 = 完整值」。
-///
-/// 表格里每格都是截断显示，长文本看不出头尾；这里不换行限制、可选中，
-/// 要拷一段出来也在这儿拷。
-fn detail(ui: &mut Ui, one: &StatementResult, index: usize) {
-    let dark = ui.visuals().dark_mode;
-    let bg = if dark {
-        Color32::from_rgba_unmultiplied(255, 255, 255, 12)
-    } else {
-        Color32::from_rgba_unmultiplied(0, 0, 0, 10)
-    };
-    egui::Frame::new()
-        .fill(bg)
-        .corner_radius(3.0)
-        .inner_margin(egui::Margin::symmetric(6, 2))
-        .show(ui, |ui| {
-            ui.label(weak(format!("第 {} 行", index + 1)).strong());
-            for (col, cell) in one.columns.iter().zip(&one.rows[index]) {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(format!("{} =", col.name)).size(10.5).weak());
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(cell.display().to_string())
-                                .size(11.0)
-                                .monospace(),
-                        )
-                        .selectable(true),
-                    );
-                });
-            }
-        });
-    ui.add_space(2.0);
 }
 
 fn open_panel(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
@@ -775,154 +832,219 @@ fn body(ui: &mut Ui, panel: &mut Panel) {
 }
 
 /// 结果网格。`height` 是这块最多能占到多高，超出行数走它自己的滚动条：
-/// 底部那一格给 120，放大窗口给整屏。
+/// 底部那一格给 120，放大窗口给整屏。列比这一格还宽时走外面那根横向滚动条。
 ///
-/// 每格都是截断显示，装不下的那一截有两条路看全：行首的 ▸ 把整行摊到表格下面
-/// （见 [`detail`]），双击格子把这一格单独弹出来看（见 [`ResultsDock::draw_peek`]）。
+/// 每格都是截断显示，装不下的那一截有两条路看全：双击格子把这一格单独弹出来
+/// （见 [`draw_cell_peek`]），行首 ▸ 在屏幕右边单独开一个窗口看整行
+/// （见 [`draw_row_detail`]）。点行号把整行选中，格子底下跟出一排按钮。
 fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
-    // 拆字段借：网格读 `slot` 里的结果，展开状态要写回 `expanded`
+    // 拆字段借：网格读 `slot` 里的结果，选中和详情要写回面板
     let Panel {
         task,
         slot,
-        expanded,
+        selected,
+        detail,
         peek,
         ..
     } = panel;
     let Slot::Done(one) = slot else { return };
     let task = *task;
     let one = &*one;
-    let table = TableBuilder::new(ui)
-        .id_salt(("db_result", task))
-        .striped(true)
+    // 换了结果行数就不一样了，旧行号别留着，一点对界就是一次 panic
+    *selected = selected.filter(|i| *i < one.rows.len());
+    *detail = detail.filter(|d| d.row < one.rows.len());
+
+    // 横向滚动条只能自己套：egui_extras 的表体内部写死 `ScrollArea::new([false, vscroll])`，
+    // 压根没有横向这一维，列一多就只能看着被裁。表头和表体一起放进这个滚动区——
+    // 表头是画在表体的滚动区外面的，分开包两半会列错位。
+    ScrollArea::horizontal()
+        .id_salt(("db_grid_x", task))
         .auto_shrink([false, true])
-        // 行数少就照内容收，多了封顶走这块自己的滚动条。不封顶的话六个面板叠起来，
-        // 结果区再怎么拖也装不下两条完整结果。
-        .min_scrolled_height(0.0)
-        .max_scroll_height(height)
-        .cell_layout(Layout::left_to_right(Align::Center))
-        .column(Column::initial(46.0).at_least(34.0).clip(true))
-        .columns(
-            Column::initial(140.0)
-                .at_least(56.0)
-                .resizable(true)
-                .clip(true),
-            one.columns.len(),
-        );
-    table
-        .header(18.0, |mut header| {
-            header.col(|ui| {
-                ui.label(RichText::new("#").size(11.0).strong());
-            });
-            for col in &one.columns {
-                let name = col.name.clone();
-                let ty = col.type_name.clone();
-                header.col(|ui| {
-                    let resp = ui.add(
-                        egui::Label::new(RichText::new(name).size(11.0).strong())
-                            .truncate()
-                            .selectable(false),
-                    );
-                    if !ty.is_empty() {
-                        resp.on_hover_text(ty);
-                    }
-                });
-            }
-        })
-        .body(|body| {
-            body.rows(18.0, one.rows.len(), |mut row| {
-                let index = row.index();
-                row.col(|ui| {
-                    let arrow = if expanded.contains(&index) { "▾" } else { "▸" };
-                    let resp = ui.add(
-                        egui::Label::new(RichText::new(arrow).size(10.0).weak())
-                            .selectable(false)
-                            .sense(egui::Sense::click()),
-                    );
-                    if resp.on_hover_text("展开看这一行的完整内容").clicked()
-                        && !expanded.remove(&index)
-                    {
-                        expanded.insert(index);
-                    }
-                    ui.label(weak(format!("{}", index + 1)));
-                });
-                for (col_index, cell) in one.rows[index].iter().enumerate() {
-                    let text = cell.display().to_string();
-                    let null = cell.is_null();
-                    let mut rt = RichText::new(text.clone()).size(11.0).monospace();
-                    if null {
-                        rt = rt.weak().italics();
-                    }
-                    row.col(|ui| {
-                        let resp = ui
-                            .add(egui::Label::new(rt).truncate().selectable(true))
-                            .on_hover_cursor(egui::CursorIcon::Text);
-                        // 只有真被列宽裁掉的格子才给悬浮，短值多弹一个框反而碍事。
-                        // 表格只给可见行跑这段，量一行的宽度不贵。
-                        let full = ui
-                            .painter()
-                            .layout_no_wrap(text.clone(), egui::FontId::monospace(11.0), Color32::WHITE)
-                            .size()
-                            .x;
-                        let resp = if full <= resp.rect.width() - 6.0 {
-                            resp
-                        } else {
-                            resp.on_hover_text(hover_preview(&text))
-                        };
-                        let at = resp
-                            .interact_pointer_pos()
-                            .unwrap_or_else(|| resp.rect.right_bottom());
-                        if resp.double_clicked() {
-                            *peek = Some(Peek {
-                                row: index,
-                                col: col_index,
-                                at,
-                            });
-                        }
-                        resp.context_menu(|ui| {
-                            if ui
-                                .button("查看完整内容")
-                                .on_hover_text("单独开一个窗口放这一格：能换行、能滚动、整段选中拷贝")
-                                .clicked()
-                            {
-                                *peek = Some(Peek {
-                                    row: index,
-                                    col: col_index,
-                                    at,
-                                });
-                                ui.close();
-                            }
-                            if ui.button("复制单元格").clicked() {
-                                ui.ctx().copy_text(text.clone());
-                                ui.close();
-                            }
-                            if ui.button("复制整行").clicked() {
-                                let line = tsv_row(one.rows[index].iter().map(Cell::display));
-                                ui.ctx().copy_text(line);
-                                ui.close();
-                            }
-                            if ui.button("复制整表").clicked() {
-                                ui.ctx().copy_text(to_tsv(one));
-                                ui.close();
+        .show(ui, |ui| {
+            let table = TableBuilder::new(ui)
+                .id_salt(("db_result", task))
+                .striped(true)
+                // 这儿往里量的可用宽度是无限，横向必须缩到内容宽才有真实的溢出边界，
+                // 水平滚动条才出得来（列少时也不会凭空多一根条）。纵向照旧封顶。
+                .auto_shrink([true, true])
+                // 行数少就照内容收，多了封顶走这块自己的滚动条。不封顶的话六个面板叠起来，
+                // 结果区再怎么拖也装不下两条完整结果。
+                .min_scrolled_height(0.0)
+                .max_scroll_height(height)
+                .cell_layout(Layout::left_to_right(Align::Center))
+                .column(Column::initial(46.0).at_least(34.0).clip(true))
+                .columns(
+                    Column::initial(140.0)
+                        .at_least(56.0)
+                        .resizable(true)
+                        .clip(true),
+                    one.columns.len(),
+                );
+            table
+                .header(18.0, |mut header| {
+                    header.col(|ui| {
+                        ui.label(RichText::new("#").size(11.0).strong());
+                    });
+                    for col in &one.columns {
+                        let name = col.name.clone();
+                        let ty = col.type_name.clone();
+                        header.col(|ui| {
+                            let resp = ui.add(
+                                egui::Label::new(RichText::new(name).size(11.0).strong())
+                                    .truncate()
+                                    .selectable(false),
+                            );
+                            if !ty.is_empty() {
+                                resp.on_hover_text(ty);
                             }
                         });
+                    }
+                })
+                .body(|body| {
+                    body.rows(18.0, one.rows.len(), |mut row| {
+                        let index = row.index();
+                        // `set_selected` 只管它之后加进来的格子，所以第一格之前调。
+                        // 也正因为这样，点下去那一帧不改亮哪一行，下一帧才跟上。
+                        row.set_selected(*selected == Some(index));
+                        row.col(|ui| {
+                            let opened = detail.is_some_and(|d| d.row == index);
+                            let arrow = if opened { "▾" } else { "▸" };
+                            let resp = ui.add(
+                                egui::Label::new(RichText::new(arrow).size(10.0).weak())
+                                    .selectable(false)
+                                    .sense(egui::Sense::click()),
+                            );
+                            let at = resp
+                                .interact_pointer_pos()
+                                .unwrap_or_else(|| resp.rect.center());
+                            if resp.on_hover_text("在右边单独开一个窗口看这一行").clicked() {
+                                *detail = (!opened).then_some(Detail { row: index, at });
+                            }
+                            let mut num = RichText::new(format!("{}", index + 1)).size(10.5);
+                            num = if *selected == Some(index) {
+                                num.strong()
+                            } else {
+                                num.weak()
+                            };
+                            let resp = ui.add(
+                                egui::Label::new(num)
+                                    .selectable(false)
+                                    .sense(egui::Sense::click()),
+                            );
+                            if resp.on_hover_text("点一下选中 / 取消整行").clicked() {
+                                *selected = (*selected != Some(index)).then_some(index);
+                            }
+                        });
+                        for (col_index, cell) in one.rows[index].iter().enumerate() {
+                            let text = cell.display().to_string();
+                            let null = cell.is_null();
+                            let mut rt = RichText::new(text.clone()).size(11.0).monospace();
+                            if null {
+                                rt = rt.weak().italics();
+                            }
+                            row.col(|ui| {
+                                let resp = ui
+                                    .add(egui::Label::new(rt).truncate().selectable(true))
+                                    .on_hover_cursor(egui::CursorIcon::Text);
+                                // 只有真被列宽裁掉的格子才给悬浮，短值多弹一个框反而碍事。
+                                // 表格只给可见行跑这段，量一行的宽度不贵。
+                                let full = ui
+                                    .painter()
+                                    .layout_no_wrap(
+                                        text.clone(),
+                                        egui::FontId::monospace(11.0),
+                                        Color32::WHITE,
+                                    )
+                                    .size()
+                                    .x;
+                                let resp = if full <= resp.rect.width() - 6.0 {
+                                    resp
+                                } else {
+                                    resp.on_hover_text(hover_preview(&text))
+                                };
+                                let at = resp
+                                    .interact_pointer_pos()
+                                    .unwrap_or_else(|| resp.rect.right_bottom());
+                                if resp.double_clicked() {
+                                    *peek = Some(Peek {
+                                        row: index,
+                                        col: col_index,
+                                        at,
+                                    });
+                                }
+                                resp.context_menu(|ui| {
+                                    if ui
+                                        .button("查看完整内容")
+                                        .on_hover_text("单独开一个窗口放这一格：能换行、能滚动、整段选中拷贝")
+                                        .clicked()
+                                    {
+                                        *peek = Some(Peek {
+                                            row: index,
+                                            col: col_index,
+                                            at,
+                                        });
+                                        ui.close();
+                                    }
+                                    if ui.button("复制单元格").clicked() {
+                                        ui.ctx().copy_text(text.clone());
+                                        ui.close();
+                                    }
+                                    if ui.button("复制整行").clicked() {
+                                        let line =
+                                            tsv_row(one.rows[index].iter().map(Cell::display));
+                                        ui.ctx().copy_text(line);
+                                        ui.close();
+                                    }
+                                    if ui.button("复制整表").clicked() {
+                                        ui.ctx().copy_text(to_tsv(one));
+                                        ui.close();
+                                    }
+                                });
+                            });
+                        }
                     });
-                }
-            });
+                });
         });
+
+    // 选中那一行的去处。快捷键留给编辑器，这里只给按钮——结果区抢一个 Ctrl+C
+    // 会把正在编辑器里拷贝的那只手抢走。
+    if let Some(index) = *selected {
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("已选中第 {} 行", index + 1))
+                    .size(10.5)
+                    .strong(),
+            );
+            if ui
+                .add(egui::Button::new(RichText::new("复制整行").size(11.0)).frame(false))
+                .on_hover_text("制表符分隔的一行，直接粘进表格软件")
+                .clicked()
+            {
+                let line = tsv_row(one.rows[index].iter().map(Cell::display));
+                ui.ctx().copy_text(line);
+            }
+            let resp = ui
+                .add(egui::Button::new(RichText::new("看详情").size(11.0)).frame(false))
+                .on_hover_text("在右边单独开一个窗口，逐列看完整值");
+            if resp.clicked() {
+                *detail = Some(Detail {
+                    row: index,
+                    at: resp.rect.center(),
+                });
+            }
+            if ui
+                .add(egui::Button::new(RichText::new("取消选中").size(11.0)).frame(false))
+                .clicked()
+            {
+                *selected = None;
+            }
+        });
+    }
     if one.truncated {
         ui.label(weak(
             "行数超过上限，只留了前面这些；要全量请在 SQL 里自己分页。",
         ));
-    }
-    // 展开的行统一摊在表格下面：表格自己带裁剪，行中间塞不进去一整块明细
-    let mut open: Vec<usize> = expanded
-        .iter()
-        .copied()
-        .filter(|i| *i < one.rows.len())
-        .collect();
-    open.sort_unstable();
-    for index in open {
-        detail(ui, one, index);
     }
 }
 
@@ -1232,6 +1354,12 @@ mod tests {
             .collect()
     }
 
+    /// 某一帧屏上所有的字。拿已画好的 `FullOutput` 问，比 `on_screen` 多跑一帧便宜，
+    /// 也不会把时间线跳到 9.0 之后去（同一轮里后面的帧数就得比它大）。
+    fn texts(out: &egui::FullOutput) -> Vec<String> {
+        seen(out).into_iter().map(|(t, _)| t).collect()
+    }
+
     /// 列太窄，长值在网格里只看得到开头。双击把那一条完整内容开成一个小窗口，
     /// 里面能换行、能滚动、能整段选中——底部那一格里头没有第二个地方办得到。
     #[test]
@@ -1267,6 +1395,260 @@ mod tests {
         // 关掉窗口的那一帧记在面板上，别留一个开着的弹窗在状态里
         dock.panels[0].peek = None;
         assert!(!on_screen(&mut dock, &ctx).contains(&"note · 第 1 行".to_string()));
+    }
+
+    /// 按一下（按下、松开各占一帧，再跑一帧让「下一帧才跟上」的高亮落地）。
+    ///
+    /// 返回松手那一帧的输出：剪贴板这类一次性请求只出现在处理点击的那一帧里。
+    fn click(
+        dock: &mut ResultsDock,
+        ctx: &egui::Context,
+        pos: egui::Pos2,
+        t: f64,
+    ) -> egui::FullOutput {
+        let mut at = |pressed: bool, step: f64| {
+            show_pass(
+                dock,
+                ctx,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                step,
+            )
+        };
+        at(true, t);
+        let out = at(false, t + 0.05);
+        show_pass(dock, ctx, vec![], t + 0.10);
+        out
+    }
+
+    /// 屏上某段文字最靠左的那一格。同一列里行号和格子内容会撞字，靠左的是行号。
+    fn spot(out: &egui::FullOutput, needle: &str) -> Option<egui::Pos2> {
+        seen(out)
+            .into_iter()
+            .filter(|(t, _)| t == needle)
+            .min_by(|a, b| a.1.min.x.total_cmp(&b.1.min.x))
+            .map(|(_, rect)| rect.center())
+    }
+
+    /// 整行选中时一格一格铺出来的选中底色有几块。
+    fn lit(out: &egui::FullOutput, want: Color32) -> usize {
+        fn walk(shape: &egui::Shape, want: Color32, n: &mut usize) {
+            match shape {
+                egui::Shape::Rect(r) if r.fill == want => *n += 1,
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, want, n)),
+                _ => {}
+            }
+        }
+        let mut n = 0;
+        for group in &out.shapes {
+            walk(&group.shape, want, &mut n);
+        }
+        n
+    }
+
+    fn copied(out: &egui::FullOutput) -> Vec<String> {
+        out.platform_output
+            .commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 列一多，底部那一格压根装不下，而 egui_extras 的表体只给竖向滚动。
+    /// 外面这层横向滚动区就是补这一维的：溢出之后滚得动，最右那一列滚得回来。
+    #[test]
+    fn a_wide_table_can_be_scrolled_sideways() {
+        let mut dock = ResultsDock::new();
+        let cols = ["c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8"];
+        dock.start_run("本机", "宽表", &parts(&["SELECT * FROM wide"]), None);
+        let row = cols
+            .iter()
+            .map(|c| Cell::Text((*c).into()))
+            .collect::<Vec<_>>();
+        let one = table(&cols, vec![row]);
+        dock.on_event(&event(1, Ok(DbOutcome::Statement(one))));
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let out = show_pass(&mut dock, &ctx, vec![], 0.0);
+        let edge = 900.0;
+        // 8 列 × 140 早就越过 900 宽的结果区了。裁在外面的那些压根不往 shapes 里
+        // 落笔（格子 clip 后矩形为空，epaint 直接丢），所以屏上只剩左边六列。
+        let shown = texts(&out);
+        assert!(shown.contains(&"c1".to_string()), "第一列就该在屏上：{shown:?}");
+        assert!(
+            !shown.contains(&"c8".to_string()),
+            "最右边那一列不该还没滚就看得见：{shown:?}"
+        );
+        assert!(
+            (1..=8).filter(|i| shown.contains(&format!("c{i}"))).count() < 8,
+            "八列全挤得下，那这轮根本没造出溢出：{shown:?}"
+        );
+
+        let over = spot(&out, "c1").expect("第一列没画出来");
+        let mut t = 1.0;
+        show_pass(&mut dock, &ctx, vec![egui::Event::PointerMoved(over)], t);
+        t += 0.1;
+        // `delta` 说的是「内容往哪儿挪」，所以要往右滚得给负的 x
+        show_pass(
+            &mut dock,
+            &ctx,
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(-600.0, 0.0),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Wheel,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            t,
+        );
+        t += 0.1;
+        let mut out = show_pass(&mut dock, &ctx, vec![], t);
+        // 滚动带惯性，几帧才停得住
+        for _ in 0..6 {
+            t += 0.1;
+            out = show_pass(&mut dock, &ctx, vec![], t);
+        }
+        let shown = texts(&out);
+        assert!(
+            shown.contains(&"c8".to_string()),
+            "滚过去了最右那一列还是没进屏：{shown:?}"
+        );
+        assert!(
+            !shown.contains(&"c1".to_string()),
+            "滚到头了第一列还赖在屏上，说明压根没滚：{shown:?}"
+        );
+        let c8 = seen(&out)
+            .into_iter()
+            .find(|(t, _)| t == "c8")
+            .map(|(_, rect)| rect.min.x)
+            .expect("c8 又不见了");
+        assert!(c8 < edge, "c8 落在了屏外：{c8:.0}");
+    }
+
+    /// 点行号选中整行：底色铺满这一行，格子底下跟出一排按钮。
+    ///
+    /// 拷贝走按钮而不是 Ctrl+C——键盘那一下归编辑器，结果区抢过去会把用户
+    /// 正打算拷的那段文字换掉。
+    #[test]
+    fn clicking_the_row_number_selects_the_whole_row() {
+        let mut dock = ResultsDock::new();
+        dock.start_run("本机", "查用户", &parts(&["SELECT note FROM t"]), None);
+        let one = table(
+            &["note"],
+            vec![
+                vec![Cell::Text("甲".into())],
+                vec![Cell::Text("乙".into())],
+            ],
+        );
+        dock.on_event(&event(1, Ok(DbOutcome::Statement(one))));
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let mark = egui::Style::default().visuals.selection.bg_fill;
+        let out = show_pass(&mut dock, &ctx, vec![], 0.0);
+        assert_eq!(lit(&out, mark), 0, "一帧都没点，不该有选中底色");
+        let row2 = spot(&out, "2").expect("第二行的行号没画出来");
+
+        click(&mut dock, &ctx, row2, 1.0);
+        // `set_selected` 只管它之后加进来的格子，所以要点完下一帧才亮
+        let out = show_pass(&mut dock, &ctx, vec![], 1.2);
+        assert!(lit(&out, mark) >= 2, "整行没亮：两格至少该铺两块底色");
+        let shown = texts(&out);
+        assert!(
+            shown.iter().any(|t| t == "已选中第 2 行"),
+            "选中之后没跟出那一排按钮：{shown:?}"
+        );
+
+        let pos = spot(&out, "复制整行").expect("那一排里没有「复制整行」");
+        let out = click(&mut dock, &ctx, pos, 2.0);
+        assert_eq!(
+            copied(&out),
+            vec!["乙".to_string()],
+            "拷的该是选中那一行的原文"
+        );
+
+        // 再点一次行号取消：底色和按钮一起收
+        click(&mut dock, &ctx, row2, 3.0);
+        let out = show_pass(&mut dock, &ctx, vec![], 3.2);
+        assert_eq!(lit(&out, mark), 0, "取消选中了还亮着");
+        let shown = texts(&out);
+        assert!(
+            !shown.iter().any(|t| t == "已选中第 2 行"),
+            "取消选中了那一排还在：{shown:?}"
+        );
+    }
+
+    /// 行首的 ▸ 开的是右边那个独立窗口，不往表格里塞块——塞进去那块收不回去。
+    #[test]
+    fn the_row_arrow_opens_a_detail_window_and_closes_it_again() {
+        let mut dock = ResultsDock::new();
+        dock.start_run("本机", "查用户", &parts(&["SELECT * FROM t"]), None);
+        let one = table(
+            &["name", "note"],
+            vec![vec![Cell::Text("甲".into()), Cell::Text("很长的一段备注".into())]],
+        );
+        dock.on_event(&event(1, Ok(DbOutcome::Statement(one))));
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let out = show_pass(&mut dock, &ctx, vec![], 0.0);
+        let arrow = seen(&out)
+            .into_iter()
+            .find(|(t, _)| t == "▸")
+            .map(|(_, rect)| rect.center())
+            .expect("行首那个 ▸ 没画出来");
+
+        click(&mut dock, &ctx, arrow, 1.0);
+        let mut out = show_pass(&mut dock, &ctx, vec![], 1.2);
+        // 新开的窗口头几帧只在量尺寸、摆位置，尺寸落定才轮到画内容
+        for step in [1.25, 1.3] {
+            out = show_pass(&mut dock, &ctx, vec![], step);
+        }
+        let shown = texts(&out);
+        assert!(
+            shown.iter().any(|t| t == "详情 · 第 1 行"),
+            "点 ▸ 没把详情窗口开出来：{shown:?}"
+        );
+        assert!(
+            shown.iter().any(|t| t == "note =") && shown.iter().any(|t| t == "很长的一段备注"),
+            "详情窗口里没摊开「列名 = 完整值」：{shown:?}"
+        );
+        // 详情在屏幕右边，不会把表格本身盖住
+        let title = seen(&out)
+            .into_iter()
+            .find(|(t, _)| t == "详情 · 第 1 行")
+            .map(|(_, rect)| rect)
+            .expect("窗口标题没了");
+        assert!(
+            title.center().x > 900.0 / 2.0,
+            "详情窗口该贴着屏幕右边，实测标题在 x={:.0}",
+            title.center().x
+        );
+
+        // 收窗口点的是同一个位置：行首那个字换成了 ▾，但按字去找会先撞到面板
+        // 标题上那枚同字的折叠钮，把整块收起来。格子没动过，坐标直接复用。
+        click(&mut dock, &ctx, arrow, 2.0);
+        let out = show_pass(&mut dock, &ctx, vec![], 2.2);
+        let shown = texts(&out);
+        assert!(
+            !shown.iter().any(|t| t.starts_with("详情 · ")),
+            "再点一次 ▾ 没把窗口收掉：{shown:?}"
+        );
+        assert!(
+            dock.panels[0].detail.is_none(),
+            "窗口收掉了，状态里还留着那一行"
+        );
     }
 
     /// 整块提交：块头在第 12 字节，回块也跳那儿

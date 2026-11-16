@@ -30,7 +30,7 @@ The release package is a **single exe** (about 12 MB, 5.2 MB zipped). No .NET, n
 | Recursive split panes | The tmux / i3 binary pane tree — split as deep as you like, default keys match Windows Terminal | [Split panes](#split-panes) |
 | Journal blocks | Task blocks written directly into ordinary text files, mixed with prose and versioned with git | [Journal blocks](#journal-blocks) |
 | SQL blocks | Jupyter-style: the query lives in a plain text file, `Ctrl+Enter` runs it and the result lands below the editor. `Ctrl+Alt+N` starts a fresh `query-<timestamp>.sql` with the connection already bound | [SQL blocks](#sql-blocks) |
-| Multiple results at once | One panel per statement, so a broken second query does not throw away the first result; batch headers, pop-out windows, copy as TSV, export as CSV, long cells unfolded per row | [Results dock](#results-dock) |
+| Multiple results at once | One panel per statement, so a broken second query does not throw away the first result; batch headers, pop-out windows, copy as TSV, export as CSV, sideways-scrolling wide tables, whole-row selection, per-row detail window | [Results dock](#results-dock) |
 | MySQL connections | Named connections in `config.json`, browsed as connection → database → table, passwords via `env:` so no secret sits on disk. The test verdict (`✓` / `✗` / `⚠`) and the current default are visible wherever the connection is | [Connections](#connections) |
 | Cursor position history | Like IDEA's Navigate Back / Forward; a position only counts as a stop after the cursor sits there for 350 ms | [Cursor position history](#cursor-position-history) |
 | Find and replace | Case sensitivity, regex, all matches highlighted, hands stay in the input box | [Find and replace](#find-and-replace) |
@@ -210,7 +210,10 @@ Six panels stacked in one strip is its own problem, so the dock separates them t
 - **A 2.5 pt status bar painted down the left edge** of every panel (green done / red failed / blue waiting). Titles repeat; colour does not
 
 - Each panel header carries `回块` (jump back to the block it came from), `放大` / `收起` (put *this* result into its own resizable window — the way to read a wide table that the bottom strip cannot stretch to fit), `复制` (the whole result as tab-separated text, ready to paste into a spreadsheet), `导出` (CSV), `关掉整块` (close every panel of this submission) and `✕`; clicking the header row itself collapses just that panel
-- Grid cells are single-line and truncated — that is what keeps a wide table readable — but a `TEXT` column with a paragraph in it is not gone: the `▸` at the head of each row unfolds **that row underneath the table** as `column = full value`, wrapped, selectable, and copyable cell / row / table from any cell's right-click menu. It is a per-panel toggle, so five rows can stay open while one is expanded
+- Grid cells are single-line and truncated — that is what keeps a wide table readable. A copy of any cell, row or table is on its right-click menu
+- **Wide tables scroll sideways.** `egui_extras` gives a table body a vertical bar and nothing else, so the grid is wrapped in its own horizontal scroll area — header and body travel together, so columns cannot slip out of alignment. Each column starts at 140 pt, keeps a 56 pt floor and is still drag-resizable; the `#` column is 46 pt and slides along with the rest. One caveat the nesting brings: the table's vertical bar now sits at the right edge of the *content*, so it can be off-screen while you are scrolled left — the wheel still scrolls vertically there
+- **The `▸` at the head of a row opens that row in its own window, pinned to the right of the screen**: one `column = full value` field per line, wrapped, selectable, with `复制整行` at the bottom. The same chevron closes it, one window per panel, and it reopens where you left it. It used to unfold a block inside the grid, which could not be folded back and kept getting clipped by the table's own viewport
+- **Click a row number to select the whole row.** Every cell of it lights up and an action bar appears under the grid: `复制整行` (that row as TSV), `看详情` (the same right-side window) and `取消选中`. Copying lives on the bar rather than on `Ctrl+C` on purpose — that keystroke belongs to the editor, and stealing it would swap whatever you were about to copy there
 - A cell that is genuinely too narrow for its content shows a hover tooltip with the head of the value, and **double-clicking it opens that one cell in its own window** — wrapped, scrollable, select-all, with `复制本格` putting the *untruncated* value on the clipboard (the same item is on the right-click menu as `查看完整内容`). Same-grid, same-data: the window reads the panel it came from
 - The bottom strip is resizable even before anything has run — dragging the divider up used to spring back to the default height, because an empty dock only measured one line of text and the panel booked that
 - The dock bar has `全部收起 / 全部展开`, `清空` (closes finished panels and keeps the ones still waiting for a reply) and `关闭`
@@ -456,7 +459,7 @@ About 19,900 lines of Rust in a single binary crate, 22 source files:
 | `src/database.rs` | Sidebar `Database` tab and the connection manager window: cached tree, in-flight requests, the connection draft, and the stored test verdict with the fingerprint that retires it |
 | `src/db/mod.rs` | Engine-agnostic protocol: `ConnectionSpec` → `Driver`, one worker thread per connection, events back out, plus `MockDriver` so the UI is testable without a server |
 | `src/db/mysql.rs` | The only file that knows MySQL: connect options, the text protocol → cells, one statement per call |
-| `src/results.rs` | Results dock: one panel per statement, batch headers, pop-out window, status write-back, TSV for `复制`, RFC 4180 CSV for `导出`, per-row expansion |
+| `src/results.rs` | Results dock: one panel per statement, batch headers, pop-out window, status write-back, TSV for `复制`, RFC 4180 CSV for `导出`, sideways scroll, whole-row selection, per-row detail window |
 | `src/nav.rs` | Cursor position history |
 | `src/format.rs` | JSON / XML formatting |
 | `src/keymap.rs` | Configurable keybindings: action ids, serialization, conflict detection |
@@ -606,6 +609,14 @@ The byte spans painted in the editor come from the same scan that produced the s
 ### A freshly opened egui window paints nothing
 
 `Window::show` spends its first frames measuring and placing itself; content only appears once the size has settled. That is egui's business, but it is a trap for headless tests: the pop-out result window test has to burn two frames after the click before asserting that the grid text is on screen.
+
+### A wide table needs its own scroll area, and the tests see the culling
+
+`egui_extras` hard-codes its table body as `ScrollArea::new([false, vscroll])` — there is no horizontal dimension at all, so past the point where the columns stop fitting they are simply cut off. The fix is an outer `ScrollArea::horizontal()` around the *whole* table: the header is painted outside the body's scroll area, so wrapping only one of the two leaves the header's columns and the body's columns misaligned.
+
+Inside that outer scroll area, the available width is unbounded, which rules out the obvious approaches: column widths cannot be derived from `available_width()` (they would be computed from infinity), and `TableState` freezes a resizable column's width after the first frame, so a width that adapts to the panel never arrives. Hence the fixed 140 pt / 56 pt floor.
+
+The same nesting changes what a headless test can observe. A cell whose clip rect has degenerated to nothing (fully scrolled out) is dropped by `Painter::add` before it ever reaches `FullOutput.shapes` — it is not painted off-screen, it does not exist in the output. So `a_wide_table_can_be_scrolled_sideways` asserts `c8` is *absent* before the wheel event and *present* after it, instead of comparing x coordinates across the two passes.
 
 ### A connection verdict is claimed by a fingerprint, not by a name
 
