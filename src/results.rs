@@ -714,6 +714,7 @@ fn draw_cell_peek(panel: &mut Panel, ctx: &egui::Context) {
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.checkbox(&mut pinned, "钉住")
+                        .on_hover_cursor(crate::theme::HAND)
                         .on_hover_text("钉住：点别处它也不关。\n不勾时点了窗口外面任何一处，这一格自己收掉。");
                 });
             });
