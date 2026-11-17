@@ -28,7 +28,9 @@
 
 use std::sync::Arc;
 
-use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, FontId, FontTweak, TextStyle};
+use eframe::egui::{
+    self, Color32, FontData, FontDefinitions, FontFamily, FontId, FontTweak, TextStyle,
+};
 
 /// 代码区统一行高（字号倍数）。取中文行高，保证字形不被裁切。
 pub const MONO_LINE_HEIGHT: f32 = 1.32;
@@ -89,7 +91,9 @@ pub fn install_fonts(ctx: &egui::Context) {
         let mut mono = FontData::from_blob(blob, 0);
         mono.tweak = baseline_tweak(SYMBOL_Y_OFFSET);
 
-        fonts.font_data.insert("symbols".to_owned(), Arc::new(plain));
+        fonts
+            .font_data
+            .insert("symbols".to_owned(), Arc::new(plain));
         fonts
             .font_data
             .insert("symbols_mono".to_owned(), Arc::new(mono));
@@ -121,7 +125,9 @@ pub fn install_fonts(ctx: &egui::Context) {
         mono.tweak = baseline_tweak(CJK_Y_OFFSET);
 
         fonts.font_data.insert("cjk".to_owned(), Arc::new(plain));
-        fonts.font_data.insert("cjk_mono".to_owned(), Arc::new(mono));
+        fonts
+            .font_data
+            .insert("cjk_mono".to_owned(), Arc::new(mono));
 
         fonts
             .families
@@ -156,6 +162,29 @@ pub fn panel_fill(dark: bool) -> Color32 {
     }
 }
 
+/// 能点的地方一律换成手型光标。
+pub const HAND: egui::CursorIcon = egui::CursorIcon::PointingHand;
+
+/// 行内那种「看着像文字、其实能按」的小按钮。
+///
+/// `frame(false)` 的按钮悬浮时一笔不画，用户分不清那是一句说明还是一个能按的东西；
+/// 这里改用 egui 自己的「没激活就藏起边框」——底色只在悬浮和按下时出现，
+/// 边距却一直留着，所以点下去不会把整行推歪。字号和边距在这一处统一，
+/// 免得各面板各写各的，一排小按钮高矮胖瘦不齐。
+pub fn chip(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        ui.spacing_mut().button_padding = egui::vec2(4.0, 2.0);
+        ui.add(
+            egui::Button::new(egui::RichText::new(text).size(11.0))
+                .frame(true)
+                .frame_when_inactive(false),
+        )
+    })
+    .inner
+    .on_hover_cursor(HAND)
+}
+
 /// 应用整体视觉风格。
 pub fn apply_style(ctx: &egui::Context, dark: bool) {
     ctx.set_theme(if dark {
@@ -188,6 +217,9 @@ pub fn apply_style(ctx: &egui::Context, dark: bool) {
 
     let mut style = (*ctx.global_style()).clone();
     style.visuals = visuals;
+    // 按钮一悬停就换手型光标，跟浏览器一致；自绘的行和页签不吃这条，
+    // 得各自 .on_hover_cursor(HAND)
+    style.visuals.interact_cursor = Some(egui::CursorIcon::PointingHand);
     style.spacing.item_spacing = egui::vec2(6.0, 5.0);
     style.spacing.button_padding = egui::vec2(8.0, 3.0);
     style.spacing.menu_margin = egui::Margin::same(6);
@@ -203,8 +235,9 @@ pub fn apply_style(ctx: &egui::Context, dark: bool) {
     style
         .text_styles
         .insert(TextStyle::Heading, FontId::proportional(18.0));
-    style
-        .text_styles
-        .insert(TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace));
+    style.text_styles.insert(
+        TextStyle::Monospace,
+        FontId::new(13.0, FontFamily::Monospace),
+    );
     ctx.set_global_style(style);
 }

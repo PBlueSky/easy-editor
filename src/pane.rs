@@ -199,10 +199,7 @@ impl<T> PaneTree<T> {
     pub fn remove(&mut self, id: PaneId) -> Option<T> {
         let ids = self.pane_ids();
         let at = ids.iter().position(|p| *p == id)?;
-        let payload = self
-            .root
-            .as_mut()
-            .and_then(|root| root.take_payload(id));
+        let payload = self.root.as_mut().and_then(|root| root.take_payload(id));
         if payload.is_some() {
             if let Some(root) = self.root.take() {
                 self.root = collapse(root);
@@ -491,7 +488,13 @@ fn collapse<T>(node: Node<T>) -> Option<Node<T>> {
             id,
             payload: Some(p),
         }),
-        Node::Split { id, axis, ratio, a, b } => match (collapse(*a), collapse(*b)) {
+        Node::Split {
+            id,
+            axis,
+            ratio,
+            a,
+            b,
+        } => match (collapse(*a), collapse(*b)) {
             (Some(a), Some(b)) => Some(Node::Split {
                 id,
                 axis,

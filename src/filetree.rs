@@ -276,8 +276,7 @@ impl FileTree {
         let row = ui.available_rect_before_wrap();
         ui.horizontal(|ui| {
             let buttons = ui.scope_builder(
-                egui::UiBuilder::new()
-                    .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                egui::UiBuilder::new().layout(egui::Layout::right_to_left(egui::Align::Center)),
                 |ui| {
                     ui.add_space(4.0);
                     if ui
@@ -311,8 +310,10 @@ impl FileTree {
             let right = buttons.inner.left() - 6.0;
             let row_h = ui.spacing().interact_size.y.min(24.0);
             if right > row.left() + 24.0 {
-                let rect =
-                    egui::Rect::from_min_size(row.left_top(), egui::vec2(right - row.left(), row_h));
+                let rect = egui::Rect::from_min_size(
+                    row.left_top(),
+                    egui::vec2(right - row.left(), row_h),
+                );
                 ui.scope_builder(
                     egui::UiBuilder::new()
                         .max_rect(rect)
@@ -336,10 +337,8 @@ impl FileTree {
         });
 
         // 根目录也支持右键新建，工作区为空时也能操作
-        let (root_rect, root_resp) = ui.allocate_exact_size(
-            Vec2::new(ui.available_width(), 2.0),
-            Sense::click(),
-        );
+        let (root_rect, root_resp) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 2.0), Sense::click());
         let _ = root_rect;
         root_resp.context_menu(|ui| {
             if ui.button("在根目录新建文件").clicked() {
@@ -459,12 +458,7 @@ impl FileTree {
         hits
     }
 
-    fn render_search_results(
-        &mut self,
-        ui: &mut Ui,
-        dark: bool,
-        out: &mut Option<TreeAction>,
-    ) {
+    fn render_search_results(&mut self, ui: &mut Ui, dark: bool, out: &mut Option<TreeAction>) {
         let hits = self.matching_entries();
         if hits.is_empty() {
             ui.add_space(8.0);
@@ -476,12 +470,15 @@ impl FileTree {
         for entry in hits {
             let row_h = 20.0;
             let width = ui.available_width().max(120.0);
-            let (rect, response) =
-                ui.allocate_exact_size(Vec2::new(width, row_h), Sense::click());
+            let (rect, response) = ui.allocate_exact_size(Vec2::new(width, row_h), Sense::click());
+            let response = response.on_hover_cursor(crate::theme::HAND);
 
             if self.selected.as_deref() == Some(entry.path.as_path()) {
-                ui.painter()
-                    .rect_filled(rect, 3.0, ui.visuals().selection.bg_fill.gamma_multiply(0.35));
+                ui.painter().rect_filled(
+                    rect,
+                    3.0,
+                    ui.visuals().selection.bg_fill.gamma_multiply(0.35),
+                );
             } else if response.hovered() {
                 ui.painter()
                     .rect_filled(rect, 3.0, ui.visuals().widgets.hovered.weak_bg_fill);
@@ -552,15 +549,18 @@ impl FileTree {
             let indent = 6.0 + depth as f32 * 13.0;
             let row_h = 20.0;
             let width = ui.available_width().max(120.0);
-            let (rect, response) =
-                ui.allocate_exact_size(Vec2::new(width, row_h), Sense::click());
+            let (rect, response) = ui.allocate_exact_size(Vec2::new(width, row_h), Sense::click());
+            let response = response.on_hover_cursor(crate::theme::HAND);
 
             let hovered = response.hovered();
             let selected = self.selected.as_deref() == Some(entry.path.as_path());
 
             if selected {
-                ui.painter()
-                    .rect_filled(rect, 3.0, ui.visuals().selection.bg_fill.gamma_multiply(0.35));
+                ui.painter().rect_filled(
+                    rect,
+                    3.0,
+                    ui.visuals().selection.bg_fill.gamma_multiply(0.35),
+                );
             } else if hovered {
                 ui.painter()
                     .rect_filled(rect, 3.0, ui.visuals().widgets.hovered.weak_bg_fill);
@@ -639,7 +639,11 @@ impl FileTree {
                 let target_dir = if entry.is_dir {
                     entry.path.clone()
                 } else {
-                    entry.path.parent().map(|p| p.to_path_buf()).unwrap_or_default()
+                    entry
+                        .path
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_default()
                 };
                 if ui.button("新建文件").clicked() {
                     self.new_entry = Some((target_dir.clone(), false));
@@ -660,7 +664,8 @@ impl FileTree {
                     ui.close();
                 }
                 ui.separator();
-                if !entry.is_dir && format::supports(&entry.path) && ui.button("格式化").clicked() {
+                if !entry.is_dir && format::supports(&entry.path) && ui.button("格式化").clicked()
+                {
                     *out = Some(TreeAction::Format(entry.path.clone()));
                     ui.close();
                 }
@@ -693,37 +698,45 @@ impl FileTree {
     ) {
         let mut close = false;
         let mut create = false;
-        egui::Window::new(if is_dir { "新建文件夹" } else { "新建文件" })
-            .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.label(format!("位置：{}", parent.to_string_lossy()));
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.new_name)
-                        .hint_text(if is_dir { "文件夹名称" } else { "文件名，如 main.rs" })
-                        .desired_width(300.0),
-                );
-                // 每帧无条件 request_focus 会把输入法组字打断，中文填不进来（见 src/ime.rs）
-                ime::focus_input_box(&resp);
-                // 组字期间的回车/Esc 是输入法在用（确认候选词 / 撤销组字），别当成建文件
-                if !ime::composing(ui) {
-                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        close = true;
-                    }
-                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        create = true;
-                    }
+        egui::Window::new(if is_dir {
+            "新建文件夹"
+        } else {
+            "新建文件"
+        })
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.label(format!("位置：{}", parent.to_string_lossy()));
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.new_name)
+                    .hint_text(if is_dir {
+                        "文件夹名称"
+                    } else {
+                        "文件名，如 main.rs"
+                    })
+                    .desired_width(300.0),
+            );
+            // 每帧无条件 request_focus 会把输入法组字打断，中文填不进来（见 src/ime.rs）
+            ime::focus_input_box(&resp);
+            // 组字期间的回车/Esc 是输入法在用（确认候选词 / 撤销组字），别当成建文件
+            if !ime::composing(ui) {
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    close = true;
                 }
-                ui.horizontal(|ui| {
-                    if ui.button("创建").clicked() {
-                        create = true;
-                    }
-                    if ui.button("取消").clicked() {
-                        close = true;
-                    }
-                });
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    create = true;
+                }
+            }
+            ui.horizontal(|ui| {
+                if ui.button("创建").clicked() {
+                    create = true;
+                }
+                if ui.button("取消").clicked() {
+                    close = true;
+                }
             });
+        });
 
         if create && !self.new_name.trim().is_empty() {
             let path = parent.join(self.new_name.trim());
@@ -850,7 +863,11 @@ mod tests {
     }
 
     /// 只关心画面、不关心操作结果的帧。
-    fn frame(ctx: &egui::Context, tree: &mut FileTree, events: Vec<egui::Event>) -> egui::FullOutput {
+    fn frame(
+        ctx: &egui::Context,
+        tree: &mut FileTree,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
         pass(ctx, tree, events).0
     }
 
@@ -881,11 +898,7 @@ mod tests {
     }
 
     /// 菜单弹出的帧数不固定，多跑几帧等到它出现。
-    fn wait_for_text(
-        ctx: &egui::Context,
-        tree: &mut FileTree,
-        needle: &str,
-    ) -> Option<Rect> {
+    fn wait_for_text(ctx: &egui::Context, tree: &mut FileTree, needle: &str) -> Option<Rect> {
         for _ in 0..4 {
             let out = frame(ctx, tree, vec![]);
             if let Some(rect) = find_text(&out, needle) {
@@ -911,14 +924,30 @@ mod tests {
             .expect("文件树里没画出 a.txt")
             .center();
 
-        pass(&ctx, &mut tree, pointer(row, egui::PointerButton::Secondary, true));
-        pass(&ctx, &mut tree, pointer(row, egui::PointerButton::Secondary, false));
+        pass(
+            &ctx,
+            &mut tree,
+            pointer(row, egui::PointerButton::Secondary, true),
+        );
+        pass(
+            &ctx,
+            &mut tree,
+            pointer(row, egui::PointerButton::Secondary, false),
+        );
         let item = wait_for_text(&ctx, &mut tree, "新建文件")
             .expect("右键没有弹出「新建文件」菜单")
             .center();
 
-        pass(&ctx, &mut tree, pointer(item, egui::PointerButton::Primary, true));
-        pass(&ctx, &mut tree, pointer(item, egui::PointerButton::Primary, false));
+        pass(
+            &ctx,
+            &mut tree,
+            pointer(item, egui::PointerButton::Primary, true),
+        );
+        pass(
+            &ctx,
+            &mut tree,
+            pointer(item, egui::PointerButton::Primary, false),
+        );
         // Window 的第一帧只量尺寸不画内容，再跑一帧才能看到它
         let out = frame(&ctx, &mut tree, vec![]);
         assert!(tree.new_entry.is_some(), "点了菜单项却没记下新建目标");
@@ -927,15 +956,8 @@ mod tests {
             "新建对话框没画出来"
         );
 
-        frame(
-            &ctx,
-            &mut tree,
-            vec![egui::Event::Text("probe.txt".into())],
-        );
-        assert_eq!(
-            tree.new_name, "probe.txt",
-            "对话框里的输入框没收到键盘文字"
-        );
+        frame(&ctx, &mut tree, vec![egui::Event::Text("probe.txt".into())]);
+        assert_eq!(tree.new_name, "probe.txt", "对话框里的输入框没收到键盘文字");
 
         frame(
             &ctx,
@@ -969,13 +991,29 @@ mod tests {
             .expect("文件树里没画出 a.txt")
             .center();
 
-        frame(&ctx, &mut tree, pointer(row, egui::PointerButton::Secondary, true));
-        frame(&ctx, &mut tree, pointer(row, egui::PointerButton::Secondary, false));
+        frame(
+            &ctx,
+            &mut tree,
+            pointer(row, egui::PointerButton::Secondary, true),
+        );
+        frame(
+            &ctx,
+            &mut tree,
+            pointer(row, egui::PointerButton::Secondary, false),
+        );
         let item = wait_for_text(&ctx, &mut tree, "重命名")
             .expect("右键没有弹出「重命名」菜单")
             .center();
-        frame(&ctx, &mut tree, pointer(item, egui::PointerButton::Primary, true));
-        frame(&ctx, &mut tree, pointer(item, egui::PointerButton::Primary, false));
+        frame(
+            &ctx,
+            &mut tree,
+            pointer(item, egui::PointerButton::Primary, true),
+        );
+        frame(
+            &ctx,
+            &mut tree,
+            pointer(item, egui::PointerButton::Primary, false),
+        );
 
         // 改名框出现，并预填当前名字
         let out = frame(&ctx, &mut tree, vec![]);
@@ -1010,7 +1048,11 @@ mod tests {
             }
             other => panic!("回车改名没交出 Renamed 动作：{other:?}"),
         }
-        assert_eq!(std::fs::read_to_string(&new).unwrap(), "hello\n", "内容换了文件");
+        assert_eq!(
+            std::fs::read_to_string(&new).unwrap(),
+            "hello\n",
+            "内容换了文件"
+        );
         assert!(!old.exists(), "旧名字还留在磁盘上");
         assert_eq!(tree.renaming, None, "改名框该关掉");
     }
@@ -1057,13 +1099,29 @@ mod tests {
         // Esc 取消
         let out = frame(&ctx, &mut tree, vec![]);
         let row = find_text(&out, "a.txt").expect("没画出 a.txt").center();
-        frame(&ctx, &mut tree, pointer(row, egui::PointerButton::Secondary, true));
-        frame(&ctx, &mut tree, pointer(row, egui::PointerButton::Secondary, false));
+        frame(
+            &ctx,
+            &mut tree,
+            pointer(row, egui::PointerButton::Secondary, true),
+        );
+        frame(
+            &ctx,
+            &mut tree,
+            pointer(row, egui::PointerButton::Secondary, false),
+        );
         let item = wait_for_text(&ctx, &mut tree, "重命名")
             .expect("右键没有弹出「重命名」菜单")
             .center();
-        frame(&ctx, &mut tree, pointer(item, egui::PointerButton::Primary, true));
-        frame(&ctx, &mut tree, pointer(item, egui::PointerButton::Primary, false));
+        frame(
+            &ctx,
+            &mut tree,
+            pointer(item, egui::PointerButton::Primary, true),
+        );
+        frame(
+            &ctx,
+            &mut tree,
+            pointer(item, egui::PointerButton::Primary, false),
+        );
         frame(&ctx, &mut tree, vec![]);
         assert_eq!(tree.renaming.as_deref(), Some(old.as_path()));
         frame(
@@ -1098,13 +1156,29 @@ mod tests {
         let row = find_text(&out, "a.txt")
             .expect("文件树里没画出 sub/a.txt")
             .center();
-        frame(&ctx, &mut tree, pointer(row, egui::PointerButton::Secondary, true));
-        frame(&ctx, &mut tree, pointer(row, egui::PointerButton::Secondary, false));
+        frame(
+            &ctx,
+            &mut tree,
+            pointer(row, egui::PointerButton::Secondary, true),
+        );
+        frame(
+            &ctx,
+            &mut tree,
+            pointer(row, egui::PointerButton::Secondary, false),
+        );
         let item = wait_for_text(&ctx, &mut tree, "在此处打开终端")
             .expect("右键没有弹出「在此处打开终端」菜单")
             .center();
-        frame(&ctx, &mut tree, pointer(item, egui::PointerButton::Primary, true));
-        let (_, action) = pass(&ctx, &mut tree, pointer(item, egui::PointerButton::Primary, false));
+        frame(
+            &ctx,
+            &mut tree,
+            pointer(item, egui::PointerButton::Primary, true),
+        );
+        let (_, action) = pass(
+            &ctx,
+            &mut tree,
+            pointer(item, egui::PointerButton::Primary, false),
+        );
         match action {
             Some(TreeAction::OpenTerminal(at)) => assert_eq!(at, dir.join("sub")),
             other => panic!("点「在此处打开终端」没交出目录：{other:?}"),

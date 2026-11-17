@@ -13,11 +13,21 @@
 //! 本模块不碰 egui，也不管 SQL 块的文本格式（那在 `crate::sql`）。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 pub mod mysql;
+
+/// 一条连接闲够这么久就把工作线程收掉。
+///
+/// 会话在服务器侧也占一个线程和一块缓冲区。配了十条连接、当前只用两条，
+/// 不该让另外八条一直挂着；收掉之后下次要用会自动重开，用户那边只是牌子
+/// 从「已连接」翻回「未连接」。
+pub const IDLE_LINK: Duration = Duration::from_secs(5 * 60);
 
 /// 一个结果面板最多显示多少行。再多没人看得完，还白占内存；
 /// 要全量就自己在 SQL 里分页。
@@ -315,9 +325,7 @@ type ConnectFn = fn(&ConnectionSpec) -> Result<Box<dyn Driver>, DbError>;
 /// 一次只回一个结果的请求。整块执行不走它，见 [`Job::Run`]。
 enum Call {
     Databases,
-    Tables {
-        database: String,
-    },
+    Tables { database: String },
     Probe,
 }
 
@@ -344,6 +352,9 @@ enum Msg {
         id: u64,
         conn: String,
         error: String,
+        /// 会话是否废了（见 [`DbError::needs_reconnect`]）。
+        /// 上层拿它决定「已断开」的牌子翻不翻：SQL 自己的错不该把连接说成断了。
+        dead: bool,
     },
 }
 
@@ -354,6 +365,19 @@ pub struct DbEvent {
     pub id: u64,
     pub conn: String,
     pub outcome: Result<DbOutcome, String>,
+    /// 失败且会话已不可用。成功的事件恒为 `false`。
+    pub dead: bool,
+}
+
+/// 一条连接背后那个工作线程的把手。
+struct Worker {
+    /// 建线程时用的配置。改过就换一条线程，省掉「往旧线程发重连指令」这套协议。
+    spec: ConnectionSpec,
+    tx: Sender<Job>,
+    /// 线程正不正在干活。闲够 [`IDLE_LINK`] 才回收，正在跑查询的不动它。
+    busy: Arc<AtomicBool>,
+    /// 最近一次派活或收活，回收只看这个数。
+    last_used: Instant,
 }
 
 /// 按连接名常驻的后台线程集合。
@@ -361,9 +385,7 @@ pub struct DbHub {
     connect: ConnectFn,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
-    /// 连接名 -> (建线程时用的配置, 该工作线程的收件箱)。
-    /// 配置改过就重开一条线程，省掉「往旧线程发重连指令」这套额外协议。
-    workers: HashMap<String, (ConnectionSpec, Sender<Job>)>,
+    workers: HashMap<String, Worker>,
     next_id: u64,
 }
 
@@ -410,12 +432,13 @@ impl DbHub {
         }
         let max_rows = max_rows.clamp(1, MAX_ROWS);
         self.ensure_worker(spec);
-        let tx = self.workers[&spec.name].1.clone();
-        // 工作线程只可能在 hub 被 drop 后退出，那时整个应用也要走了，不特别处理
-        let _ = tx.send(Job::Run {
-            parts: parts.clone(),
-            max_rows,
-        });
+        self.dispatch(
+            spec,
+            Job::Run {
+                parts: parts.clone(),
+                max_rows,
+            },
+        );
         Ok(parts)
     }
 
@@ -437,10 +460,20 @@ impl DbHub {
         }
         let id = self.take_id();
         self.ensure_worker(spec);
-        let tx = self.workers[&spec.name].1.clone();
-        // 工作线程只可能在 hub 被 drop 后退出，那时整个应用也要走了，不特别处理
-        let _ = tx.send(Job::Call { id, call });
+        self.dispatch(spec, Job::Call { id, call });
         Ok(id)
+    }
+
+    /// 派一个任务给这条连接的工作线程，顺手记一笔「它在用」。
+    ///
+    /// 工作线程只可能在 hub 被 drop 后退出，所以通道写不进去当作丢掉就行，
+    /// 每种任务都保证每个 id 至多一个回执（见 [`DbHub::spawn`] 里的说法）。
+    fn dispatch(&mut self, spec: &ConnectionSpec, job: Job) {
+        if let Some(worker) = self.workers.get_mut(&spec.name) {
+            worker.busy.store(true, Ordering::Relaxed);
+            let _ = worker.tx.send(job);
+            worker.last_used = Instant::now();
+        }
     }
 
     fn take_id(&mut self) -> u64 {
@@ -454,121 +487,61 @@ impl DbHub {
         let stale = self
             .workers
             .get(&spec.name)
-            .is_some_and(|(used, _)| used != spec);
+            .is_some_and(|worker| worker.spec != *spec);
         if stale {
             // 配置改过了。丢掉旧线程的发送端，它会因为通道断开自己退出。
             self.workers.remove(&spec.name);
         }
         if !self.workers.contains_key(&spec.name) {
-            let tx = self.spawn(spec.clone());
-            self.workers.insert(spec.name.clone(), (spec.clone(), tx));
+            let (tx, busy) = self.spawn(spec.clone());
+            self.workers.insert(
+                spec.name.clone(),
+                Worker {
+                    spec: spec.clone(),
+                    tx,
+                    busy,
+                    last_used: Instant::now(),
+                },
+            );
         }
     }
 
-    fn spawn(&self, spec: ConnectionSpec) -> Sender<Job> {
+    /// 收掉闲够久的线程，返回被收的的连接名（上层据此把牌子翻回「未连接」）。
+    ///
+    /// `busy` 那一判是必须的：正在跑查询的线程只是「很久没派过活」，
+    /// 收掉它等于把那条查询的结果扔了。
+    pub fn reap(&mut self, idle: Duration) -> Vec<String> {
+        let dead: Vec<String> = self
+            .workers
+            .iter()
+            .filter(|(_, worker)| {
+                !worker.busy.load(Ordering::Relaxed) && worker.last_used.elapsed() >= idle
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in &dead {
+            self.workers.remove(name);
+        }
+        dead
+    }
+
+    /// 起一条只属于这个连接的线程。返回它的收件箱和「正在干活」那面旗。
+    fn spawn(&self, spec: ConnectionSpec) -> (Sender<Job>, Arc<AtomicBool>) {
         let (job_tx, job_rx) = channel::<Job>();
         let reply = self.tx.clone();
         let connect = self.connect;
+        let busy = Arc::new(AtomicBool::new(false));
+        let flag = busy.clone();
         std::thread::spawn(move || {
             let mut driver: Option<Box<dyn Driver>> = None;
             while let Ok(job) = job_rx.recv() {
-                // 一个块的多条语句各有自己的任务 id，出错时得挨个报回去：
-                // 只报第一条的话，其余面板会永远停在「执行中」。
-                let ids: Vec<u64> = match &job {
-                    Job::Run { parts, .. } => parts.iter().map(|(id, _)| *id).collect(),
-                    Job::Call { id, .. } => vec![*id],
-                };
-                // 连不上不算致命：把失败报回去，下个任务再试一次，
-                // 免得一时的网络抖动把这条连接的线程整个带走。
-                if driver.is_none() {
-                    match connect(&spec) {
-                        Ok(fresh) => driver = Some(fresh),
-                        Err(err) => {
-                            let error = err.to_string();
-                            for id in ids {
-                                let _ = reply.send(Msg::Failed {
-                                    id,
-                                    conn: spec.name.clone(),
-                                    error: error.clone(),
-                                });
-                            }
-                            continue;
-                        }
-                    }
-                }
-                let target = match driver.as_mut() {
-                    Some(d) => d,
-                    None => continue,
-                };
-                // 会话是否废了。逐条执行时先记下来，跑完再丢驱动：
-                // `target` 还借在 `driver` 上，同一段作用域里直接赋值过不了借用检查。
-                let mut session_dead = false;
-                match job {
-                    Job::Run { parts, max_rows } => {
-                        for (id, stmt) in parts {
-                            let (sent, failed) = match target.execute(&stmt, max_rows) {
-                                Ok(one) => (
-                                    Msg::Done {
-                                        id,
-                                        conn: spec.name.clone(),
-                                        outcome: DbOutcome::Statement(one),
-                                    },
-                                    false,
-                                ),
-                                Err(err) => {
-                                    session_dead = err.needs_reconnect;
-                                    (
-                                        Msg::Failed {
-                                            id,
-                                            conn: spec.name.clone(),
-                                            error: err.to_string(),
-                                        },
-                                        true,
-                                    )
-                                }
-                            };
-                            let _ = reply.send(sent);
-                            if failed {
-                                // 前一条没成，后面几条大概率也跟着错，写语句连跑更危险。
-                                // 没发出去的那些不会有任何回执，结果面板自己标成「未执行」。
-                                break;
-                            }
-                        }
-                    }
-                    Job::Call { id, call } => {
-                        let outcome = match call {
-                            Call::Databases => target.list_databases().map(DbOutcome::Names),
-                            Call::Tables { database } => {
-                                target.list_tables(&database).map(DbOutcome::Names)
-                            }
-                            Call::Probe => target.probe().map(DbOutcome::Message),
-                        };
-                        let sent = match outcome {
-                            Ok(outcome) => Msg::Done {
-                                id,
-                                conn: spec.name.clone(),
-                                outcome,
-                            },
-                            Err(err) => {
-                                // 会话级错误之后这个连接不可信，丢掉等下个任务重连。
-                                // SQL 本身的错误（语法、字段不存在）不在此列，连接照常能用。
-                                session_dead = err.needs_reconnect;
-                                Msg::Failed {
-                                    id,
-                                    conn: spec.name.clone(),
-                                    error: err.to_string(),
-                                }
-                            }
-                        };
-                        let _ = reply.send(sent);
-                    }
-                }
-                if session_dead {
-                    driver = None;
-                }
+                run_job(job, &spec, connect, &reply, &mut driver);
+                // 旗子在 `dispatch` 那一头立起来，这儿统一放下去：
+                // 一条语句跑十分钟的线程不该被当成空闲回收掉。
+                flag.store(false, Ordering::Relaxed);
             }
         });
-        job_tx
+        (job_tx, busy)
     }
 
     /// 每帧调用：把后台完成的结果搬回前台。
@@ -578,20 +551,26 @@ impl DbHub {
     pub fn poll(&mut self) -> Vec<DbEvent> {
         let mut out = Vec::new();
         while let Ok(msg) = self.rx.try_recv() {
-            match msg {
-                Msg::Done { id, conn, outcome } => out.push(DbEvent {
+            let (id, conn, outcome, dead) = match msg {
+                Msg::Done { id, conn, outcome } => (id, conn, Ok(outcome), false),
+                Msg::Failed {
                     id,
                     conn,
-                    outcome: Ok(outcome),
-                }),
-                Msg::Failed { id, conn, error, .. } => {
-                    out.push(DbEvent {
-                        id,
-                        conn,
-                        outcome: Err(error),
-                    })
-                }
+                    error,
+                    dead,
+                } => (id, conn, Err(error), dead),
+            };
+            // 刚收过活的线程不算闲：`last_used` 只看派活那一头的话，
+            // 一条十分钟的查询一跑完就会被当成闲了十分钟收掉。
+            if let Some(worker) = self.workers.get_mut(&conn) {
+                worker.last_used = Instant::now();
             }
+            out.push(DbEvent {
+                id,
+                conn,
+                outcome,
+                dead,
+            });
         }
         out
     }
@@ -614,6 +593,115 @@ impl DbHub {
 impl Default for DbHub {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// 工作线程吃下一个任务：需要时先建会话，逐条执行，逐条回报。
+///
+/// 拆出来是为了让线程主体只剩「收活 → 干活 → 放旗」三步，
+/// 不至于在一处 `continue` 上漏掉旗子、把线程永久当成在忙。
+fn run_job(
+    job: Job,
+    spec: &ConnectionSpec,
+    connect: ConnectFn,
+    reply: &Sender<Msg>,
+    driver: &mut Option<Box<dyn Driver>>,
+) {
+    // 一个块的多条语句各有自己的任务 id，出错时得挨个报回去：
+    // 只报第一条的话，其余面板会永远停在「执行中」。
+    let ids: Vec<u64> = match &job {
+        Job::Run { parts, .. } => parts.iter().map(|(id, _)| *id).collect(),
+        Job::Call { id, .. } => vec![*id],
+    };
+    // 连不上不算致命：把失败报回去，下个任务再试一次，
+    // 免得一时的网络抖动把这条连接的线程整个带走。
+    if driver.is_none() {
+        match connect(spec) {
+            Ok(fresh) => *driver = Some(fresh),
+            Err(err) => {
+                let error = err.to_string();
+                for id in ids {
+                    let _ = reply.send(Msg::Failed {
+                        id,
+                        conn: spec.name.clone(),
+                        error: error.clone(),
+                        // 压根没连上，会话自然不存在
+                        dead: true,
+                    });
+                }
+                return;
+            }
+        }
+    }
+    let target = match driver.as_mut() {
+        Some(d) => d,
+        None => return,
+    };
+    // 会话是否废了。逐条执行时先记下来，跑完再丢驱动：
+    // `target` 还借在 `driver` 上，同一段作用域里直接赋值过不了借用检查。
+    let mut session_dead = false;
+    match job {
+        Job::Run { parts, max_rows } => {
+            for (id, stmt) in parts {
+                let (sent, failed) = match target.execute(&stmt, max_rows) {
+                    Ok(one) => (
+                        Msg::Done {
+                            id,
+                            conn: spec.name.clone(),
+                            outcome: DbOutcome::Statement(one),
+                        },
+                        false,
+                    ),
+                    Err(err) => {
+                        session_dead = err.needs_reconnect;
+                        (
+                            Msg::Failed {
+                                id,
+                                conn: spec.name.clone(),
+                                error: err.to_string(),
+                                dead: err.needs_reconnect,
+                            },
+                            true,
+                        )
+                    }
+                };
+                let _ = reply.send(sent);
+                if failed {
+                    // 前一条没成，后面几条大概率也跟着错，写语句连跑更危险。
+                    // 没发出去的那些不会有任何回执，结果面板自己标成「未执行」。
+                    break;
+                }
+            }
+        }
+        Job::Call { id, call } => {
+            let outcome = match call {
+                Call::Databases => target.list_databases().map(DbOutcome::Names),
+                Call::Tables { database } => target.list_tables(&database).map(DbOutcome::Names),
+                Call::Probe => target.probe().map(DbOutcome::Message),
+            };
+            let sent = match outcome {
+                Ok(outcome) => Msg::Done {
+                    id,
+                    conn: spec.name.clone(),
+                    outcome,
+                },
+                Err(err) => {
+                    // 会话级错误之后这个连接不可信，丢掉等下个任务重连。
+                    // SQL 本身的错误（语法、字段不存在）不在此列，连接照常能用。
+                    session_dead = err.needs_reconnect;
+                    Msg::Failed {
+                        id,
+                        conn: spec.name.clone(),
+                        error: err.to_string(),
+                        dead: err.needs_reconnect,
+                    }
+                }
+            };
+            let _ = reply.send(sent);
+        }
+    }
+    if session_dead {
+        *driver = None;
     }
 }
 
@@ -718,7 +806,11 @@ impl Driver for MockDriver {
                     ]
                 })
                 .collect(),
-            affected_rows: if is_read { total as u64 } else { self.rows as u64 },
+            affected_rows: if is_read {
+                total as u64
+            } else {
+                self.rows as u64
+            },
             last_insert_id: if is_read { 0 } else { 42 },
             warnings: 0,
             truncated: self.rows > max_rows,
@@ -887,7 +979,11 @@ mod tests {
         let mut hub = DbHub::with_driver(|_| Ok(Box::new(MockDriver::new())));
         let parts = hub.run(&spec("demo"), "SELECT 1; SELECT 2", 100).unwrap();
         let stmts: Vec<&str> = parts.iter().map(|(_, s)| s.as_str()).collect();
-        assert_eq!(stmts, vec!["SELECT 1", "SELECT 2"], "切好的语句要原样交回，面板标题靠它");
+        assert_eq!(
+            stmts,
+            vec!["SELECT 1", "SELECT 2"],
+            "切好的语句要原样交回，面板标题靠它"
+        );
         let events = wait_all(&mut hub, 2);
         assert_eq!(events.len(), 2, "两条语句各回一个事件，不打包");
         // 同一个连接线程串行执行、按序回报，所以事件顺序就是语句顺序
@@ -939,7 +1035,11 @@ mod tests {
         assert_eq!(parts.len(), 3);
 
         let events = wait_all(&mut hub, 2);
-        assert!(events[0].outcome.is_ok(), "第一条的结果要留着：{:?}", events[0]);
+        assert!(
+            events[0].outcome.is_ok(),
+            "第一条的结果要留着：{:?}",
+            events[0]
+        );
         assert_eq!(events[0].id, parts[0].0);
         assert!(
             matches!(&events[1].outcome, Err(text) if text.contains("语法错了")),
@@ -1026,7 +1126,10 @@ mod tests {
         let b = hub.tables(&spec("乙"), "demo".into()).unwrap();
         let events = wait_all(&mut hub, 2);
         let ids: Vec<u64> = events.iter().map(|e| e.id).collect();
-        assert!(ids.contains(&a) && ids.contains(&b), "两个任务都要回来：{ids:?}");
+        assert!(
+            ids.contains(&a) && ids.contains(&b),
+            "两个任务都要回来：{ids:?}"
+        );
         assert_eq!(hub.connections().len(), 2);
     }
 
@@ -1086,7 +1189,8 @@ mod tests {
                 ..MockDriver::new()
             }))
         });
-        hub.run(&spec("demo"), "SELECT * FROM big", 999_999).unwrap();
+        hub.run(&spec("demo"), "SELECT * FROM big", 999_999)
+            .unwrap();
         let events = wait(&mut hub);
         match &events[0].outcome {
             Ok(DbOutcome::Statement(one)) => {
@@ -1117,10 +1221,36 @@ mod tests {
             .run(&spec("demo"), "-- 只是说明\n/* 也没语句 */", 100)
             .unwrap();
         assert!(parts.is_empty(), "实际 {} 条", parts.len());
-        assert!(
-            hub.connections().is_empty(),
-            "没语句可跑，线程也不用开"
-        );
+        assert!(hub.connections().is_empty(), "没语句可跑，线程也不用开");
+    }
+
+    /// 配十条只用两条，剩下八条的线程不该一直挂着——服务器那边一个会话也占一个线程。
+    ///
+    /// 「正在干活」的那条不算闲：它只是很久没派过活，收掉等于把在跑的查询扔了。
+    #[test]
+    fn idle_threads_are_reaped_but_a_busy_one_is_not() {
+        let mut hub = DbHub::with_driver(|_| Ok(Box::new(MockDriver::new())));
+        hub.run(&spec("闲的"), "SELECT 1", 100).unwrap();
+        wait(&mut hub);
+        assert_eq!(hub.connections(), vec!["闲的".to_string()]);
+
+        // 线程跑完最后一条才放下「忙」旗，给它一点时间，不然这条测试偶发假红
+        let mut reaped = Vec::new();
+        for _ in 0..500 {
+            reaped = hub.reap(Duration::ZERO);
+            if !reaped.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(reaped, vec!["闲的".to_string()], "闲够久的该报出来");
+        assert!(hub.connections().is_empty(), "报出来的线程要真收了");
+
+        // 刚派过活的这条离回收线还远着呢
+        hub.run(&spec("忙的"), "SELECT 1", 100).unwrap();
+        assert!(hub.reap(IDLE_LINK).is_empty(), "没闲够就不该动它");
+        assert_eq!(hub.connections(), vec!["忙的".to_string()]);
+        wait(&mut hub);
     }
 
     #[test]

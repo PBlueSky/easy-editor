@@ -546,7 +546,8 @@ mod tests {
     #[test]
     fn unknown_tail_tokens_are_ignored() {
         // 以后加新字段时，老版本读到的就是这种尾巴，不能整个块解析失败
-        let head = parse_head("-- sql x 2026-11-15 09:00 [已执行] conn=a limit=10 whatever").unwrap();
+        let head =
+            parse_head("-- sql x 2026-11-15 09:00 [已执行] conn=a limit=10 whatever").unwrap();
         assert_eq!(head.conn, "a");
         assert_eq!(head.status, STATUS_DONE);
     }
@@ -776,7 +777,11 @@ SELECT 2;
         let sql = "SELECT 1;\n\n-- 说明\nSELECT 2;\n";
         // 空行往下找：落在 SELECT 2，而不是把两条一起端出去
         assert_eq!(pick(sql, 10), Some(1), "空行该抓下面最近的那句");
-        assert_eq!(pick(sql, sql.len()), Some(1), "尾行没有语句，回头给最后一条");
+        assert_eq!(
+            pick(sql, sql.len()),
+            Some(1),
+            "尾行没有语句，回头给最后一条"
+        );
         // 光标在第一句自带的那行注释里：还在第一句范围内
         let head = "-- 说明\nSELECT 1;\nSELECT 2;";
         assert_eq!(pick(head, 3), Some(0));

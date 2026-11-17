@@ -273,7 +273,10 @@ impl EasyEditorApp {
             show_side,
             terminal: TerminalPanel::new(
                 std::env::current_dir().unwrap_or_default(),
-                TerminalSettings::from_config(&config.data.terminal_programs, &config.data.terminal_args),
+                TerminalSettings::from_config(
+                    &config.data.terminal_programs,
+                    &config.data.terminal_args,
+                ),
             ),
             search: SearchState::default(),
             find: FindState::default(),
@@ -478,12 +481,11 @@ impl EasyEditorApp {
         self.tabs.clear();
         self.active = None;
         // 标签表清空了，面板里存的下标全部作废；终端面板原样保留
-        self.panes
-            .foreach_payload_mut(|_, kind| {
-                if let PaneKind::Editor(slot) = kind {
-                    *slot = None;
-                }
-            });
+        self.panes.foreach_payload_mut(|_, kind| {
+            if let PaneKind::Editor(slot) = kind {
+                *slot = None;
+            }
+        });
         self.close_find_bar();
         // 记住工作目录，下次启动自动恢复
         let text = path.to_string_lossy().to_string();
@@ -584,8 +586,12 @@ impl EasyEditorApp {
     }
 
     fn save_active(&mut self) {
-        let Some(idx) = self.focused_tab() else { return };
-        let Some(file) = self.tabs.get_mut(idx) else { return };
+        let Some(idx) = self.focused_tab() else {
+            return;
+        };
+        let Some(file) = self.tabs.get_mut(idx) else {
+            return;
+        };
         if file.large {
             self.status = "大文件为只读预览，未保存".into();
             return;
@@ -646,12 +652,11 @@ impl EasyEditorApp {
         // 标签表短了一格，每块面板存的下标都要跟着挪，否则会指向隔壁的文件
         let remaining = self.tabs.len();
         let was_focused = self.focused_tab() == Some(idx);
-        self.panes
-            .foreach_payload_mut(|_, kind| {
-                if let PaneKind::Editor(slot) = kind {
-                    *slot = remap_tab(*slot, idx, remaining);
-                }
-            });
+        self.panes.foreach_payload_mut(|_, kind| {
+            if let PaneKind::Editor(slot) = kind {
+                *slot = remap_tab(*slot, idx, remaining);
+            }
+        });
         if was_focused && remaining > 0 {
             // 焦点面板空了的话接着显示隔壁的标签，和大多数编辑器一致
             let next = idx.min(remaining - 1);
@@ -699,7 +704,9 @@ impl EasyEditorApp {
     }
 
     fn journal_goto(&mut self, forward: bool) {
-        let Some(idx) = self.focused_tab() else { return };
+        let Some(idx) = self.focused_tab() else {
+            return;
+        };
         let file = &mut self.tabs[idx];
         let blocks = journal::scan(&file.text);
         if blocks.is_empty() {
@@ -729,7 +736,9 @@ impl EasyEditorApp {
     }
 
     fn journal_toggle(&mut self) {
-        let Some(idx) = self.focused_tab() else { return };
+        let Some(idx) = self.focused_tab() else {
+            return;
+        };
         let file = &mut self.tabs[idx];
         let blocks = journal::scan(&file.text);
         let line = file.line.saturating_sub(1);
@@ -832,7 +841,10 @@ impl EasyEditorApp {
             self.tabs[idx].pending_jump = Some((head.len() + 1).min(text.len()));
         }
         self.status = if conn.is_empty() {
-            format!("已新建 {}（还没配连接）", path.file_name().unwrap_or_default().to_string_lossy())
+            format!(
+                "已新建 {}（还没配连接）",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            )
         } else {
             format!(
                 "已新建 {}，连到「{conn}」",
@@ -870,21 +882,11 @@ impl EasyEditorApp {
         ui.horizontal(|ui| {
             ui.label(RichText::new("默认连接").size(11.0).weak());
             ui.label(RichText::new(&name).size(11.5).strong().color(accent));
-            if let Some((mark, color)) = self.probe_badge(&name) {
-                ui.label(RichText::new(mark).size(11.5).strong().color(color));
-            }
+            let (mark, state, _) = self.database.link_mark(ui, &name);
+            ui.label(RichText::new(mark).size(11.5).strong().color(accent))
+                .on_hover_text(state);
             ui.label(RichText::new(target).size(10.5).weak());
         });
-    }
-
-    /// 测试连接的状态记号。没测过给 None，那一带就不会凭空多出一个符号。
-    fn probe_badge(&self, name: &str) -> Option<(&'static str, Color32)> {
-        use crate::database::Probe;
-        Some(match self.database.probe_state(name)? {
-            Probe::Running => ("…", Color32::GRAY),
-            Probe::Ok(_) => ("✓", Color32::from_rgb(70, 160, 100)),
-            Probe::Failed(_) => ("✗", Color32::from_rgb(196, 60, 52)),
-        })
     }
 
     /// 执行 SQL：`Ctrl+Enter`——选中的那段优先，其次只跑光标所在的那一句。
@@ -938,7 +940,8 @@ impl EasyEditorApp {
             ),
             (None, None) => {
                 self.status =
-                    "光标这一句没有 SQL，也没有选区。Ctrl+Shift+J 插一个块，或开本文件 SQL 模式。".into();
+                    "光标这一句没有 SQL，也没有选区。Ctrl+Shift+J 插一个块，或开本文件 SQL 模式。"
+                        .into();
                 return;
             }
         };
@@ -1052,22 +1055,28 @@ impl EasyEditorApp {
     /// 三道闸：`sql::auto_runnable`（写了 auto 且条条只读）、同一份正文只跑一次、
     /// 结果区还在等回执就不开新的一批。写操作永远只能人手按。
     ///
+    /// 那道闸按连接看，不看全局：一条连接只有一个工作线程，往排队的那条再塞是白等；
+    /// 另一条连接明明空着，凭什么跟着一起停。
+    ///
     /// `now` 由调用方给，测试才能不用真睡 700 毫秒。
     fn auto_tick(&mut self, now: std::time::Instant) {
-        if self.results.running() {
+        let Some(idx) = self.focused_tab() else {
             return;
-        }
-        let Some(idx) = self.focused_tab() else { return };
+        };
         let text = self.tabs[idx].text.clone();
         let path = self.tabs[idx].path.clone();
+        let default_conn = self.database.active_conn().unwrap_or_default().to_string();
         let pending: Vec<sql::Block> = sql::scan(&text)
             .into_iter()
             .filter(|b| sql::auto_runnable(b, &text))
+            .filter(|b| self.auto_ran.get(&b.id()).map(String::as_str) != Some(b.sql(&text)))
             .filter(|b| {
-                self.auto_ran
-                    .get(&b.id())
-                    .map(String::as_str)
-                    != Some(b.sql(&text))
+                let conn = if b.conn.is_empty() {
+                    default_conn.as_str()
+                } else {
+                    b.conn.as_str()
+                };
+                !self.results.busy_on(conn)
             })
             .collect();
         if pending.is_empty() {
@@ -1097,10 +1106,7 @@ impl EasyEditorApp {
             // 先记账再提交：连不上库的时候不该每帧重敲一次门，改了正文才会再试
             self.auto_ran.insert(block.id(), body.clone());
             let conn = if block.conn.is_empty() {
-                self.database
-                    .active_conn()
-                    .unwrap_or_default()
-                    .to_string()
+                self.database.active_conn().unwrap_or_default().to_string()
             } else {
                 block.conn.clone()
             };
@@ -1232,7 +1238,9 @@ impl EasyEditorApp {
     // ---------- 查找替换 ----------
 
     fn sync_find_to_file(&mut self) {
-        let Some(idx) = self.focused_tab() else { return };
+        let Some(idx) = self.focused_tab() else {
+            return;
+        };
         let matches = Arc::new(self.find.matches.clone());
         let current = if self.find.matches.is_empty() {
             None
@@ -1245,7 +1253,9 @@ impl EasyEditorApp {
     }
 
     fn find_recompute(&mut self) {
-        let Some(idx) = self.focused_tab() else { return };
+        let Some(idx) = self.focused_tab() else {
+            return;
+        };
         self.find.recompute(&self.tabs[idx].text);
         self.sync_find_to_file();
         if let Some((a, _)) = self.find.current_range() {
@@ -1273,7 +1283,9 @@ impl EasyEditorApp {
     }
 
     fn find_replace_current(&mut self) {
-        let Some(idx) = self.focused_tab() else { return };
+        let Some(idx) = self.focused_tab() else {
+            return;
+        };
         if self.tabs[idx].large {
             self.status = "大文件为只读预览，无法替换".into();
             return;
@@ -1292,7 +1304,9 @@ impl EasyEditorApp {
     }
 
     fn find_replace_all(&mut self) {
-        let Some(idx) = self.focused_tab() else { return };
+        let Some(idx) = self.focused_tab() else {
+            return;
+        };
         if self.tabs[idx].large {
             self.status = "大文件为只读预览，无法替换".into();
             return;
@@ -1467,20 +1481,26 @@ impl EasyEditorApp {
     /// 焦点所在编辑器面板的标签；焦点在终端时退回最后一次聚焦的编辑面板，
     /// 这样 Ctrl+S / Ctrl+F 在终端里按下去也不会变成空操作。
     fn focused_tab(&self) -> Option<usize> {
-        let focused = self.panes.focus().and_then(|p| self.panes.payload_of(p).copied());
+        let focused = self
+            .panes
+            .focus()
+            .and_then(|p| self.panes.payload_of(p).copied());
         if focused.map(PaneKind::is_editor) == Some(true) {
             return focused.and_then(PaneKind::tab);
         }
-        let last = self
-            .last_editor_pane
-            .filter(|p| self.panes.contains(*p))?;
+        let last = self.last_editor_pane.filter(|p| self.panes.contains(*p))?;
         self.panes.payload_of(last).copied().and_then(PaneKind::tab)
     }
 
     /// 本次要写入标签的面板：焦点在编辑器上就是它，否则用最后一次聚焦的编辑面板。
     fn editor_pane_for_write(&self) -> Option<PaneId> {
         let focused = self.panes.focus()?;
-        if self.panes.payload_of(focused).copied().is_some_and(|k| k.is_editor()) {
+        if self
+            .panes
+            .payload_of(focused)
+            .copied()
+            .is_some_and(|k| k.is_editor())
+        {
             return Some(focused);
         }
         let last = self.last_editor_pane.filter(|p| self.panes.contains(*p))?;
@@ -1511,7 +1531,9 @@ impl EasyEditorApp {
 
     /// 设置当前焦点面板的激活标签。
     fn set_focused_tab(&mut self, idx: Option<usize>) {
-        let Some(p) = self.editor_pane_for_write() else { return };
+        let Some(p) = self.editor_pane_for_write() else {
+            return;
+        };
         if let Some(PaneKind::Editor(slot)) = self.panes.payload_of_mut(p) {
             *slot = idx;
         }
@@ -1558,7 +1580,9 @@ impl EasyEditorApp {
     /// 沿某个方向再切一刀。编辑器面板复制当前文件（对比 / 边看边写），
     /// 终端面板起一个新 shell。
     fn split_focused(&mut self, axis: Axis) {
-        let Some(target) = self.panes.focus() else { return };
+        let Some(target) = self.panes.focus() else {
+            return;
+        };
         let payload = match self.panes.payload_of(target).copied() {
             Some(PaneKind::Editor(idx)) => PaneKind::Editor(idx),
             Some(PaneKind::Terminal(_)) => match self.terminal.create() {
@@ -1677,7 +1701,12 @@ impl EasyEditorApp {
             }
         }
         self.panes.set_focus(new_id);
-        if let Some(t) = self.panes.payload_of(new_id).copied().and_then(PaneKind::terminal_id) {
+        if let Some(t) = self
+            .panes
+            .payload_of(new_id)
+            .copied()
+            .and_then(PaneKind::terminal_id)
+        {
             self.terminal.request_focus(t);
         }
         self.status = "已移动面板".into();
@@ -1695,7 +1724,12 @@ impl EasyEditorApp {
             return;
         }
         for id in self.panes.pane_ids() {
-            if let Some(t) = self.panes.payload_of(id).copied().and_then(PaneKind::terminal_id) {
+            if let Some(t) = self
+                .panes
+                .payload_of(id)
+                .copied()
+                .and_then(PaneKind::terminal_id)
+            {
                 if self.panes.set_focus(id) {
                     self.terminal.request_focus(t);
                     self.after_focus_change();
@@ -1708,10 +1742,12 @@ impl EasyEditorApp {
 
     /// 第一块终端面板的 id，自检脚本往里敲命令用。
     fn first_terminal_id(&self) -> Option<u64> {
-        self.panes
-            .pane_ids()
-            .into_iter()
-            .find_map(|id| self.panes.payload_of(id).copied().and_then(PaneKind::terminal_id))
+        self.panes.pane_ids().into_iter().find_map(|id| {
+            self.panes
+                .payload_of(id)
+                .copied()
+                .and_then(PaneKind::terminal_id)
+        })
     }
 
     /// 关掉一块面板。只剩一块时不销毁，退回空白编辑面板。
@@ -1820,8 +1856,12 @@ impl EasyEditorApp {
     /// `Ctrl+F` 时把选中的文字带进查找框。
     /// 只带单行、长度合理的片段——多行选区通常是整段代码，塞进查找框没意义。
     fn prefill_find_query(&mut self) {
-        let Some(idx) = self.focused_tab() else { return };
-        let Some(file) = self.tabs.get(idx) else { return };
+        let Some(idx) = self.focused_tab() else {
+            return;
+        };
+        let Some(file) = self.tabs.get(idx) else {
+            return;
+        };
         let sel = file.selection.trim();
         if sel.is_empty() || sel.contains('\n') || sel.chars().count() > 120 {
             return;
@@ -1862,7 +1902,9 @@ impl EasyEditorApp {
     /// 每帧把当前光标喂给历史；停留够久才真正记一个点。
     fn poll_caret(&mut self, ctx: &egui::Context) {
         let Some(idx) = self.active else { return };
-        let Some(file) = self.tabs.get(idx) else { return };
+        let Some(file) = self.tabs.get(idx) else {
+            return;
+        };
         // 大文件是只读虚拟渲染，没有可编辑光标，不参与历史
         if file.large {
             return;
@@ -2081,8 +2123,9 @@ impl EasyEditorApp {
                 }
             }
             "split" => {
-                const STAGES: [u64; 11] =
-                    [400, 1200, 2000, 2800, 3400, 3900, 4500, 5100, 5800, 6400, 7000];
+                const STAGES: [u64; 11] = [
+                    400, 1200, 2000, 2800, 3400, 3900, 4500, 5100, 5800, 6400, 7000,
+                ];
                 if self.verify_stage < STAGES.len() && ms >= STAGES[self.verify_stage] {
                     match self.verify_stage {
                         0 => {
@@ -2500,12 +2543,11 @@ impl EasyEditorApp {
                 // 先把「这段 SQL 发去哪儿」说清楚，再给动作
                 self.connection_row(ui);
                 ui.separator();
-                let h_new_query = format!("新建一个 .sql 查询文件，首行带好连接  {}", hint("sql_new_query"));
-                if ui
-                    .button("新建查询")
-                    .on_hover_text(h_new_query)
-                    .clicked()
-                {
+                let h_new_query = format!(
+                    "新建一个 .sql 查询文件，首行带好连接  {}",
+                    hint("sql_new_query")
+                );
+                if ui.button("新建查询").on_hover_text(h_new_query).clicked() {
                     self.new_query(None);
                     ui.close();
                 }
@@ -2560,7 +2602,13 @@ impl EasyEditorApp {
                 let idx = self.focused_tab();
                 let file_name = idx
                     .and_then(|i| self.tabs.get(i))
-                    .map(|f| f.path.file_stem().unwrap_or_default().to_string_lossy().into_owned())
+                    .map(|f| {
+                        f.path
+                            .file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
                     .unwrap_or_default();
                 let mut on = idx.is_some_and(|i| self.tabs[i].sql_mode);
                 let check = ui
@@ -2638,7 +2686,9 @@ impl EasyEditorApp {
                 }
                 // 新建终端用哪个 shell。原来在终端面板的页签条上，页签条没了就挪到这儿
                 egui::ComboBox::from_id_salt("shell_picker")
-                    .selected_text(RichText::new(format!("shell: {}", self.terminal.shell.label())).size(11.5))
+                    .selected_text(
+                        RichText::new(format!("shell: {}", self.terminal.shell.label())).size(11.5),
+                    )
                     .width(130.0)
                     .show_ui(ui, |ui| {
                         for kind in self.terminal.available.clone() {
@@ -2660,20 +2710,16 @@ impl EasyEditorApp {
                     self.center_terminal_settings = self.show_terminal_settings;
                 }
                 let h_dec = hint("font_dec");
-                if ui
-                    .small_button("-")
-                    .on_hover_text(h_dec)
-                    .clicked()
-                {
+                if ui.small_button("-").on_hover_text(h_dec).clicked() {
                     self.font_size = (self.font_size - 1.0).max(10.0);
                 }
-                ui.label(RichText::new(format!("{:.0}", self.font_size)).size(11.5).weak());
+                ui.label(
+                    RichText::new(format!("{:.0}", self.font_size))
+                        .size(11.5)
+                        .weak(),
+                );
                 let h_inc = hint("font_inc");
-                if ui
-                    .small_button("+")
-                    .on_hover_text(h_inc)
-                    .clicked()
-                {
+                if ui.small_button("+").on_hover_text(h_inc).clicked() {
                     self.font_size = (self.font_size + 1.0).min(28.0);
                 }
 
@@ -2767,7 +2813,9 @@ impl EasyEditorApp {
                         journal_jump = self.journal_panel(ui);
                     }
                     SideTab::Database => {
-                        self.database.sidebar(ui);
+                        // 每条连接排了几条语句先抄出来：侧栏要拿它给行尾摆「⏳2」
+                        let busy = self.results.busy_by_conn();
+                        self.database.sidebar(ui, &busy);
                     }
                 }
             });
@@ -2809,9 +2857,8 @@ impl EasyEditorApp {
         let focused = ui.memory(|m| m.has_focus(query_id));
         // 组字那一帧的回车是输入法在确认候选词，不是「开始搜索」
         let composing = ime::composing(ui);
-        let enter = focused
-            && !composing
-            && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
+        let enter =
+            focused && !composing && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
 
         let resp = ui.add(
             egui::TextEdit::singleline(&mut self.search.query)
@@ -3023,21 +3070,24 @@ impl EasyEditorApp {
             .show(ui, |ui| {
                 for block in &blocks {
                     let active = block.line == current_line;
-                    let mark = if block.is_done() { "[已完成]" } else { "[待处理]" };
+                    let mark = if block.is_done() {
+                        "[已完成]"
+                    } else {
+                        "[待处理]"
+                    };
                     let label = format!("{} {}", mark, block.title);
                     let resp = ui.add(
-                        egui::Label::new(
-                            RichText::new(label)
-                                .size(12.0)
-                                .color(if block.is_done() {
-                                    Color32::from_rgb(120, 150, 120)
-                                } else {
-                                    ui.visuals().text_color()
-                                }),
-                        )
+                        egui::Label::new(RichText::new(label).size(12.0).color(
+                            if block.is_done() {
+                                Color32::from_rgb(120, 150, 120)
+                            } else {
+                                ui.visuals().text_color()
+                            },
+                        ))
                         .sense(egui::Sense::click())
                         .truncate(),
                     );
+                    let resp = resp.on_hover_cursor(crate::theme::HAND);
                     if active {
                         ui.painter().rect_filled(
                             resp.rect.expand2(egui::vec2(2.0, 1.0)),
@@ -3139,11 +3189,7 @@ impl EasyEditorApp {
                     {
                         step = Some(false);
                     }
-                    if ui
-                        .small_button("↓")
-                        .on_hover_text("下一个 Enter")
-                        .clicked()
-                    {
+                    if ui.small_button("↓").on_hover_text("下一个 Enter").clicked() {
                         step = Some(true);
                     }
                     if ui.checkbox(&mut self.find.case_sensitive, "Aa").changed() {
@@ -3314,11 +3360,7 @@ impl EasyEditorApp {
                             let n = journal::scan(&file.text).len();
                             if n > 0 {
                                 ui.separator();
-                                ui.label(
-                                    RichText::new(format!("{n} 个日志块"))
-                                        .size(11.0)
-                                        .weak(),
-                                );
+                                ui.label(RichText::new(format!("{n} 个日志块")).size(11.0).weak());
                             }
                         }
                     }
@@ -3342,27 +3384,36 @@ impl EasyEditorApp {
         ui.separator();
         let name = self.database.active_conn().map(|s| s.to_string());
         let accent = ui.visuals().hyperlink_color;
-        let (mark, color) = match name.as_deref().and_then(|n| self.probe_badge(n)) {
-            Some((mark, color)) => (mark, color),
-            // 有连接还没测过 = 只是信息；连连接都没有 = 现在跑不了，得醒目
-            None if name.is_some() => ("", accent),
-            None => ("", ui.visuals().warn_fg_color),
+        let (mark, state) = match &name {
+            // 「○ 未连接」也照主色写字：那颗 ○ 已经说了状态，字再灰一层就整块像坏了
+            Some(n) => {
+                let (mark, state, _) = self.database.link_mark(ui, n);
+                (mark.to_string(), state)
+            }
+            None => (String::new(), "还没有数据库连接".to_string()),
         };
         let label = match &name {
             // 库名一起写：同一条连接上换库是常事，只报连接等于报了一半
             Some(name) => {
                 let db = self.database.current_db(name);
                 if db.is_empty() {
-                    format!("SQL → {name}{mark}")
+                    format!("SQL → {name} {mark}")
                 } else {
-                    format!("SQL → {name}/{db}{mark}")
+                    format!("SQL → {name}/{db} {mark}")
                 }
             }
             None => "SQL → 未配置连接".to_string(),
         };
         let resp = ui
-            .add(egui::Button::new(RichText::new(label).size(11.0).color(color)).frame(false))
-            .on_hover_text("这个文件的 SQL 发往哪条连接，点开侧栏数据库树切换。测试连接的 ✓/✗ 也在这里");
+            .add(
+                egui::Button::new(RichText::new(label).size(11.0).color(accent))
+                    .frame(true)
+                    .frame_when_inactive(false),
+            )
+            .on_hover_cursor(crate::theme::HAND)
+            .on_hover_text(format!(
+                "{state}\n点一下打开侧栏数据库树：那里能连接 / 断开、换库、看每条连接在跑几条"
+            ));
         if resp.clicked() {
             self.side = SideTab::Database;
             self.show_side = true;
@@ -3443,7 +3494,12 @@ impl EasyEditorApp {
             .iter()
             .filter_map(|p| {
                 let kind = self.panes.payload_of(p.id).copied()?;
-                Some((p.id, p.rect, kind.sanitize(self.tabs.len()), Some(p.id) == focus))
+                Some((
+                    p.id,
+                    p.rect,
+                    kind.sanitize(self.tabs.len()),
+                    Some(p.id) == focus,
+                ))
             })
             .collect();
 
@@ -3500,6 +3556,7 @@ impl EasyEditorApp {
                                     .sense(egui::Sense::click()),
                             )
                             .on_hover_text("右键：移动面板")
+                            .on_hover_cursor(crate::theme::HAND)
                             .context_menu(|ui| {
                                 // 终端只能开在下方时用户没法把它挪到右边，
                                 // 这里给每块面板一个「移到边缘」的入口。
@@ -3516,29 +3573,32 @@ impl EasyEditorApp {
                                     }
                                 }
                             });
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui
-                                    .small_button(RichText::new("×").size(11.0))
-                                    .on_hover_text(format!("关闭面板 {}", hint("pane_close")))
-                                    .clicked()
-                                {
-                                    close_id = Some(id);
-                                }
-                                if ui
-                                    .small_button(RichText::new("上下").size(10.5))
-                                    .on_hover_text(format!("向下拆分 {}", hint("split_row")))
-                                    .clicked()
-                                {
-                                    split_at = Some((id, Axis::Vertical));
-                                }
-                                if ui
-                                    .small_button(RichText::new("左右").size(10.5))
-                                    .on_hover_text(format!("向右拆分 {}", hint("split_col")))
-                                    .clicked()
-                                {
-                                    split_at = Some((id, Axis::Horizontal));
-                                }
-                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .small_button(RichText::new("×").size(11.0))
+                                        .on_hover_text(format!("关闭面板 {}", hint("pane_close")))
+                                        .clicked()
+                                    {
+                                        close_id = Some(id);
+                                    }
+                                    if ui
+                                        .small_button(RichText::new("上下").size(10.5))
+                                        .on_hover_text(format!("向下拆分 {}", hint("split_row")))
+                                        .clicked()
+                                    {
+                                        split_at = Some((id, Axis::Vertical));
+                                    }
+                                    if ui
+                                        .small_button(RichText::new("左右").size(10.5))
+                                        .on_hover_text(format!("向右拆分 {}", hint("split_col")))
+                                        .clicked()
+                                    {
+                                        split_at = Some((id, Axis::Horizontal));
+                                    }
+                                },
+                            );
                         });
                         ui.separator();
 
@@ -3702,7 +3762,9 @@ impl EasyEditorApp {
     // ---------- 弹窗 ----------
 
     fn quick_open_window(&mut self, ctx: &egui::Context) {
-        let Some(state) = &mut self.quick_open else { return };
+        let Some(state) = &mut self.quick_open else {
+            return;
+        };
         let mut close = false;
         let mut choose: Option<PathBuf> = None;
         let mut query_changed = false;
@@ -3740,27 +3802,29 @@ impl EasyEditorApp {
                 }
                 ui.separator();
 
-                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                    for (i, path) in state.matches.iter().take(30).enumerate() {
-                        let name = path
-                            .file_name()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        let rel = self
-                            .root
-                            .as_ref()
-                            .map(|r| filetree::relative(r, path))
-                            .unwrap_or_else(|| path.to_string_lossy().to_string());
-                        let selected = i == state.sel;
-                        let text = format!("{name}    {rel}");
-                        if ui
-                            .selectable_label(selected, RichText::new(text).size(12.0))
-                            .clicked()
-                        {
-                            choose = Some(path.clone());
+                egui::ScrollArea::vertical()
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        for (i, path) in state.matches.iter().take(30).enumerate() {
+                            let name = path
+                                .file_name()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            let rel = self
+                                .root
+                                .as_ref()
+                                .map(|r| filetree::relative(r, path))
+                                .unwrap_or_else(|| path.to_string_lossy().to_string());
+                            let selected = i == state.sel;
+                            let text = format!("{name}    {rel}");
+                            if ui
+                                .selectable_label(selected, RichText::new(text).size(12.0))
+                                .clicked()
+                            {
+                                choose = Some(path.clone());
+                            }
                         }
-                    }
-                });
+                    });
 
                 if enter {
                     if let Some(path) = state.matches.get(state.sel) {
@@ -3798,7 +3862,9 @@ impl EasyEditorApp {
     }
 
     fn close_confirm(&mut self, ctx: &egui::Context) {
-        let Some(idx) = self.pending_close else { return };
+        let Some(idx) = self.pending_close else {
+            return;
+        };
         if idx >= self.tabs.len() {
             self.pending_close = None;
             return;
@@ -3897,7 +3963,11 @@ impl EasyEditorApp {
             );
             ui.separator();
 
-            ui.label(RichText::new("程序路径（留空 = 自动探测）").size(11.5).weak());
+            ui.label(
+                RichText::new("程序路径（留空 = 自动探测）")
+                    .size(11.5)
+                    .weak(),
+            );
             let p_resp = ui.add(
                 egui::TextEdit::singleline(&mut program)
                     .hint_text(r"C:\Program Files\Git\bin\bash.exe")
@@ -3913,14 +3983,21 @@ impl EasyEditorApp {
             }
 
             ui.add_space(6.0);
-            ui.label(RichText::new("启动参数（留空 = 内置参数）").size(11.5).weak());
+            ui.label(
+                RichText::new("启动参数（留空 = 内置参数）")
+                    .size(11.5)
+                    .weak(),
+            );
             let a_resp = ui.add(
                 egui::TextEdit::singleline(&mut args)
                     .hint_text("例如：-NoProfile -NoLogo")
                     .desired_width(f32::INFINITY),
             );
             muted_line(ui, "按空格拆分，带空格的参数用双引号包住。");
-            muted_line(ui, format!("改动即时生效，并写进 {}", config::Config::path().display()));
+            muted_line(
+                ui,
+                format!("改动即时生效，并写进 {}", config::Config::path().display()),
+            );
 
             ui.add_space(6.0);
             let mut cleared = false;
@@ -3943,7 +4020,10 @@ impl EasyEditorApp {
                     .settings
                     .programs
                     .insert(id.clone(), program.trim().to_string());
-                self.terminal.settings.args.insert(id, args.trim().to_string());
+                self.terminal
+                    .settings
+                    .args
+                    .insert(id, args.trim().to_string());
                 // 路径可能让某个种类从「没有」变成「可用」，可用列表要跟着重算
                 self.terminal.refresh();
             }
@@ -4097,6 +4177,8 @@ impl EasyEditorApp {
 
         self.search.poll();
         self.database.poll();
+        // 闲置够久的连接在这里放掉，卡住的「正在连接」也在这里翻成「连不上」
+        self.database.tick(std::time::Instant::now());
         // SQL 块的回执不归侧栏管，转手给底部结果区
         for event in self.database.take_stray() {
             self.results.on_event(&event);
@@ -4109,6 +4191,9 @@ impl EasyEditorApp {
         if self.database.busy() || self.results.running() {
             // 库表列表和测试结果都在后台线程，不催一帧就永远停在「读取中…」
             ctx.request_repaint_after(std::time::Duration::from_millis(60));
+        } else if self.database.has_link() {
+            // 挂着会话时按半分钟醒一次：闲置回收晚一圈没有代价，每帧重画有
+            ctx.request_repaint_after(std::time::Duration::from_secs(30));
         }
         // 后台面板的输出也要每帧读进屏幕模型，否则 PTY 的 channel 会一直堆
         self.terminal.pump();
@@ -4121,14 +4206,11 @@ impl EasyEditorApp {
         self.handle_shortcuts(&ctx);
 
         // 调试用：EASY_EDITOR_VERIFY=insert 时自动插入一个日志块
-        if self.frame_count == 20
-            && crate::config::env_var("VERIFY").as_deref() == Some("insert")
-        {
+        if self.frame_count == 20 && crate::config::env_var("VERIFY").as_deref() == Some("insert") {
             self.insert_journal_block();
         }
         // 调试用：EASY_EDITOR_VERIFY=replace 时自动执行全部替换
-        if self.frame_count == 30
-            && crate::config::env_var("VERIFY").as_deref() == Some("replace")
+        if self.frame_count == 30 && crate::config::env_var("VERIFY").as_deref() == Some("replace")
         {
             self.find_replace_all();
         }
@@ -4494,11 +4576,7 @@ mod tests {
         out.shapes.iter().find_map(|c| walk(&c.shape, needle))
     }
 
-    fn wait_for_text(
-        app: &mut EasyEditorApp,
-        ctx: &egui::Context,
-        needle: &str,
-    ) -> Option<Rect> {
+    fn wait_for_text(app: &mut EasyEditorApp, ctx: &egui::Context, needle: &str) -> Option<Rect> {
         for _ in 0..4 {
             let out = frame(app, ctx, vec![]);
             if let Some(rect) = find_text(&out, needle) {
@@ -4539,7 +4617,11 @@ mod tests {
             .expect("文件树里没画出 a.txt")
             .center();
 
-        frame(&mut app, &ctx, pointer(row, egui::PointerButton::Secondary, true));
+        frame(
+            &mut app,
+            &ctx,
+            pointer(row, egui::PointerButton::Secondary, true),
+        );
         frame(
             &mut app,
             &ctx,
@@ -4549,7 +4631,11 @@ mod tests {
             .expect("右键没有弹出「新建文件」菜单")
             .center();
 
-        frame(&mut app, &ctx, pointer(item, egui::PointerButton::Primary, true));
+        frame(
+            &mut app,
+            &ctx,
+            pointer(item, egui::PointerButton::Primary, true),
+        );
         frame(
             &mut app,
             &ctx,
@@ -4561,11 +4647,7 @@ mod tests {
             "新建对话框没画出来"
         );
 
-        frame(
-            &mut app,
-            &ctx,
-            vec![egui::Event::Text("probe.txt".into())],
-        );
+        frame(&mut app, &ctx, vec![egui::Event::Text("probe.txt".into())]);
         assert_eq!(
             app.tree.as_ref().unwrap().new_name,
             "probe.txt",
@@ -4615,10 +4697,7 @@ mod tests {
         click_tree_menu(&mut app, &ctx, row, "重命名");
         // 改名框要到下一帧才画出来并拿到焦点，这一帧敲键会丢
         let out = frame(&mut app, &ctx, vec![]);
-        assert!(
-            find_text(&out, "a.txt").is_some(),
-            "改名框没在原位画出来"
-        );
+        assert!(find_text(&out, "a.txt").is_some(), "改名框没在原位画出来");
 
         // 改名框预填了当前名字：Ctrl+A 全选，再敲新名字整段替换，最后回车落地
         frame(&mut app, &ctx, vec![key_press(Key::A, Modifiers::COMMAND)]);
@@ -4655,19 +4734,13 @@ mod tests {
     fn open_terminal_menu_splits_in_that_directory() {
         let (ctx, mut app, dir) = app_in_folder("easy-editor-app-open-term-test", "a\n");
         std::fs::create_dir_all(dir.join("sub")).unwrap();
-        app.tree
-            .as_mut()
-            .unwrap()
-            .expanded
-            .insert(dir.join("sub"));
+        app.tree.as_mut().unwrap().expanded.insert(dir.join("sub"));
         app.terminal.settings = TerminalSettings::default();
         app.terminal.shell = crate::terminal::ShellKind::Cmd;
 
         let before = app.terminal.len();
         let out = frame(&mut app, &ctx, vec![]);
-        let row = find_text(&out, "sub")
-            .expect("文件树里没画出 sub")
-            .center();
+        let row = find_text(&out, "sub").expect("文件树里没画出 sub").center();
         click_tree_menu(&mut app, &ctx, row, "在此处打开终端");
         // 拆分与终端计数都要走完一帧才看得清
         frame(&mut app, &ctx, vec![]);
@@ -4702,11 +4775,7 @@ mod tests {
             .expect("右键没有弹出「新建文件」菜单")
             .center();
         frame(app, ctx, pointer(item, egui::PointerButton::Primary, true));
-        frame(
-            app,
-            ctx,
-            pointer(item, egui::PointerButton::Primary, false),
-        );
+        frame(app, ctx, pointer(item, egui::PointerButton::Primary, false));
         // Window 首帧只量尺寸不画内容，再跑一帧才算真的开好了
         let out = frame(app, ctx, vec![]);
         let hint = find_text(&out, "文件名，如 main.rs");
@@ -4776,7 +4845,11 @@ mod tests {
             .or_else(|| find_text(&out, "hello"))
             .expect("编辑器里没画出 hello")
             .center();
-        frame(&mut app, &ctx, pointer(spot, egui::PointerButton::Primary, true));
+        frame(
+            &mut app,
+            &ctx,
+            pointer(spot, egui::PointerButton::Primary, true),
+        );
         frame(
             &mut app,
             &ctx,
@@ -4904,8 +4977,9 @@ mod tests {
     fn text_rect_where(out: &egui::FullOutput, pred: impl Fn(&str) -> bool) -> Option<Rect> {
         fn walk(shape: &egui::Shape, pred: &impl Fn(&str) -> bool) -> Option<Rect> {
             match shape {
-                egui::Shape::Text(t) => (pred)(&t.galley.job.text)
-                    .then(|| t.galley.rect.translate(t.pos.to_vec2())),
+                egui::Shape::Text(t) => {
+                    (pred)(&t.galley.job.text).then(|| t.galley.rect.translate(t.pos.to_vec2()))
+                }
                 egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| walk(s, pred)),
                 _ => None,
             }
@@ -4954,8 +5028,12 @@ mod tests {
         let row = hit_row(&out);
 
         // 指针到位后不再动，tooltip_delay 才走得完
-        let mut out =
-            frame_time(&mut app, &ctx, 1.0, vec![egui::Event::PointerMoved(row.center())]);
+        let mut out = frame_time(
+            &mut app,
+            &ctx,
+            1.0,
+            vec![egui::Event::PointerMoved(row.center())],
+        );
         for i in 1..8 {
             out = frame_time(&mut app, &ctx, 1.0 + i as f64 * 0.3, vec![]);
         }
@@ -4977,7 +5055,11 @@ mod tests {
         );
 
         let center = row.center();
-        frame(&mut app, &ctx, pointer(center, egui::PointerButton::Primary, true));
+        frame(
+            &mut app,
+            &ctx,
+            pointer(center, egui::PointerButton::Primary, true),
+        );
         frame(
             &mut app,
             &ctx,
@@ -5005,7 +5087,11 @@ mod tests {
 
         let start = egui::pos2(x, y);
         frame(&mut app, &ctx, vec![egui::Event::PointerMoved(start)]);
-        frame(&mut app, &ctx, pointer(start, egui::PointerButton::Primary, true));
+        frame(
+            &mut app,
+            &ctx,
+            pointer(start, egui::PointerButton::Primary, true),
+        );
         for i in 1..=6 {
             let p = egui::pos2(x + i as f32 * 12.0, y);
             frame(&mut app, &ctx, vec![egui::Event::PointerMoved(p)]);
@@ -5112,7 +5198,8 @@ mod tests {
     /// 又跑一遍。以前判的是 `resp.lost_focus()`，正文那一下换行正好落进这个条件里。
     #[test]
     fn enter_in_the_editor_is_a_newline_not_another_search() {
-        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-search-enter", "hello world\nbye\n");
+        let (ctx, mut app, dir) =
+            app_in_folder("easy-editor-app-search-enter", "hello world\nbye\n");
         app.open_file(dir.join("a.txt"), None);
         frame(&mut app, &ctx, vec![]);
 
@@ -5140,17 +5227,22 @@ mod tests {
             .pane_rect(app.panes.focus().unwrap())
             .unwrap();
         let over = egui::pos2(pane.left() + 80.0, pane.top() + 40.0);
-        frame(&mut app, &ctx, pointer(over, egui::PointerButton::Primary, true));
-        frame(&mut app, &ctx, pointer(over, egui::PointerButton::Primary, false));
+        frame(
+            &mut app,
+            &ctx,
+            pointer(over, egui::PointerButton::Primary, true),
+        );
+        frame(
+            &mut app,
+            &ctx,
+            pointer(over, egui::PointerButton::Primary, false),
+        );
         let before = app.tabs[app.active.unwrap()].text.clone();
 
         frame(&mut app, &ctx, vec![key_press(Key::Enter, Modifiers::NONE)]);
         frame(&mut app, &ctx, vec![]);
 
-        assert_eq!(
-            app.search.generation, started,
-            "正文里回车把搜索又跑了一遍"
-        );
+        assert_eq!(app.search.generation, started, "正文里回车把搜索又跑了一遍");
         assert!(
             app.tabs[app.active.unwrap()].text.len() > before.len(),
             "正文里那一下回车没换成行"
@@ -5160,10 +5252,10 @@ mod tests {
     /// 「移到最右侧」：原先上下堆叠的面板要变成左右并排，并且贴到工作区右缘。
     #[test]
     fn moving_pane_to_right_splits_side_by_side() {
-        let (ctx, mut app, _dir) =
-            app_in_folder("easy-editor-app-move-pane-test", "hello\n");
+        let (ctx, mut app, _dir) = app_in_folder("easy-editor-app-move-pane-test", "hello\n");
         let root = app.panes.focus().unwrap();
-        app.panes.split(root, Axis::Vertical, PaneKind::Editor(None));
+        app.panes
+            .split(root, Axis::Vertical, PaneKind::Editor(None));
         frame(&mut app, &ctx, vec![]);
         let bottom = app.panes.focus().unwrap();
         let before = app.pane_layout.pane_rect(bottom).unwrap();
@@ -5184,16 +5276,19 @@ mod tests {
             moved.min.x >= other.max.x,
             "没有变成左右并排：moved={moved:?} other={other:?}"
         );
-        assert!(moved.min.x > before.min.x, "没有向右移动：before={before:?}");
+        assert!(
+            moved.min.x > before.min.x,
+            "没有向右移动：before={before:?}"
+        );
     }
 
     /// 「移到最下方」：左右并排的面板要变成上下堆叠，并且贴到工作区下缘。
     #[test]
     fn moving_pane_to_bottom_stacks_below() {
-        let (ctx, mut app, _dir) =
-            app_in_folder("easy-editor-app-move-pane-down", "hello\n");
+        let (ctx, mut app, _dir) = app_in_folder("easy-editor-app-move-pane-down", "hello\n");
         let left = app.panes.focus().unwrap();
-        app.panes.split(left, Axis::Horizontal, PaneKind::Editor(None));
+        app.panes
+            .split(left, Axis::Horizontal, PaneKind::Editor(None));
         frame(&mut app, &ctx, vec![]);
         let before = app.pane_layout.pane_rect(left).unwrap();
 
@@ -5213,7 +5308,10 @@ mod tests {
             moved.min.y >= other.max.y,
             "没有变成上下堆叠：moved={moved:?} other={other:?}"
         );
-        assert!(moved.min.y > before.min.y, "没有向下移动：before={before:?}");
+        assert!(
+            moved.min.y > before.min.y,
+            "没有向下移动：before={before:?}"
+        );
         assert_eq!(app.status, "已移动面板");
     }
 
@@ -5287,7 +5385,11 @@ mod tests {
         let grab = title.center();
         let before = window.min;
         let drag = Vec2::new(120.0, 60.0);
-        frame(&mut app, &ctx, pointer(grab, egui::PointerButton::Primary, true));
+        frame(
+            &mut app,
+            &ctx,
+            pointer(grab, egui::PointerButton::Primary, true),
+        );
         for i in 1..=6 {
             let p = grab + drag * (i as f32 / 6.0);
             frame(&mut app, &ctx, vec![egui::Event::PointerMoved(p)]);
@@ -5418,7 +5520,11 @@ mod tests {
         let lrect = app.pane_layout.pane_rect(left).unwrap();
         let grab = Pos2::new(lrect.min.x + 20.0, lrect.min.y + 10.0);
 
-        frame(&mut app, &ctx, pointer(grab, egui::PointerButton::Secondary, true));
+        frame(
+            &mut app,
+            &ctx,
+            pointer(grab, egui::PointerButton::Secondary, true),
+        );
         frame(
             &mut app,
             &ctx,
@@ -5428,7 +5534,11 @@ mod tests {
             .expect("右键标题没有弹出「移动面板」菜单")
             .center();
 
-        frame(&mut app, &ctx, pointer(item, egui::PointerButton::Primary, true));
+        frame(
+            &mut app,
+            &ctx,
+            pointer(item, egui::PointerButton::Primary, true),
+        );
         frame(
             &mut app,
             &ctx,
@@ -5442,9 +5552,10 @@ mod tests {
     fn all_texts(out: &egui::FullOutput) -> Vec<(String, Rect)> {
         fn walk(shape: &egui::Shape, v: &mut Vec<(String, Rect)>) {
             match shape {
-                egui::Shape::Text(t) => {
-                    v.push((t.galley.job.text.clone(), t.galley.rect.translate(t.pos.to_vec2())))
-                }
+                egui::Shape::Text(t) => v.push((
+                    t.galley.job.text.clone(),
+                    t.galley.rect.translate(t.pos.to_vec2()),
+                )),
                 egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, v)),
                 _ => {}
             }
@@ -5807,10 +5918,7 @@ mod tests {
             &mut app,
             &ctx,
             t,
-            vec![
-                egui::Event::ModifiersChanged(cmd),
-                key_press(Key::Z, cmd),
-            ],
+            vec![egui::Event::ModifiersChanged(cmd), key_press(Key::Z, cmd)],
         );
         assert_eq!(
             app.tabs[0].text, "hello\nworld\n",
@@ -5894,7 +6002,10 @@ mod tests {
             &mut app,
             &ctx,
             Key::Plus,
-            Modifiers { shift: true, ..ctrl },
+            Modifiers {
+                shift: true,
+                ..ctrl
+            },
         );
         assert_eq!(app.font_size, 16.0, "Ctrl+Shift+= 没放大编辑器字号");
         assert_eq!(ctx.zoom_factor(), 1.0, "Ctrl+Shift+= 把整个界面缩放了");
@@ -5952,10 +6063,7 @@ mod tests {
         );
         for _ in 0..3 {
             let out = frame(&mut app, &ctx, vec![]);
-            let ime = out
-                .platform_output
-                .ime
-                .expect("组字途中输入法申请被撤掉了");
+            let ime = out.platform_output.ime.expect("组字途中输入法申请被撤掉了");
             assert!(
                 !ime.should_interrupt_composition,
                 "组字途中被打断，候选串会被清空"
@@ -6151,8 +6259,16 @@ mod tests {
             .map(|(_, r)| r.center())
             .expect("行号 2 没找到");
         let spot = egui::pos2(pane.min.x + 150.0, row2.y);
-        let _ = frame(&mut app, &ctx, pointer(spot, egui::PointerButton::Primary, true));
-        let _ = frame(&mut app, &ctx, pointer(spot, egui::PointerButton::Primary, false));
+        let _ = frame(
+            &mut app,
+            &ctx,
+            pointer(spot, egui::PointerButton::Primary, true),
+        );
+        let _ = frame(
+            &mut app,
+            &ctx,
+            pointer(spot, egui::PointerButton::Primary, false),
+        );
         let _ = frame(&mut app, &ctx, vec![]);
         let focus_before = ctx.memory(|m| m.focused());
         assert!(focus_before.is_some(), "点正文后编辑器没拿到焦点");
@@ -6161,8 +6277,16 @@ mod tests {
         let btn = find_text(&out, "日志块")
             .expect("顶栏「日志块」按钮没画出来")
             .center();
-        let _ = frame(&mut app, &ctx, pointer(btn, egui::PointerButton::Primary, true));
-        let _ = frame(&mut app, &ctx, pointer(btn, egui::PointerButton::Primary, false));
+        let _ = frame(
+            &mut app,
+            &ctx,
+            pointer(btn, egui::PointerButton::Primary, true),
+        );
+        let _ = frame(
+            &mut app,
+            &ctx,
+            pointer(btn, egui::PointerButton::Primary, false),
+        );
         for _ in 0..4 {
             let _ = frame(&mut app, &ctx, vec![]);
         }
@@ -6201,7 +6325,11 @@ mod tests {
         let out = frame(&mut app, &ctx, vec![]);
         let before = body(&out, 'a').expect("正文没画出来");
         let start = egui::pos2(before.left() + 40.0, before.top() + 10.0);
-        let _ = frame(&mut app, &ctx, pointer(start, egui::PointerButton::Primary, true));
+        let _ = frame(
+            &mut app,
+            &ctx,
+            pointer(start, egui::PointerButton::Primary, true),
+        );
 
         let mut col_last = app.tabs[0].col;
         for i in 0..6 {
@@ -6223,12 +6351,13 @@ mod tests {
 
         // 松手后锚点必须自己回来，否则中文输入法就再也挂不上这个窗口了
         let end = egui::pos2(start.x + 160.0, start.y);
-        let _ = frame(&mut app, &ctx, pointer(end, egui::PointerButton::Primary, false));
+        let _ = frame(
+            &mut app,
+            &ctx,
+            pointer(end, egui::PointerButton::Primary, false),
+        );
         let out = frame(&mut app, &ctx, vec![]);
-        let ime = out
-            .platform_output
-            .ime
-            .expect("松手后没把输入法锚点还回来");
+        let ime = out.platform_output.ime.expect("松手后没把输入法锚点还回来");
         assert!(
             !ime.should_interrupt_composition,
             "拖选结束那一帧还在打断输入法"
@@ -6314,64 +6443,87 @@ mod tests {
         v
     }
 
+    /// 一次交两条语句 = 页签栏两格，屏上只摊开一格。
+    ///
+    /// 从前是两个面板竖着叠：看着公平，实际结果区就那么高，第三个开始全在裁剪区外，
+    /// 用户得先拖高面板再滚——十条的时候等于只有两条结果。
     #[test]
-    fn sql_block_gets_one_result_panel_per_statement() {
+    fn sql_block_gets_one_result_tab_per_statement() {
         let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_two_panels");
         app.sql_run_block();
-        assert_eq!(app.results.count(), 2, "块里两条语句就该两个面板");
+        assert_eq!(app.results.count(), 2, "块里两条语句就该两个页签");
         assert!(app.results.open, "提交了结果区就该亮出来");
 
         settle_results(&mut app, &ctx);
-        let out = frame(&mut app, &ctx, vec![]);
-        let shown = texts(&out);
+        let shown = texts(&frame(&mut app, &ctx, vec![]));
         assert!(shown.contains(&"结果 · 2 个".to_string()), "{shown:?}");
-        // 网格画出来了：列头 + 一份行数小结
-        assert!(shown.iter().any(|t| t.starts_with("本机 · 2 行")), "{shown:?}");
-
-        // 两个面板同时在屏上，而且都得没被结果区裁掉
-        let seen = seen(&out);
-        let visible = |needle: &str| {
-            seen.iter()
-                .filter(|(t, _)| t.starts_with(needle))
-                .map(|(_, r)| r.top())
-                .collect::<Vec<f32>>()
-        };
-        // 每块一行小结、一份列头：各两个才说明第二个面板整块画出来了，
-        // 而不是只把标题行挤在缝里露了个尖
-        assert_eq!(visible("本机 · 2 行").len(), 2, "{shown:?}");
-        assert_eq!(visible("name").len(), 2, "第二块的网格没画出来：{shown:?}");
-        let (first, second) = (visible("本机 · 2 行")[0], visible("本机 · 2 行")[1]);
-        assert!(
-            second > first,
-            "两个面板上下颠倒了：第 1 条在 {first}，第 2 条在 {second}"
+        for label in ["1·SELECT id FROM a", "2·SELECT name FROM b"] {
+            assert!(
+                shown.iter().any(|t| t == label),
+                "页签栏少了「{label}」那一格：{shown:?}"
+            );
+        }
+        // 当前那一页摊在屏上：抬头 + 一份网格；另一条只占一个页签
+        assert_eq!(on_screen(&shown, "SELECT id FROM a"), 1, "{shown:?}");
+        assert_eq!(
+            on_screen(&shown, "SELECT name FROM b"),
+            0,
+            "第二页不该同时铺开"
         );
+        assert_eq!(
+            shown.iter().filter(|t| t.as_str() == "id").count(),
+            1,
+            "屏上只该有一份网格：{shown:?}"
+        );
+
+        let shown = tab_to(&mut app, &ctx, "2·SELECT name FROM b");
+        assert_eq!(app.results.active_task(), Some(2), "点页签没换过去");
+        assert_eq!(on_screen(&shown, "SELECT name FROM b"), 1, "{shown:?}");
+        assert_eq!(on_screen(&shown, "SELECT id FROM a"), 0, "上一份该收走");
+    }
+
+    /// 页签那一格右边的 ✕：和标签同一行、排在标签右边。
+    /// 面板抬头也有一个 ✕，但它在分隔线下面那一行，靠 y 就分得开。
+    fn tab_cross(out: &egui::FullOutput, label: &str) -> egui::Pos2 {
+        let marks = seen(out);
+        let tab = marks
+            .iter()
+            .find(|(t, _)| t == label)
+            .map(|(_, r)| *r)
+            .unwrap_or_else(|| panic!("页签「{label}」没画出来"));
+        marks
+            .iter()
+            .find(|(t, r)| {
+                t == "✕" && (r.center().y - tab.center().y).abs() < 6.0 && r.center().x > tab.min.x
+            })
+            .map(|(_, r)| r.center())
+            .unwrap_or_else(|| panic!("页签「{label}」上没有关闭那一下"))
     }
 
     #[test]
-    fn closing_one_panel_leaves_its_neighbours() {
+    fn closing_one_tab_leaves_its_neighbour() {
         let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_close_one");
         app.sql_run_block();
         settle_results(&mut app, &ctx);
         let out = frame(&mut app, &ctx, vec![]);
-        let mut crosses = seen(&out)
-            .into_iter()
-            .filter(|(t, _)| t == "✕")
-            .map(|(_, r)| r.center())
-            .collect::<Vec<_>>();
-        assert_eq!(crosses.len(), 2, "两个面板该各有一个关闭按钮");
-        crosses.sort_by(|a, b| a.y.total_cmp(&b.y));
-        // 标题行现在是被限死一行高的矩形，点得着才说明按钮没被挤出可交互区
-        frame(
-            &mut app,
-            &ctx,
-            pointer(crosses[1], egui::PointerButton::Primary, true),
+        let cross = tab_cross(&out, "2·SELECT name FROM b");
+        tap(&mut app, &ctx, cross);
+        assert_eq!(app.results.count(), 1, "只该关掉点中的那个页签");
+        assert_eq!(app.results.panels()[0].task, 1, "留下的是第一条");
+        assert_eq!(
+            app.results.active_task(),
+            Some(1),
+            "当前那页没被关，不该跟着跳"
         );
-        frame(
-            &mut app,
-            &ctx,
-            pointer(crosses[1], egui::PointerButton::Primary, false),
-        );
-        assert_eq!(app.results.count(), 1, "只该关掉点中的那个面板");
+
+        // 再关掉当前这一页：屏上不该留一个「谁都没指着」的空结果区
+        let out = frame(&mut app, &ctx, vec![]);
+        let cross = tab_cross(&out, "1·SELECT id FROM a");
+        tap(&mut app, &ctx, cross);
+        assert_eq!(app.results.count(), 0);
+        assert_eq!(app.results.active_task(), None, "全关完了就别还指着一条");
+        let shown = texts(&frame(&mut app, &ctx, vec![]));
+        assert_eq!(on_screen(&shown, "SELECT id FROM a"), 0);
     }
 
     #[test]
@@ -6397,13 +6549,22 @@ mod tests {
         app.database = failing_database();
         app.sql_run_block();
         settle_results(&mut app, &ctx);
-        let out = frame(&mut app, &ctx, vec![]);
-        let shown = texts(&out);
+        let shown = texts(&frame(&mut app, &ctx, vec![]));
+        // 砸的那条正是当前那页，报错原文当场就在屏上
         assert!(
             shown.iter().any(|t| t.contains("语法错了")),
             "报错原文要贴在面板里：{shown:?}"
         );
-        assert!(shown.iter().any(|t| t.contains("未执行")));
+        assert!(
+            app.results.panels().iter().all(|p| !p.slot.is_running()),
+            "回执都到家了不许还转着圈"
+        );
+        // 被连累没执行的那条在另一个页签上，点过去得能看到
+        let shown = tab_to(&mut app, &ctx, "2·SELECT name FROM b");
+        assert!(
+            shown.iter().any(|t| t.contains("未执行")),
+            "第二条要说清它没跑过：{shown:?}"
+        );
     }
 
     #[test]
@@ -6458,7 +6619,10 @@ mod tests {
         app.database = mock_database();
         app.tabs[idx].line = 2;
         app.sql_run_block();
-        assert!(app.tabs[idx].sql_errors.is_empty(), "重跑先清掉这一段旧的红");
+        assert!(
+            app.tabs[idx].sql_errors.is_empty(),
+            "重跑先清掉这一段旧的红"
+        );
         settle_results(&mut app, &ctx);
         frame(&mut app, &ctx, vec![]);
         let idx = app.active.unwrap();
@@ -6493,16 +6657,23 @@ mod tests {
         app.sql_run_block();
         settle_results(&mut app, &ctx);
         let out = frame(&mut app, &ctx, vec![]);
-        let mut buttons = seen(&out)
+        let buttons = seen(&out)
             .into_iter()
             .filter(|(t, _)| t == "放大")
             .map(|(_, r)| r.center())
             .collect::<Vec<_>>();
-        assert_eq!(buttons.len(), 2, "两份查询结果都该能单独放大");
-        buttons.sort_by(|a, b| a.y.total_cmp(&b.y));
+        assert_eq!(buttons.len(), 1, "屏上只摊开一页，放大的入口也就一个");
 
-        frame(&mut app, &ctx, pointer(buttons[0], egui::PointerButton::Primary, true));
-        frame(&mut app, &ctx, pointer(buttons[0], egui::PointerButton::Primary, false));
+        frame(
+            &mut app,
+            &ctx,
+            pointer(buttons[0], egui::PointerButton::Primary, true),
+        );
+        frame(
+            &mut app,
+            &ctx,
+            pointer(buttons[0], egui::PointerButton::Primary, false),
+        );
         // 新窗口头几帧只在量尺寸、摆位置，尺寸落定才轮到画内容
         frame(&mut app, &ctx, vec![]);
         let out = frame(&mut app, &ctx, vec![]);
@@ -6511,10 +6682,10 @@ mod tests {
             shown.contains(&"结果 · 查用户".to_string()),
             "放大窗口没开：{shown:?}"
         );
-        // 窗口和底部面板看的是同一份数据：列头一共三份（底部两块 + 窗口一块）
+        // 窗口和底部面板看的是同一份数据：列头两份（底部一份 + 窗口一份）
         assert_eq!(
             shown.iter().filter(|t| t.as_str() == "id").count(),
-            3,
+            2,
             "窗口里该另起一份网格"
         );
         assert!(
@@ -6528,6 +6699,14 @@ mod tests {
             texts(&out).contains(&"结果 · 查用户".to_string()),
             "放大窗口开完下一帧就自己关了"
         );
+
+        // 放大的是「这一页」：换页签时窗口跟着换，不会留着上一份的结果
+        let shown = tab_to(&mut app, &ctx, "2·SELECT name FROM b");
+        assert_eq!(app.results.active_task(), Some(2));
+        assert!(
+            shown.iter().any(|t| t == "放大"),
+            "换过来那一页也要能单独放大：{shown:?}"
+        );
     }
 
     #[test]
@@ -6535,12 +6714,18 @@ mod tests {
         let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_export");
         app.sql_run_block();
         settle_results(&mut app, &ctx);
-        let out = frame(&mut app, &ctx, vec![]);
-        let shown = texts(&out);
+        let shown = texts(&frame(&mut app, &ctx, vec![]));
         assert_eq!(
             shown.iter().filter(|t| t.as_str() == "导出").count(),
-            2,
-            "两份查询结果各给一个导出按钮，存盘框归系统弹，这里只测按钮在不在：{shown:?}"
+            1,
+            "当前那页给一个导出按钮，存盘框归系统弹，这里只测按钮在不在：{shown:?}"
+        );
+        // 换一页签，导出跟着换——两条查询结果都得能单独存
+        let shown = tab_to(&mut app, &ctx, "2·SELECT name FROM b");
+        assert_eq!(
+            shown.iter().filter(|t| t.as_str() == "导出").count(),
+            1,
+            "第二条结果的导出按钮没跟上：{shown:?}"
         );
     }
 
@@ -6549,6 +6734,13 @@ mod tests {
         let idx = app.active.unwrap();
         app.tabs[idx].text =
             format!("-- sql 探测 2026-01-01 10:00 [待执行] conn=本机 auto\n{sql}\n");
+    }
+
+    /// 把当前文件的正文换成一个 `auto` 块，发到指定那条连接。
+    fn auto_conn(app: &mut EasyEditorApp, conn: &str) {
+        let idx = app.active.unwrap();
+        app.tabs[idx].text =
+            format!("-- sql 探测 2026-01-01 10:00 [待执行] conn={conn} auto\nSELECT id FROM a\n");
     }
 
     #[test]
@@ -6659,8 +6851,83 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!hits.is_empty(), "屏上找不到「{needle}」");
         hits.sort_by(|a, b| a.y.total_cmp(&b.y));
-        frame(app, ctx, pointer(hits[0], egui::PointerButton::Primary, true));
-        frame(app, ctx, pointer(hits[0], egui::PointerButton::Primary, false))
+        frame(
+            app,
+            ctx,
+            pointer(hits[0], egui::PointerButton::Primary, true),
+        );
+        frame(
+            app,
+            ctx,
+            pointer(hits[0], egui::PointerButton::Primary, false),
+        )
+    }
+
+    /// 点结果区的一个页签，换到那份结果，返回换完之后那一帧屏上的字。
+    ///
+    /// 换页签那一帧画的还是旧的那一份（`active` 是在内容画完之后才记账的），
+    /// 所以要多空跑一帧，测试才是用户实际看到的样子。
+    fn tab_to(app: &mut EasyEditorApp, ctx: &egui::Context, label: &str) -> Vec<String> {
+        let out = frame(app, ctx, vec![]);
+        click_first(app, ctx, &out, label);
+        texts(&frame(app, ctx, vec![]))
+    }
+
+    /// 屏上「这一份结果是第几条」那个抬头里的语句预览出现了几次。
+    ///
+    /// 页签上的字带序号前缀（`1·SELECT …`），和抬头的纯语句是两个不同的字串，
+    /// 用它就能分清「列在页签栏里」和「正摊在屏上」。
+    fn on_screen(shown: &[String], stmt: &str) -> usize {
+        shown.iter().filter(|t| t.as_str() == stmt).count()
+    }
+
+    /// 在屏上某一点按下一又松开（按下、松开各占一帧，egui 才认这是一次点击）。
+    fn tap(app: &mut EasyEditorApp, ctx: &egui::Context, at: egui::Pos2) {
+        frame(app, ctx, pointer(at, egui::PointerButton::Primary, true));
+        frame(app, ctx, pointer(at, egui::PointerButton::Primary, false));
+    }
+
+    /// 自动执行的闸要按连接分，不能全局一刀切。
+    ///
+    /// 两条连接各有自己的工作线程，甲堵着三条不影响乙一秒出结果；
+    /// 从前那句「有结果在跑就先不跑」把两条连接排成了独木桥。
+    #[test]
+    fn auto_blocks_are_gated_per_connection() {
+        let (_ctx, mut app, _dir) = app_on_sql_block("ee_sql_auto_gate");
+        app.database = DatabasePanel::with_hub(
+            crate::db::DbHub::with_driver(|_| Ok(Box::new(crate::db::MockDriver::new()))),
+            ["甲", "乙"]
+                .iter()
+                .map(|name| crate::db::ConnectionSpec {
+                    name: (*name).into(),
+                    database: "test".into(),
+                    ..Default::default()
+                })
+                .collect(),
+        );
+        // 甲 那边压一条永远没回执的在跑
+        let stuck = [results::Part {
+            task: 900,
+            stmt: "SELECT 堵着的".into(),
+            range: None,
+        }];
+        app.results.start_run("甲", "手工", &stuck, None);
+        assert!(app.results.busy_on("甲"));
+
+        let t0 = std::time::Instant::now();
+
+        // 乙 的自动块：甲 在跑也照样交
+        auto_conn(&mut app, "乙");
+        app.auto_tick(t0);
+        app.auto_tick(t0 + AUTO_DEBOUNCE + std::time::Duration::from_millis(1));
+        assert_eq!(app.results.count(), 2, "乙 不该被 甲 堵住");
+
+        // 同一句换成 甲：这才真是在排队，先不交
+        auto_conn(&mut app, "甲");
+        let t1 = t0 + AUTO_DEBOUNCE * 4;
+        app.auto_tick(t1);
+        app.auto_tick(t1 + AUTO_DEBOUNCE * 4);
+        assert_eq!(app.results.count(), 2, "甲 还在跑，这一句先压住");
     }
 
     #[test]
@@ -6729,13 +6996,11 @@ mod tests {
 
         let idx = app.active.expect("新建的查询该摊到前台");
         let tab = &app.tabs[idx];
-        let name = tab
-            .path
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
-        assert!(name.starts_with("query-") && name.ends_with(".sql"), "{name}");
+        let name = tab.path.file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            name.starts_with("query-") && name.ends_with(".sql"),
+            "{name}"
+        );
         assert!(tab.sql_mode, "新建的查询文件当然要按 SQL 对待");
         assert!(
             tab.text.starts_with("-- sql 查询") && tab.text.contains("conn=本机"),
@@ -6761,8 +7026,7 @@ mod tests {
         let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_batch_head");
         app.sql_run_block();
         settle_results(&mut app, &ctx);
-        let out = frame(&mut app, &ctx, vec![]);
-        let shown = texts(&out);
+        let shown = texts(&frame(&mut app, &ctx, vec![]));
         // 一批一行抬头，两条语句共用；条数写在上面，用户不用自己数面板
         assert_eq!(
             shown
@@ -6772,9 +7036,18 @@ mod tests {
             1,
             "批次抬头该出现正好一次：{shown:?}"
         );
+        // 页签上各留一个序号，屏上的「第几条」只有当前这一页
         assert!(
-            shown.iter().any(|t| t == "1/2") && shown.iter().any(|t| t == "2/2"),
-            "面板标题里要看得出这是第几条：{shown:?}"
+            shown.iter().any(|t| t == "1·SELECT id FROM a")
+                && shown.iter().any(|t| t == "2·SELECT name FROM b"),
+            "一次跑两条要在页签栏各占一格，序号不能丢：{shown:?}"
+        );
+        assert!(shown.iter().any(|t| t == "1/2"));
+        assert!(!shown.iter().any(|t| t == "2/2"));
+        let shown = tab_to(&mut app, &ctx, "2·SELECT name FROM b");
+        assert!(
+            shown.iter().any(|t| t == "2/2"),
+            "换到第二页，抬头里要写这是 2/2：{shown:?}"
         );
     }
 
@@ -6788,30 +7061,28 @@ mod tests {
         let board = copied(&out);
         assert_eq!(board.len(), 1, "点一下只该写一次剪贴板：{board:?}");
         assert_eq!(
-            board[0],
-            "id\tname\n1\t行0\n2\t行1",
+            board[0], "id\tname\n1\t行0\n2\t行1",
             "制表符分隔、带表头，粘进表格软件直接分列"
         );
     }
 
     /// 行首的 ▸ 不再往表格里塞一块明细：那块收不回去，还老被表格自己的裁剪切掉。
-    /// 现在改成在屏幕右边单独开一个窗口，同一个 ▸ 再点一下收掉。
+    /// 现在改成在屏幕右边单独开一个窗口：点别处自己收，钉住就一直开着。
     #[test]
     fn the_row_arrow_opens_a_detail_window_on_the_right() {
         let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_expand");
         app.sql_run_block();
         settle_results(&mut app, &ctx);
         let out = frame(&mut app, &ctx, vec![]);
-        // 表格每行行首那个 ▸（面板标题行用的是同一串，但它排得更靠上）
+        // 表格每行行首那个 ▸（页签栏和标题行都没有这一串）
         let mut arrows = seen(&out)
             .into_iter()
             .filter(|(t, _)| t == "▸")
             .map(|(_, r)| r.center())
             .collect::<Vec<_>>();
-        assert_eq!(arrows.len(), 4, "两个面板各两行：{arrows:?}");
+        assert_eq!(arrows.len(), 2, "当前那页两行，就该两个 ▸：{arrows:?}");
         arrows.sort_by(|a, b| a.y.total_cmp(&b.y));
-        frame(&mut app, &ctx, pointer(arrows[0], egui::PointerButton::Primary, true));
-        frame(&mut app, &ctx, pointer(arrows[0], egui::PointerButton::Primary, false));
+        tap(&mut app, &ctx, arrows[0]);
 
         let shown = seen(&frame(&mut app, &ctx, vec![]));
         let title = shown.iter().find(|(t, _)| t == "详情 · 第 1 行");
@@ -6831,20 +7102,42 @@ mod tests {
             words.contains(&"id =") && words.contains(&"name ="),
             "窗口里没把「列名 = 完整值」摊出来：{words:?}"
         );
-        assert!(words.contains(&"复制整行"), "窗口里没带拷贝整行那一条：{words:?}");
+        assert!(
+            words.contains(&"复制整行"),
+            "窗口里没带拷贝整行那一条：{words:?}"
+        );
 
-        // 收回去：同一个位置再点一下，窗口和「列名 = 值」都不该留在屏上
-        frame(&mut app, &ctx, vec![]);
-        frame(&mut app, &ctx, pointer(arrows[0], egui::PointerButton::Primary, true));
-        frame(&mut app, &ctx, pointer(arrows[0], egui::PointerButton::Primary, false));
+        // 看完不必回去点那个 ▸：窗口外面随便一下——这里点页签栏——就把它收掉
+        let out = frame(&mut app, &ctx, vec![]);
+        click_first(&mut app, &ctx, &out, "1·SELECT id FROM a");
         let shown = texts(&frame(&mut app, &ctx, vec![]));
         assert!(
-            !shown.iter().any(|t| t == "id ="),
-            "收了还留着详情：{shown:?}"
+            !shown.iter().any(|t| t.starts_with("详情 · ")),
+            "点了窗口外面还开着：{shown:?}"
         );
+
+        // 钉住的那一份不吃这一下：对着两列长值来回比的时候，点哪儿都不该散
+        tap(&mut app, &ctx, arrows[0]);
+        let out = frame(&mut app, &ctx, vec![]);
+        click_first(&mut app, &ctx, &out, "钉住");
+        assert!(
+            app.results.panels()[0].detail.is_some_and(|d| d.pinned),
+            "那一下没勾上「钉住」"
+        );
+        let out = frame(&mut app, &ctx, vec![]);
+        click_first(&mut app, &ctx, &out, "1·SELECT id FROM a");
+        let shown = texts(&frame(&mut app, &ctx, vec![]));
+        assert!(
+            shown.iter().any(|t| t == "详情 · 第 1 行"),
+            "钉住了还被点外面收走：{shown:?}"
+        );
+
+        // 同一个 ▸ 再点一下照样能手动收掉（没钉住时是 toggling，钉住后也得收）
+        tap(&mut app, &ctx, arrows[0]);
+        let shown = texts(&frame(&mut app, &ctx, vec![]));
         assert!(
             !shown.iter().any(|t| t.starts_with("详情 · ")),
-            "详情窗口没收掉：{shown:?}"
+            "再点同一个 ▸ 没收掉详情：{shown:?}"
         );
     }
 
@@ -6872,8 +7165,8 @@ mod tests {
         app.open_file(dir.join("q.sql"), None);
         let shown = texts(&frame(&mut app, &ctx, vec![]));
         assert!(
-            shown.iter().any(|t| t == "SQL → 本机/test"),
-            "状态栏少了 SQL 去向这一截：{shown:?}"
+            shown.iter().any(|t| t == "SQL → 本机/test ○"),
+            "状态栏要交代 SQL 发往哪条、那条连着没有：{shown:?}"
         );
         // 普通文本、又没块，就别在状态栏挂个跟当前文件无关的尾巴
         app.open_file(dir.join("a.txt"), None);

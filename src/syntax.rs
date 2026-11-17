@@ -185,10 +185,7 @@ mod tests {
         let syntax = hl.syntax_for(Some(Path::new("q.sql")), "SELECT 1;");
         assert_ne!(syntax.name, "Plain text", "SQL 不能退回纯文本");
         let scope = syntax.scope.to_string();
-        assert!(
-            scope.starts_with("source.sql"),
-            "实际 scope = {scope}"
-        );
+        assert!(scope.starts_with("source.sql"), "实际 scope = {scope}");
     }
 
     #[test]

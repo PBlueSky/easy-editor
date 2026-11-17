@@ -201,7 +201,14 @@ mod tests {
         settle(&mut h, p(5));
         let before = h.len();
         // 同一行里挪列
-        settle(&mut h, NavPoint { path: PathBuf::from("a.txt"), byte: 57, line: 5 });
+        settle(
+            &mut h,
+            NavPoint {
+                path: PathBuf::from("a.txt"),
+                byte: 57,
+                line: 5,
+            },
+        );
         assert_eq!(h.len(), before);
         // 但当前点更新成了新偏移，后退再前进应落在新偏移上
         h.back();

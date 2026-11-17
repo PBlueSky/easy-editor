@@ -95,10 +95,7 @@ pub fn entries(exe: &Path) -> Vec<Entry> {
             &command,
         ),
         Entry::str(
-            &format!(
-                r"Software\Classes\Applications\{}",
-                exe_name(exe)
-            ),
+            &format!(r"Software\Classes\Applications\{}", exe_name(exe)),
             "FriendlyAppName",
             CLIENT,
         ),
@@ -344,7 +341,10 @@ mod tests {
         let Value::Str(target) = value else {
             panic!("RegisteredApplications 得指一个路径")
         };
-        assert_eq!(target, format!(r"Software\Clients\TextEditor\{CLIENT}\Capabilities"));
+        assert_eq!(
+            target,
+            format!(r"Software\Clients\TextEditor\{CLIENT}\Capabilities")
+        );
         // 指过去的地方确实被我们填过，否则设置里是一个空条目
         find(&target, "ApplicationName");
         find(&target, "FileExtensions");
@@ -363,7 +363,10 @@ mod tests {
             .filter(|e| e.key.ends_with(r"\OpenWithProgids"))
             .map(|e| e.key)
             .collect::<Vec<_>>();
-        assert_eq!(progids, vec![r"Software\Classes\.txt\OpenWithProgids".to_string()]);
+        assert_eq!(
+            progids,
+            vec![r"Software\Classes\.txt\OpenWithProgids".to_string()]
+        );
     }
 
     /// 默认处理器（`UserChoice`）由系统哈希保护，程序不许写它——写了要么白写，

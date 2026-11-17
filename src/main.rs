@@ -5,9 +5,9 @@ mod assoc;
 mod config;
 // SQL 功能分几步落地：这两块里有一批只被单测摸到的口子（状态回写、只读判定、
 // 连接校验收口），界面还没接上，先别报 dead_code。
+mod database;
 #[allow(dead_code)]
 mod db;
-mod database;
 mod editor;
 mod filetree;
 mod find;

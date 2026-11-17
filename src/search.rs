@@ -342,14 +342,17 @@ fn run_builtin(
 
     let mut count = 0usize;
 
-    let walker = WalkDir::new(root).follow_links(false).into_iter().filter_entry(|e| {
-        if e.file_type().is_dir() && e.depth() > 0 {
-            let name = e.file_name().to_string_lossy();
-            !SKIP_DIRS.contains(&name.as_ref())
-        } else {
-            true
-        }
-    });
+    let walker = WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            if e.file_type().is_dir() && e.depth() > 0 {
+                let name = e.file_name().to_string_lossy();
+                !SKIP_DIRS.contains(&name.as_ref())
+            } else {
+                true
+            }
+        });
 
     for entry in walker.filter_map(|e| e.ok()) {
         if count >= MAX_HITS {

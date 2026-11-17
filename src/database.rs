@@ -77,7 +77,11 @@ fn tree_row(ui: &mut Ui, depth: usize) -> (egui::Response, f32) {
     let width = ui.available_width().max(120.0);
     let (rect, resp) = ui.allocate_exact_size(egui::Vec2::new(width, ROW_H), egui::Sense::click());
     paint_row_shell(ui, &resp, depth);
-    (resp, rect.left() + 4.0 + INDENT * depth as f32)
+    // 整行都能点（箭头展开收起、名字选中），手型光标得跟着整行走
+    (
+        resp.on_hover_cursor(crate::theme::HAND),
+        rect.left() + 4.0 + INDENT * depth as f32,
+    )
 }
 
 /// 整行的底色与缩进引导线，`tree_row` 和只读的 `muted_row` 共用。
@@ -186,9 +190,9 @@ fn trail_label(
     text: &str,
     color: egui::Color32,
 ) -> f32 {
-    let galley = ui
-        .painter()
-        .layout_no_wrap(text.to_owned(), egui::FontId::proportional(9.5), color);
+    let galley =
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), egui::FontId::proportional(9.5), color);
     let w = galley.size().x;
     ui.painter().galley(
         egui::pos2(right - w, resp.rect.center().y - galley.size().y * 0.5),
@@ -221,6 +225,7 @@ fn failed_row(ui: &mut Ui, depth: usize, err: &str, retry: impl FnOnce()) {
             ),
             egui::Button::new(RichText::new("重试").size(11.0)),
         )
+        .on_hover_cursor(crate::theme::HAND)
         .clicked()
     {
         retry();
@@ -230,28 +235,51 @@ fn failed_row(ui: &mut Ui, depth: usize, err: &str, retry: impl FnOnce()) {
 /// 已发出、等回执的后台任务分别该落到哪儿。
 enum Pending {
     Databases(String),
-    Tables { conn: String, database: String },
-    /// 连接管理窗口（或侧栏右键）里点的「测试连接」，按连接名落回 `probes`
+    Tables {
+        conn: String,
+        database: String,
+    },
+    /// 连接管理窗口（或侧栏右键）里点的「测试连接」，按连接名落回 `links`
     Probe(String),
 }
 
-/// 一次「测试连接」的结论。
+/// 「正在连接」最多挂多久。
 ///
-/// 侧栏和编辑表单看的是同一份：从前只有表单里那行灰字，右键测完只在状态栏闪一下，
-/// 到底连上没有得自己猜。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Probe {
-    Running,
-    Ok(String),
-    Failed(String),
+/// 驱动侧的建连超时只有 5 秒，正常永远到不了这条线。走到这里说明工作线程出了
+/// 意料之外的事（最现实的一种：线程 panic 了，回执再也不会有）。没有这一档，
+/// 那一行会永远转圈，而用户只剩重启一个办法。
+const OPENING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// 一条连接的会话状态。
+///
+/// 侧栏、工具栏下拉和编辑表单看的是同一份：从前只有表单里那行灰字，右键测完
+/// 只在状态栏闪一下，到底连上没有得自己猜。
+///
+/// 这里没有「未连接」这一档 —— map 里没有记录就是没连。启动时一条都不填，
+/// 所以配了十条连接、一个都没点过的程序不占十条线程和十个 TCP 会话。
+#[derive(Clone, Debug, PartialEq)]
+pub enum Link {
+    /// 握手在路上（连接、展开库列表、执行 SQL 都会走到这儿）
+    Opening(std::time::Instant),
+    /// 上一次往返是通的。带一句服务器说的话（版本号），没测过是空串
+    Online(String),
+    /// 上一次往返砸了，带原因
+    Broken(String),
 }
 
-/// 结论 + 测它的时候那份配置的指纹（[`ConnectionSpec::stamp`]）。
+impl Link {
+    /// 这条连接现在算不算挂着会话。空闲回收和「断开」都靠它判该不该动线程。
+    fn is_up(&self) -> bool {
+        matches!(self, Self::Opening(_) | Self::Online(_))
+    }
+}
+
+/// 会话状态 + 记下它时那份配置的指纹（[`ConnectionSpec::stamp`]）。
 /// 指纹对不上就说明中间改过字段，那个绿勾不能再接着亮。
 #[derive(Clone, Debug)]
-struct ProbeRecord {
+struct LinkRecord {
     stamp: u64,
-    state: Probe,
+    state: Link,
 }
 
 /// 管理窗口里正在编辑的那一条。
@@ -272,8 +300,8 @@ pub struct DatabasePanel {
     /// 侧栏里选中的连接。SQL 块头部没写 `conn=` 时发到这里。
     active: Option<String>,
     pending: HashMap<u64, Pending>,
-    /// 连接名 -> 最近一次测试连接。改了配置要跟着重测，见 [`ProbeRecord`]。
-    probes: HashMap<String, ProbeRecord>,
+    /// 连接名 -> 会话状态。没有这条记录 = 没连。改了配置要跟着过期，见 [`LinkRecord`]。
+    links: HashMap<String, LinkRecord>,
     /// 不属于这层的回执（SQL 块的结果），底部结果区每帧来取。
     ///
     /// 语句结果和库表列表共用一条通道、一套 id，这里只认领自己发出去的那些，
@@ -301,7 +329,7 @@ impl DatabasePanel {
             trees: HashMap::new(),
             active,
             pending: HashMap::new(),
-            probes: HashMap::new(),
+            links: HashMap::new(),
             stray: Vec::new(),
             draft: None,
             show_manager: false,
@@ -315,8 +343,33 @@ impl DatabasePanel {
     }
 
     /// 有没有请求还挂在后台。界面靠它决定要不要继续重画——不然结果回来了也没人看。
+    ///
+    /// 「正在连接」也算：那一档是有闹钟的（见 [`OPENING_TIMEOUT`]），
+    /// 没有重画，线程真出事时就没人去翻那块牌子。
     pub fn busy(&self) -> bool {
         !self.pending.is_empty()
+            || self
+                .links
+                .values()
+                .any(|record| matches!(record.state, Link::Opening(_)))
+    }
+
+    /// 有没有值得再醒一次去回收的会话。app 的闹钟看它：砸了的那条没什么可回收，
+    /// 一条都没连过时更不该为闲置回收空转重画。
+    pub fn has_link(&self) -> bool {
+        self.links.values().any(|record| record.state.is_up())
+    }
+
+    /// 现在挂着会话（连着或正在连）的连接名。侧栏底下「已连接 2 / 5」那一行靠它。
+    pub fn online(&self) -> Vec<String> {
+        let mut up: Vec<String> = self
+            .connections
+            .iter()
+            .filter(|spec| self.link_of(spec).is_some_and(|state| state.is_up()))
+            .map(|spec| spec.name.clone())
+            .collect();
+        up.sort();
+        up
     }
 
     /// 这条连接现在选中的是哪条：侧栏点过的那条，否则列表第一条。
@@ -345,18 +398,20 @@ impl DatabasePanel {
     /// 库名不同会重开一条连接，这正是「发往另一个库」该有的意思。
     pub fn effective_spec(&self, conn: &str) -> Option<ConnectionSpec> {
         let base = self.spec_of(conn).cloned()?;
-        Some(match self.trees.get(conn).and_then(|t| t.current_db.clone()) {
-            Some(db) if db != base.database => ConnectionSpec { database: db, ..base },
-            _ => base,
-        })
+        Some(
+            match self.trees.get(conn).and_then(|t| t.current_db.clone()) {
+                Some(db) if db != base.database => ConnectionSpec {
+                    database: db,
+                    ..base
+                },
+                _ => base,
+            },
+        )
     }
 
     /// 树上点库名：把它认作这条连接的当前库。不碰 config.json。
     fn set_current_db(&mut self, conn: &str, database: &str) {
-        self.trees
-            .entry(conn.to_string())
-            .or_default()
-            .current_db = Some(database.to_string());
+        self.trees.entry(conn.to_string()).or_default().current_db = Some(database.to_string());
         self.status = format!("「{conn}」的当前库已切到「{database}」");
     }
 
@@ -383,9 +438,89 @@ impl DatabasePanel {
             .run(&spec, block, MAX_ROWS)
             .map_err(|err| err.to_string())?;
         if !parts.is_empty() {
+            self.note_submit(conn);
             self.status = format!("{} · 已提交 {} 条语句", conn, parts.len());
         }
         Ok(parts)
+    }
+
+    /// 刚往这条连接上派了活，会话状态得跟上：还没连的先标「正在连接」，
+    /// 已经连着的原样留着 —— 跑一条查询不该把那块 ✓ 退回成 ⏳。
+    ///
+    /// 这就是「按需连接」的全部机关：线程只在真有人派活时才起，
+    /// 配置里那十条没人碰的连接一条也不占资源。
+    fn note_submit(&mut self, conn: &str) {
+        let Some(spec) = self.spec_of(conn) else {
+            return;
+        };
+        let stamp = spec.stamp();
+        if self
+            .links
+            .get(conn)
+            .is_some_and(|record| record.stamp == stamp && record.state.is_up())
+        {
+            return;
+        }
+        let at = std::time::Instant::now();
+        self.links.insert(
+            conn.to_string(),
+            LinkRecord {
+                stamp,
+                state: Link::Opening(at),
+            },
+        );
+    }
+
+    /// 一次往返到家，把会话状态翻过去。
+    ///
+    /// SQL 语义上的错（语法、表不存在）不算「断开」：服务器答了话，会话照旧能用。
+    /// 只有 `dead`（建连就没成、或者会话被服务器掐了）才翻成「已断开」——
+    /// 工作线程那边已经把驱动丢了，下一条语句会自动重连。
+    fn note_round_trip(&mut self, event: &DbEvent) {
+        // 指纹优先按现存配置算；草稿那份还没保存，就沿用它发起时记下的那个
+        let stamp = match self.spec_of(&event.conn) {
+            Some(spec) => spec.stamp(),
+            None => match self.links.get(&event.conn) {
+                Some(record) => record.stamp,
+                // 回执还在路上连接就被删了，这条结论没人认领
+                None => return,
+            },
+        };
+        let info = match self.links.get(&event.conn) {
+            Some(record) => match &record.state {
+                Link::Online(info) => info.clone(),
+                _ => String::new(),
+            },
+            None => String::new(),
+        };
+        let state = match (&event.outcome, event.dead) {
+            (Ok(DbOutcome::Message(text)), _) => Link::Online(text.clone()),
+            (Ok(_), _) => Link::Online(info),
+            (Err(err), true) => Link::Broken(err.clone()),
+            (Err(_), false) => Link::Online(info),
+        };
+        self.links
+            .insert(event.conn.clone(), LinkRecord { stamp, state });
+    }
+
+    /// 每帧调用（排在 `poll` 之后）：回收闲够久的会话，再给没回执的握手判个死刑。
+    ///
+    /// 回收只在有重画时发生，这够了：没人动的十分钟里那块牌子虽然还写着「已连接」，
+    /// 但用户也没在看它，而手一动就是一帧。
+    pub fn tick(&mut self, now: std::time::Instant) {
+        // 闲太久的线程收掉：会话在服务器侧也占一个线程，配十条用两条不该挂十条。
+        // 缓存的库列表留着 —— 下次用会重开一条连接，没必要让用户重新点一遍树。
+        for name in self.hub.reap(crate::db::IDLE_LINK) {
+            self.links.remove(&name);
+        }
+        for record in self.links.values_mut() {
+            let Link::Opening(at) = &record.state else {
+                continue;
+            };
+            if now.duration_since(*at) > OPENING_TIMEOUT {
+                record.state = Link::Broken("等握手回执等超时了，再点一次连接试试".into());
+            }
+        }
     }
 
     /// 取走不属于这一层的回执（也就是 SQL 块的语句结果），交给底部结果区。
@@ -398,12 +533,14 @@ impl DatabasePanel {
         self.center_manager = true;
     }
 
-    /// 每帧调用：把后台回来的库表列表和测试回执归位。
+    /// 每帧调用：把后台回来的库表列表和握手回执归位。
     pub fn poll(&mut self) {
         for event in self.hub.poll() {
             let Some(pending) = self.pending.remove(&event.id) else {
                 // 不是这层发出去的（SQL 块的结果），或者是连接在这帧之前被改过、
                 // 删掉了 —— 都原样搁下，让上层取走认领得了的那部分。
+                // 会话状态是这一层的事，转手之前先看一眼。
+                self.note_round_trip(&event);
                 self.stray.push(event);
                 continue;
             };
@@ -416,6 +553,7 @@ impl DatabasePanel {
                     if let Some(tree) = self.trees.get_mut(&conn) {
                         tree.databases = to_load(&event.outcome);
                     }
+                    self.note_round_trip(&event);
                     self.status = format!("{conn} · {text}");
                 }
                 Pending::Tables { conn, database } => {
@@ -424,19 +562,22 @@ impl DatabasePanel {
                             *slot = to_load(&event.outcome);
                         }
                     }
+                    self.note_round_trip(&event);
                     self.status = format!("{conn} / {database} · {text}");
                 }
                 Pending::Probe(conn) => {
+                    // 握手这一路以回执本身为准，不看 `dead`：连不上就是连不上，
+                    // 管它是传输层砸的还是密码错，那块牌子都得翻红。
                     let state = match &event.outcome {
-                        Ok(_) => Probe::Ok(text.clone()),
-                        Err(_) => Probe::Failed(text.clone()),
+                        Ok(_) => Link::Online(text.clone()),
+                        Err(_) => Link::Broken(text.clone()),
                     };
                     // 测完到收回来之间连接可能被删掉，那就没人在等这条结论了
-                    if let Some(record) = self.probes.get_mut(&conn) {
+                    if let Some(record) = self.links.get_mut(&conn) {
                         record.state = state;
                     }
                     self.status = match &event.outcome {
-                        Ok(_) => format!("「{conn}」可用：{text}"),
+                        Ok(_) => format!("「{conn}」已连接：{text}"),
                         Err(_) => format!("「{conn}」连不上：{text}"),
                     };
                 }
@@ -484,7 +625,10 @@ impl DatabasePanel {
         }
         match self.hub.databases(&spec) {
             Ok(id) => {
-                self.pending.insert(id, Pending::Databases(name.to_string()));
+                self.pending
+                    .insert(id, Pending::Databases(name.to_string()));
+                // 展开这一下就是这条连接的第一次握手
+                self.note_submit(name);
             }
             Err(err) => {
                 // 配置不全这种事不用等后台线程绕一圈，就地写回错误
@@ -519,6 +663,7 @@ impl DatabasePanel {
                         database,
                     },
                 );
+                self.note_submit(name);
             }
             Err(err) => {
                 let text = err.to_string();
@@ -530,17 +675,44 @@ impl DatabasePanel {
         }
     }
 
-    /// 丢掉某条连接的缓存和工作线程。配置改了、删了、手工刷新都用它。
+    /// 丢掉某条连接的会话、缓存和工作线程。配置改了、删了、手工断开都用它。
+    ///
+    /// 状态记号也一起删 —— 「没有记录」就是「未连接」，这正是此刻的事实。
     fn forget(&mut self, name: &str) {
         self.trees.remove(name);
+        self.links.remove(name);
         self.hub.close(name);
+    }
+
+    /// 断开一条连接：收掉线程和缓存。库列表留着没意义，下次连本来就要重问。
+    fn disconnect(&mut self, name: &str) {
+        self.forget(name);
+        self.status = format!("已断开「{name}」，下次执行会自动重连");
+    }
+
+    /// 连上一条连接：握一次手拿到版本号，顺手把库列表读出来、把树展开。
+    ///
+    /// 这是给用户的那条「明确的连接路径」（右键「连接」、卡片上那个按钮）。
+    /// 不点它也连得上 —— 执行 SQL、展开树都会自己起线程，那条路只是不用先问一声。
+    fn connect_now(&mut self, name: &str) {
+        let Some(spec) = self.spec_of(name).cloned() else {
+            return;
+        };
+        self.test_connection(&spec);
+        self.trees.entry(name.to_string()).or_default().expanded = true;
+        self.load_databases(name);
     }
 
     /// 重新问服务器要库和表。展开状态得保留：刷完树自己收了很难用。
     fn refresh(&mut self, name: &str) {
         let expanded = self.trees.get(name).is_some_and(|t| t.expanded);
         self.hub.close(name);
-        let tree = ConnTree { expanded, ..Default::default() };
+        // 线程都换了，那块「已连接」的牌子不能留在旧会话身上
+        self.links.remove(name);
+        let tree = ConnTree {
+            expanded,
+            ..Default::default()
+        };
         self.trees.insert(name.to_string(), tree);
         if expanded {
             self.load_databases(name);
@@ -552,84 +724,104 @@ impl DatabasePanel {
         self.connections.iter().find(|c| c.name == name)
     }
 
-    /// 发一次「测试连接」。回执走 `poll`，所以这里只登记任务。
+    /// 发一次握手（界面上写「测试连接」）。回执走 `poll`，所以这里只登记任务。
     fn test_connection(&mut self, spec: &ConnectionSpec) {
         let name = spec.name.clone();
         let stamp = spec.stamp();
-        let record = |state: Probe| ProbeRecord { stamp, state };
+        let record = |state: Link| LinkRecord { stamp, state };
         if let Some(field) = spec.missing() {
             // 没填全就别去麻烦后台线程，直接把该填哪一项说在结论那一格里
-            self.probes.insert(name, record(Probe::Failed(format!("请先填写{field}"))));
+            self.links
+                .insert(name, record(Link::Broken(format!("请先填写{field}"))));
             return;
         }
         match self.hub.probe(spec) {
             Ok(id) => {
                 self.pending.insert(id, Pending::Probe(spec.name.clone()));
-                self.probes.insert(name, record(Probe::Running));
-                self.status = format!("正在测试 {}…", spec.name);
+                self.links
+                    .insert(name, record(Link::Opening(std::time::Instant::now())));
+                self.status = format!("正在连接 {}…", spec.name);
             }
             Err(err) => {
                 let text = err.to_string();
-                self.probes.insert(name, record(Probe::Failed(text.clone())));
+                self.links.insert(name, record(Link::Broken(text.clone())));
                 self.status = format!("连接失败：{text}");
             }
         }
     }
 
-    /// 这条连接现在的测试结论。只在配置和当初测的那份一模一样时才给——
-    /// 改过主机、密码之类还不重测就接着显示绿勾，比不显示更坏。
-    fn probe_of(&self, spec: &ConnectionSpec) -> Option<&Probe> {
-        self.probes
+    /// 这条连接现在的会话状态。只在配置和当初连的那份一模一样时才给——
+    /// 改过主机、密码之类还不重连就接着显示绿勾，比不显示更坏。
+    fn link_of(&self, spec: &ConnectionSpec) -> Option<&Link> {
+        self.links
             .get(&spec.name)
             .filter(|record| record.stamp == spec.stamp())
             .map(|record| &record.state)
     }
 
-    /// 给上层（工具栏、状态栏）看的测试结论。
-    pub fn probe_state(&self, name: &str) -> Option<Probe> {
-        self.spec_of(name).and_then(|spec| self.probe_of(spec).cloned())
+    /// 给上层（工具栏、状态栏）看的会话状态。
+    pub fn link_state(&self, name: &str) -> Option<Link> {
+        self.spec_of(name)
+            .and_then(|spec| self.link_of(spec).cloned())
     }
 
-    /// 有过结论，但配置已经变了。
-    fn probe_stale(&self, spec: &ConnectionSpec) -> bool {
-        self.probes
+    /// 这条连接现在挂不挂着会话。右键菜单拿它决定写「连接」还是「断开」。
+    pub fn is_up(&self, name: &str) -> bool {
+        self.link_state(name).is_some_and(|state| state.is_up())
+    }
+
+    /// 有过状态记录，但配置已经变了。
+    fn link_stale(&self, spec: &ConnectionSpec) -> bool {
+        self.links
             .get(&spec.name)
             .is_some_and(|record| record.stamp != spec.stamp())
     }
 
-    /// 这条连接现在该显示的测试结论，图标、文案、颜色一起给。
+    /// 这条连接现在该显示的会话状态，图标、文案、颜色一起给。
     ///
-    /// 侧栏的行和表单里那一块走同一份口径：同一个连接在两处说法不一，
-    /// 用户只会当成都在瞎说。没有结论就没有这一行——从没测过的连接不该被暗示「坏了」。
-    fn probe_view(
-        &self,
-        ui: &Ui,
-        spec: &ConnectionSpec,
-    ) -> Option<(&'static str, String, egui::Color32)> {
+    /// 侧栏的行、工具栏的下拉和表单里那一块走同一份口径：同一个连接在三处说法不一，
+    /// 用户只会当成都在瞎说。没有记录就是「未连接」——启动时十条连接全在这一档，
+    /// 一条都不该提前占着线程和会话。
+    fn link_view(&self, ui: &Ui, spec: &ConnectionSpec) -> (&'static str, String, egui::Color32) {
         let visuals = ui.visuals();
         let green = egui::Color32::from_rgb(70, 160, 100);
-        Some(match self.probe_of(spec) {
-            Some(Probe::Running) => ("⏳", "正在测试…".into(), visuals.hyperlink_color),
-            Some(Probe::Ok(info)) => ("✓", format!("连接可用 · {info}"), green),
-            Some(Probe::Failed(err)) => ("✗", format!("连不上：{err}"), visuals.error_fg_color),
-            // 测过之后又改了字段：与其把上次的绿勾接着亮，不如直说那个结果不作数了
-            None if self.probe_stale(spec) => (
+        match self.link_of(spec) {
+            Some(Link::Opening(_)) => ("⏳", "正在连接…".into(), visuals.hyperlink_color),
+            Some(Link::Online(info)) if info.is_empty() => ("✓", "已连接".into(), green),
+            Some(Link::Online(info)) => ("✓", format!("已连接 · {info}"), green),
+            Some(Link::Broken(err)) => ("✗", format!("连不上：{err}"), visuals.error_fg_color),
+            // 连过之后又改了字段：与其把上次的绿勾接着亮，不如直说那个结果不作数了
+            None if self.link_stale(spec) => (
                 "⚠",
                 "配置改过了，上次结果不作数".into(),
                 visuals.warn_fg_color,
             ),
-            None => return None,
-        })
+            None => (
+                "○",
+                "未连接".into(),
+                visuals.text_color().gamma_multiply(0.45),
+            ),
+        }
     }
 
-    /// 表单里那一行测试结论，整块铺色。
+    /// 按连接名给的状态记号：工具栏那一行和状态栏那一颗用它。
+    ///
+    /// 和侧栏、表单走同一个 `link_view`，为的是同一个连接在三处说法一致。
+    /// 没有记录给「○ 未连接」而不是空字符串——启动时十行全空着，
+    /// 用户得分不出「还没连」和「没测过」，那一颗 ○ 正是要告诉他得动手。
+    pub fn link_mark(&self, ui: &Ui, name: &str) -> (&'static str, String, egui::Color32) {
+        match self.spec_of(name) {
+            Some(spec) => self.link_view(ui, spec),
+            None => ("○", "没有这条连接".to_string(), ui.visuals().warn_fg_color),
+        }
+    }
+
+    /// 表单里那一行会话状态，整块铺色。
     ///
     /// 单独占一行是有原因的：从前它挤在「测试连接」按钮边上，11 号灰字，
     /// 用户点完根本不知道有没有生效。这一屏上「连上了没」是唯一要紧的答案。
-    fn probe_line(&self, ui: &mut Ui, spec: &ConnectionSpec) {
-        let Some((icon, text, color)) = self.probe_view(ui, spec) else {
-            return;
-        };
+    fn link_line(&self, ui: &mut Ui, spec: &ConnectionSpec) {
+        let (icon, text, color) = self.link_view(ui, spec);
         let dark = ui.visuals().dark_mode;
         let alpha = if dark { 40 } else { 28 };
         let fill = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha);
@@ -659,10 +851,7 @@ impl DatabasePanel {
             name: format!("连接{}", self.connections.len() + 1),
             ..Default::default()
         };
-        self.draft = Some(Draft {
-            index: None,
-            spec,
-        });
+        self.draft = Some(Draft { index: None, spec });
         self.show_manager = true;
     }
 
@@ -709,19 +898,11 @@ impl DatabasePanel {
                 spec.clone()
             }
         };
-        // 改过配置的连接，旧线程和旧列表都不再作数（改名时新旧名字一起收）
+        // 改过配置的连接，旧线程、旧列表和旧的状态记号都不再作数（改名时新旧名字一起收）。
+        // 只改显示名也一样要从「未连接」重新开始：线程已经被 `forget` 收了，
+        // 那块「已连接」的牌子不能凭空活在一个从没握过手的连接上。
         self.forget(&old.name);
         self.forget(&spec.name);
-        // 测试结论是按名字存的：改名后把它挪到新名字上，绿勾不该因为一次改名就消失。
-        // 但结论本身按配置指纹认领，存完再对着新配置核验，改过密码那份 ✓ 自然不亮。
-        let tested = self
-            .probes
-            .remove(&draft.spec.name)
-            .or_else(|| self.probes.remove(&old.name));
-        self.probes.remove(&old.name);
-        if let Some(record) = tested {
-            self.probes.insert(spec.name.clone(), record);
-        }
         if self.active.as_deref() == Some(old.name.as_str()) {
             self.active = Some(spec.name.clone());
         }
@@ -736,8 +917,8 @@ impl DatabasePanel {
         // 没保存过的连接也可能被「测试连接」起了线程，顺手收掉
         if !self.connections.iter().any(|c| c.name == draft.spec.name) {
             self.hub.close(&draft.spec.name);
-            // 结论也别留着：这个名字下面马上会长出另一条不相干的连接
-            self.probes.remove(&draft.spec.name);
+            // 状态也别留着：这个名字下面马上会长出另一条不相干的连接
+            self.links.remove(&draft.spec.name);
         }
     }
 
@@ -747,7 +928,6 @@ impl DatabasePanel {
         };
         self.connections.remove(index);
         self.forget(&spec.name);
-        self.probes.remove(&spec.name);
         if self.active.as_deref() == Some(spec.name.as_str()) {
             self.active = self.connections.first().map(|c| c.name.clone());
         }
@@ -766,20 +946,22 @@ impl DatabasePanel {
     }
 
     /// 侧栏「数据库」页签的内容。
-    pub fn sidebar(&mut self, ui: &mut Ui) {
+    ///
+    /// `busy` 是每条连接此刻排着几条语句（结果区给的）。连接之间各走各的线程，
+    /// 所以这一排数字只能按连接摆：全局一个「执行中」会说谎——两条同时跑时
+    /// 它只显示一次，看着像一个在等另一个。
+    pub fn sidebar(&mut self, ui: &mut Ui, busy: &[(String, usize)]) {
         // 标题行和文件树那头一个写法：按钮先占住右边，标题最后拿剩下的宽度。
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add(egui::Button::new(RichText::new("管理").size(11.5)).frame(false))
+                if crate::theme::chip(ui, "管理")
                     .on_hover_text("增删改连接，配置写在 config.json")
                     .clicked()
                 {
                     self.open_manager();
                 }
                 let active = self.active.clone();
-                if ui
-                    .add(egui::Button::new(RichText::new("刷新").size(11.5)).frame(false))
+                if crate::theme::chip(ui, "刷新")
                     .on_hover_text("重新读取当前选中连接的库和表")
                     .clicked()
                 {
@@ -787,6 +969,8 @@ impl DatabasePanel {
                         self.refresh(&name);
                     }
                 }
+                let up = self.online().len();
+                ui.label(weak(format!("已连接 {up} / {}", self.connections.len())));
                 ui.label(RichText::new("数据库连接").strong().size(12.0));
             });
         });
@@ -796,7 +980,11 @@ impl DatabasePanel {
             ui.add_space(20.0);
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new("还没有数据库连接").weak());
-                if ui.button("新建连接").clicked() {
+                if ui
+                    .button("新建连接")
+                    .on_hover_cursor(crate::theme::HAND)
+                    .clicked()
+                {
                     self.begin_new();
                 }
             });
@@ -815,6 +1003,8 @@ impl DatabasePanel {
             let target = eff.as_ref().map(|s| s.target()).unwrap_or_default();
             let database = self.current_db(&active);
             let color = ui.visuals().hyperlink_color;
+            let link_spec = self.spec_of(&active).cloned().unwrap_or_default();
+            let (mark, state, mark_color) = self.link_view(ui, &link_spec);
             egui::Frame::group(ui.style())
                 .inner_margin(egui::Margin::same(6))
                 .show(ui, |ui| {
@@ -843,6 +1033,30 @@ impl DatabasePanel {
                                 .color(color),
                             );
                         });
+                        // 连接/断开这一颗摆在这儿，不藏在右键里：
+                        // 「配了十条只想连两条」的时候，得有一处明说怎么连、怎么放掉。
+                        ui.horizontal(|ui| {
+                            let up = self.is_up(&active);
+                            let label = if up { "断开连接" } else { "连接" };
+                            let tip = if up {
+                                "放掉这条会话和它的工作线程。\n下次执行会自动重连，不用手动回来。"
+                            } else {
+                                "现在就建这条会话，并把库列表读出来。\n不点也行：执行 SQL 时它会自己连上。"
+                            };
+                            if crate::theme::chip(ui, label).on_hover_text(tip).clicked() {
+                                if up {
+                                    self.disconnect(&active);
+                                } else {
+                                    self.connect_now(&active);
+                                }
+                            }
+                            ui.label(
+                                RichText::new(format!("{mark} {state}"))
+                                    .size(10.5)
+                                    .strong()
+                                    .color(mark_color),
+                            );
+                        });
                     });
                 });
             ui.add_space(2.0);
@@ -855,7 +1069,11 @@ impl DatabasePanel {
                 // 整份克隆出来再遍历：行渲染里要改 self，借着一份 Vec 改不动
                 let specs = self.connections.clone();
                 for spec in specs {
-                    self.conn_rows(ui, &spec);
+                    let queued = busy
+                        .iter()
+                        .find(|(conn, _)| *conn == spec.name)
+                        .map_or(0, |(_, n)| *n);
+                    self.conn_rows(ui, &spec, queued);
                 }
             });
         self.status_row(ui);
@@ -868,11 +1086,13 @@ impl DatabasePanel {
         ui.label(RichText::new(self.status.clone()).size(10.5).weak());
     }
 
-    fn conn_rows(&mut self, ui: &mut Ui, spec: &ConnectionSpec) {
+    /// 一棵连接子树。`queued` 是这条连接此刻排着的语句条数（结果区给的）。
+    fn conn_rows(&mut self, ui: &mut Ui, spec: &ConnectionSpec, queued: usize) {
         let name = spec.name.clone();
         let expanded = self.trees.get(&name).is_some_and(|t| t.expanded);
         let selected = self.active_conn() == Some(name.as_str());
-        let probe = self.probe_view(ui, spec);
+        let (mark, state, mark_color) = self.link_view(ui, spec);
+        let up = self.is_up(&name);
 
         let (resp, x) = tree_row(ui, 0);
         let cy = resp.rect.center().y;
@@ -887,20 +1107,22 @@ impl DatabasePanel {
 
         // 行尾记号从右往左摆，名字拿剩下的那一截：再长的连接名也不会把牌子挤出面板
         let mut right = resp.rect.right() - 8.0;
-        if let Some((icon, _, color)) = &probe {
-            right = trail_label(ui, &resp, right, icon, *color);
+        // 没连上也要摆那颗 ○：十行全空着，用户分不清是还没测还是测挂了
+        right = trail_label(ui, &resp, right, mark, mark_color);
+        if queued > 0 {
+            right = trail_label(ui, &resp, right, &format!("⏳{queued}"), accent);
         }
         if selected {
             right = trail_label(ui, &resp, right, "默认", accent);
         }
         let hover = format!(
-            "{} · {}\n点名字 = 设为默认连接（SQL 块没写 conn= 就发到这里）\n点箭头 = {}",
+            "{state} · {} · {}\n点名字 = 设为默认连接（SQL 块没写 conn= 就发到这里）\n点箭头 = {}\n右键 = {}/断开",
             spec.kind.label(),
             spec.target(),
-            if expanded { "收起库列表" } else { "展开库列表" }
+            if expanded { "收起库列表" } else { "展开库列表" },
+            if up { "断开" } else { "连接" },
         );
-        put_name(ui, &resp, x + ARROW_W + ICON_W, right, &name, 12.5, true)
-            .on_hover_text(hover);
+        put_name(ui, &resp, x + ARROW_W + ICON_W, right, &name, 12.5, true).on_hover_text(hover);
 
         if resp.clicked() {
             if hit_arrow(&resp, x) {
@@ -914,19 +1136,34 @@ impl DatabasePanel {
             }
         }
         resp.context_menu(|ui| {
-            if ui.button("刷新库列表").clicked() {
+            // 连接 / 断开：一颗跟着状态换字，比摆两个按钮各自禁用清楚
+            let label = if up { "断开连接" } else { "连接" };
+            if ui
+                .button(label)
+                .on_hover_cursor(crate::theme::HAND)
+                .clicked()
+            {
+                ui.close();
+                if up {
+                    self.disconnect(&name);
+                } else {
+                    self.connect_now(&name);
+                }
+            }
+            if ui
+                .button("刷新库列表")
+                .on_hover_cursor(crate::theme::HAND)
+                .clicked()
+            {
                 self.refresh(&name);
                 ui.close();
             }
-            if ui.button("测试连接").clicked() {
-                let saved = self.spec_of(&name).cloned();
-                ui.close();
-                if let Some(saved) = saved {
-                    self.test_connection(&saved);
-                }
-            }
             ui.separator();
-            if ui.button("编辑连接…").clicked() {
+            if ui
+                .button("编辑连接…")
+                .on_hover_cursor(crate::theme::HAND)
+                .clicked()
+            {
                 let index = self.connections.iter().position(|c| c.name == name);
                 ui.close();
                 if let Some(index) = index {
@@ -987,10 +1224,13 @@ impl DatabasePanel {
         let hover = format!(
             "{}\n点名字 = 设为这条连接的当前库（不写 conn= 的 SQL 就发到这里）\n点箭头 = {}",
             db,
-            if is_open { "收起表列表" } else { "展开表列表" }
+            if is_open {
+                "收起表列表"
+            } else {
+                "展开表列表"
+            }
         );
-        put_name(ui, &resp, x + ARROW_W + ICON_W, right, &db, 12.0, false)
-            .on_hover_text(hover);
+        put_name(ui, &resp, x + ARROW_W + ICON_W, right, &db, 12.0, false).on_hover_text(hover);
 
         if resp.clicked() {
             if hit_arrow(&resp, x) {
@@ -1061,7 +1301,11 @@ impl DatabasePanel {
                     .size(12.0),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("新建").clicked() {
+                if ui
+                    .button("新建")
+                    .on_hover_cursor(crate::theme::HAND)
+                    .clicked()
+                {
                     self.begin_new();
                 }
             });
@@ -1093,11 +1337,16 @@ impl DatabasePanel {
                                 )
                                 .min_size(egui::vec2(rows_width, 0.0)),
                             )
+                            .on_hover_cursor(crate::theme::HAND)
                             .on_hover_text(&target);
                         if row.clicked() {
                             self.begin_edit(index);
                         }
-                        if ui.small_button("删除").clicked() {
+                        if ui
+                            .small_button("删除")
+                            .on_hover_cursor(crate::theme::HAND)
+                            .clicked()
+                        {
                             self.delete(index);
                         }
                     });
@@ -1134,7 +1383,11 @@ impl DatabasePanel {
                 .selected_text(spec.kind.label())
                 .show_ui(ui, |ui| {
                     for kind in DbKind::all() {
-                        if ui.selectable_label(spec.kind == *kind, kind.label()).clicked() {
+                        if ui
+                            .selectable_label(spec.kind == *kind, kind.label())
+                            .on_hover_cursor(crate::theme::HAND)
+                            .clicked()
+                        {
                             spec.kind = *kind;
                             spec.port = kind.default_port();
                         }
@@ -1147,7 +1400,11 @@ impl DatabasePanel {
                     .desired_width(120.0),
             );
             ui.label(weak("端口"));
-            ui.add(egui::DragValue::new(&mut spec.port).range(1..=65535).speed(1));
+            ui.add(
+                egui::DragValue::new(&mut spec.port)
+                    .range(1..=65535)
+                    .speed(1),
+            );
         });
 
         ui.add_space(4.0);
@@ -1161,7 +1418,11 @@ impl DatabasePanel {
             ui.label(weak("密码"));
             ui.add(
                 egui::TextEdit::singleline(&mut secret.1)
-                    .hint_text(if secret.0 { "变量名" } else { "留空 = 空密码" })
+                    .hint_text(if secret.0 {
+                        "变量名"
+                    } else {
+                        "留空 = 空密码"
+                    })
                     .password(!secret.0)
                     .desired_width(150.0),
             );
@@ -1203,7 +1464,7 @@ impl DatabasePanel {
         }
 
         ui.add_space(6.0);
-        self.probe_line(ui, &spec);
+        self.link_line(ui, &spec);
 
         ui.add_space(2.0);
         let mut test = false;
@@ -1212,16 +1473,25 @@ impl DatabasePanel {
         ui.horizontal(|ui| {
             if ui
                 .button("测试连接")
+                .on_hover_cursor(crate::theme::HAND)
                 .on_hover_text("只问一句版本号，不动任何数据")
                 .clicked()
             {
                 test = true;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("取消").clicked() {
+                if ui
+                    .button("取消")
+                    .on_hover_cursor(crate::theme::HAND)
+                    .clicked()
+                {
                     cancel = true;
                 }
-                if ui.button("保存").clicked() {
+                if ui
+                    .button("保存")
+                    .on_hover_cursor(crate::theme::HAND)
+                    .clicked()
+                {
                     save = true;
                 }
             });
@@ -1256,7 +1526,14 @@ fn table_row(ui: &mut Ui, database: &str, table: &str) {
     let qualified = format!("`{database}`.`{table}`");
     let (resp, x) = tree_row(ui, 2);
     let cy = resp.rect.center().y;
-    tree_icon(ui, cy, x + ARROW_W, TABLE_ICON, false, ui.visuals().hyperlink_color);
+    tree_icon(
+        ui,
+        cy,
+        x + ARROW_W,
+        TABLE_ICON,
+        false,
+        ui.visuals().hyperlink_color,
+    );
     put_name(
         ui,
         &resp,
@@ -1271,11 +1548,19 @@ fn table_row(ui: &mut Ui, database: &str, table: &str) {
         ui.ctx().copy_text(qualified.clone());
     }
     resp.context_menu(|ui| {
-        if ui.button("复制表名").clicked() {
+        if ui
+            .button("复制表名")
+            .on_hover_cursor(crate::theme::HAND)
+            .clicked()
+        {
             ui.ctx().copy_text(qualified.clone());
             ui.close();
         }
-        if ui.button("复制 SELECT 语句").clicked() {
+        if ui
+            .button("复制 SELECT 语句")
+            .on_hover_cursor(crate::theme::HAND)
+            .clicked()
+        {
             ui.ctx()
                 .copy_text(format!("SELECT * FROM {qualified} LIMIT 100;"));
             ui.close();
@@ -1297,8 +1582,8 @@ fn muted_row(ui: &mut Ui, depth: usize, text: &str) {
     );
 }
 
-fn weak(text: &str) -> RichText {
-    RichText::new(text.to_string()).size(11.0).weak()
+fn weak(text: impl Into<String>) -> RichText {
+    RichText::new(text).size(11.0).weak()
 }
 
 /// 密码框拆成「是否 env 间接」+「框里显示的内容」。
@@ -1337,6 +1622,17 @@ mod tests {
         match load {
             Load::Ready(list) => Some(list),
             _ => None,
+        }
+    }
+
+    /// 会话状态取成一句好比较的话。`Link::Opening` 里带的是时间点，断言用不上。
+    fn link(panel: &DatabasePanel, name: &str) -> String {
+        match panel.link_state(name) {
+            Some(Link::Opening(_)) => "正在连接".into(),
+            Some(Link::Online(info)) if info.is_empty() => "已连接".into(),
+            Some(Link::Online(info)) => format!("已连接 · {info}"),
+            Some(Link::Broken(err)) => format!("连不上 · {err}"),
+            None => "未连接".into(),
         }
     }
 
@@ -1457,17 +1753,15 @@ mod tests {
         panel.begin_edit(0);
         let draft_spec = panel.draft.clone().expect("草稿").spec;
         panel.test_connection(&draft_spec);
-        assert!(
-            matches!(panel.probe_of(&draft_spec), Some(Probe::Running)),
+        assert_eq!(
+            link(&panel, "测试连接"),
+            "正在连接",
             "点下去那一帧就该有反应，不然等回执的几秒像没点上"
         );
         settle(&mut panel);
-        assert_eq!(
-            panel.probe_of(&draft_spec),
-            Some(&Probe::Ok("8.0.33-mock".into()))
-        );
+        assert_eq!(link(&panel, "测试连接"), "已连接 · 8.0.33-mock");
         assert!(
-            panel.status.contains("可用"),
+            panel.status.contains("已连接"),
             "状态栏也要说：{}",
             panel.status
         );
@@ -1483,10 +1777,11 @@ mod tests {
         panel.connections.push(bad.clone());
         panel.test_connection(&bad);
         settle(&mut panel);
-        match panel.probe_of(&bad) {
-            Some(Probe::Failed(text)) => assert!(text.contains("连接被拒绝"), "{text}"),
-            other => panic!("失败得留在结论里，不能只在状态栏闪一下：{other:?}"),
-        }
+        assert!(
+            link(&panel, "坏连接").contains("连接被拒绝"),
+            "失败得留在结论里，不能只在状态栏闪一下：{}",
+            link(&panel, "坏连接")
+        );
     }
 
     #[test]
@@ -1495,33 +1790,42 @@ mod tests {
         let saved = spec("测试连接");
         panel.test_connection(&saved);
         settle(&mut panel);
-        assert!(panel.probe_of(&saved).is_some());
+        assert!(panel.link_of(&saved).is_some());
         let mut edited = saved.clone();
         edited.host = "10.0.0.1".into();
-        assert!(
-            panel.probe_of(&edited).is_none(),
-            "换了主机还亮绿勾等于骗人"
-        );
-        assert!(
-            panel.probe_stale(&edited),
-            "但得说清那是过期，不是从没测过"
-        );
+        assert!(panel.link_of(&edited).is_none(), "换了主机还亮绿勾等于骗人");
+        assert!(panel.link_stale(&edited), "但得说清那是过期，不是从没测过");
     }
 
+    /// 改名看着只动了显示，底下那条会话却整个换了：旧线程收了，「已连接」的牌子
+    /// 不能凭空活在一个从没握过手的新会话上。
     #[test]
-    fn renaming_keeps_the_verdict_and_saving_moves_it_to_the_new_name() {
+    fn renaming_starts_the_verdict_over() {
         let mut panel = panel(&["旧名"]);
         let saved = spec("旧名");
         panel.test_connection(&saved);
         settle(&mut panel);
+        assert_eq!(link(&panel, "旧名"), "已连接 · 8.0.33-mock");
+
         panel.begin_edit(0);
         panel.draft.as_mut().expect("草稿").spec.name = "新名".into();
         panel.save_draft();
-        assert!(
-            panel.probe_of(&spec("新名")).is_some(),
-            "改个显示名不该把测过的结论丢掉"
+        assert_eq!(
+            panel.connections[0].name, "新名",
+            "名字本身要改到位，别在旧名下留一条孤儿配置"
         );
-        assert!(!panel.probes.contains_key("旧名"), "旧名字下不该留孤儿");
+        assert!(
+            panel.links.is_empty(),
+            "换了会话还留着上一轮的牌子：{:?}",
+            panel.links
+        );
+        assert_eq!(link(&panel, "新名"), "未连接", "改名后从「未连接」重新开始");
+
+        // 重连一次就能再亮起来，说明「未连接」只是要重新握手，不是坏了
+        let renamed = spec("新名");
+        panel.test_connection(&renamed);
+        settle(&mut panel);
+        assert_eq!(link(&panel, "新名"), "已连接 · 8.0.33-mock");
     }
 
     #[test]
@@ -1532,10 +1836,13 @@ mod tests {
         let draft = panel.draft.clone().expect("草稿").spec;
         panel.test_connection(&draft);
         settle(&mut panel);
-        assert!(panel.probe_of(&draft).is_some(), "先测出个结论来");
+        assert!(
+            panel.link_of(&draft).is_some(),
+            "先测出个结论来（草稿没进列表，只能按那份配置查）"
+        );
         panel.cancel_draft();
         assert!(
-            panel.probes.is_empty(),
+            panel.links.is_empty(),
             "没保存的连接，结论留着只会坑下一条同名连接"
         );
     }
@@ -1547,7 +1854,7 @@ mod tests {
         panel.test_connection(&saved);
         settle(&mut panel);
         panel.delete(0);
-        assert!(panel.probes.is_empty(), "连接没了，结论也该跟着走");
+        assert!(panel.links.is_empty(), "连接没了，结论也该跟着走");
     }
 
     #[test]
@@ -1558,7 +1865,63 @@ mod tests {
         panel.test_connection(&saved);
         panel.delete(0);
         settle(&mut panel);
-        assert!(panel.probes.is_empty(), "孤儿结论：{:?}", panel.probes);
+        assert!(panel.links.is_empty(), "孤儿结论：{:?}", panel.links);
+    }
+
+    /// 配了连接 ≠ 连上了。启动时一条都不握手：有人配十条只用两条，而每次握手都要
+    /// 起一个线程、在服务器那边占一个会话；编辑文本本来就不需要数据库。
+    #[test]
+    fn startup_connects_nothing() {
+        let panel = panel(&["甲库", "乙库", "丙库"]);
+        assert!(panel.links.is_empty(), "开局就该一条都没连");
+        assert!(!panel.has_link(), "没有会话就不必为状态计时反复重画");
+        assert!(panel.online().is_empty());
+        assert_eq!(link(&panel, "甲库"), "未连接");
+        assert!(panel.hub.connections().is_empty(), "连线程都不该提前开");
+    }
+
+    /// 「明确的连接路径」：点一下连接，只有那一条起线程，其余照旧不动。
+    #[test]
+    fn connecting_one_leaves_the_others_asleep() {
+        let mut panel = panel(&["甲库", "乙库"]);
+        panel.connect_now("甲库");
+        assert_eq!(link(&panel, "甲库"), "正在连接", "点下去那一帧先给个反应");
+        settle(&mut panel);
+        assert_eq!(link(&panel, "甲库"), "已连接 · 8.0.33-mock");
+        assert_eq!(panel.online(), vec!["甲库".to_string()]);
+        assert_eq!(link(&panel, "乙库"), "未连接", "另一条不该被顺手连上");
+        assert_eq!(panel.hub.connections(), vec!["甲库".to_string()]);
+        assert!(
+            panel.trees.get("甲库").is_some_and(|t| t.expanded),
+            "连接既然点了，树就该直接展开到位"
+        );
+
+        // 断开只收这一条：线程、缓存、牌子一起走
+        panel.disconnect("甲库");
+        assert!(panel.links.is_empty(), "断了还留着「已连接」就是骗人");
+        assert!(!panel.has_link());
+        assert!(panel.hub.connections().is_empty(), "线程要真收了");
+    }
+
+    /// 握手没回执不能永远转圈：超时翻红，并且说清下一步做什么。
+    ///
+    /// 这里不真等 20 秒——`tick` 收的是「现在是几点」，把表往前拨就行。
+    #[test]
+    fn a_handshake_that_never_answers_times_out() {
+        let mut panel = panel(&["静默的连接"]);
+        panel.test_connection(&spec("静默的连接"));
+        assert_eq!(link(&panel, "静默的连接"), "正在连接");
+
+        // 回执一个都不取，模拟那条连接永远不答话
+        let late = std::time::Instant::now() + OPENING_TIMEOUT + std::time::Duration::from_secs(1);
+        panel.tick(late);
+        let state = link(&panel, "静默的连接");
+        assert!(
+            state.starts_with("连不上"),
+            "超时了牌子还写着「正在连接」：{state}"
+        );
+        assert!(state.contains("再点一次"), "得说清下一步：{state}");
+        assert!(!panel.has_link(), "这条已经判了死刑，不必再为它计时");
     }
 
     #[test]
@@ -1587,7 +1950,11 @@ mod tests {
         panel.draft.as_mut().expect("草稿").spec.name = "新名".into();
         panel.save_draft();
         assert!(panel.draft.is_none(), "保存完草稿该关掉");
-        assert_eq!(panel.active.as_deref(), Some("新名"), "改了名，选中的连接要跟着走");
+        assert_eq!(
+            panel.active.as_deref(),
+            Some("新名"),
+            "改了名，选中的连接要跟着走"
+        );
         assert!(!panel.trees.contains_key("新名"), "改名后旧缓存不能接着画");
         assert!(!panel.hub.has_connection("旧名"), "旧名字的工作线程要收掉");
     }
@@ -1628,8 +1995,14 @@ mod tests {
         }
         panel.save_draft();
         let saved = &panel.connections[0];
-        assert_eq!((saved.name.as_str(), saved.host.as_str()), ("本地", "10.1.1.1"));
-        assert_eq!((saved.user.as_str(), saved.database.as_str()), ("app", "demo"));
+        assert_eq!(
+            (saved.name.as_str(), saved.host.as_str()),
+            ("本地", "10.1.1.1")
+        );
+        assert_eq!(
+            (saved.user.as_str(), saved.database.as_str()),
+            ("app", "demo")
+        );
     }
 
     #[test]
@@ -1641,7 +2014,10 @@ mod tests {
         panel.test_connection(&draft_spec);
         assert!(panel.hub.has_connection("临时"));
         panel.cancel_draft();
-        assert!(!panel.hub.has_connection("临时"), "没保存的连接不能留个线程");
+        assert!(
+            !panel.hub.has_connection("临时"),
+            "没保存的连接不能留个线程"
+        );
     }
 
     #[test]
@@ -1665,7 +2041,11 @@ mod tests {
         panel.delete(0);
         assert!(!panel.trees.contains_key("删我"));
         assert!(!panel.hub.has_connection("删我"));
-        assert_eq!(panel.active.as_deref(), Some("留着"), "选中的连接该顺延到下一条");
+        assert_eq!(
+            panel.active.as_deref(),
+            Some("留着"),
+            "选中的连接该顺延到下一条"
+        );
     }
 
     /// 侧栏单独画一帧。指针状态在 begin_pass 就算好了，只能事前塞进 RawInput。
@@ -1683,7 +2063,7 @@ mod tests {
             ..Default::default()
         };
         let mut out = ctx.run_pass(raw, |ctx| {
-            ctx.root_ui(|ui| panel.sidebar(ui));
+            ctx.root_ui(|ui| panel.sidebar(ui, &[]));
         });
         // 没有真的渲染器消费字体图集的增量，epaint 会在 drop 时断言
         out.textures_delta.clear();
@@ -1692,12 +2072,10 @@ mod tests {
 
     fn walk_text(shape: &egui::Shape, v: &mut Vec<(String, egui::Rect)>) {
         match shape {
-            egui::Shape::Text(text) => {
-                v.push((
-                    text.galley.job.text.clone(),
-                    text.galley.rect.translate(text.pos.to_vec2()),
-                ))
-            }
+            egui::Shape::Text(text) => v.push((
+                text.galley.job.text.clone(),
+                text.galley.rect.translate(text.pos.to_vec2()),
+            )),
             egui::Shape::Vec(shapes) => {
                 for s in shapes {
                     walk_text(s, v);
@@ -1718,7 +2096,7 @@ mod tests {
     /// 把侧栏单独画一帧，收它往屏上丢的所有文字。
     ///
     /// 测试结论、默认连接这些最后都落成一个记号加一行小字。
-    /// 只断言 `probes` 里有条目证明不了用户看得见——画没画出来得看这一帧。
+    /// 只断言 `links` 里有条目证明不了用户看得见——画没画出来得看这一帧。
     fn sidebar_texts(panel: &mut DatabasePanel) -> Vec<String> {
         let ctx = egui::Context::default();
         ctx.set_pixels_per_point(1.0);
@@ -1889,11 +2267,7 @@ mod tests {
                 .contains("information_schema"),
             "点在箭头上却没展开表列表"
         );
-        assert_eq!(
-            panel.current_db("点箭头"),
-            "demo",
-            "点箭头不该把当前库换掉"
-        );
+        assert_eq!(panel.current_db("点箭头"), "demo", "点箭头不该把当前库换掉");
     }
 
     #[test]
@@ -1909,6 +2283,51 @@ mod tests {
         assert!(
             sidebar_texts(&mut panel).iter().any(|t| t == "✗"),
             "连不上得一眼看见"
+        );
+    }
+
+    /// 配了两条、只连一条时，侧栏要一眼分清哪条挂着会话、哪条没有。
+    ///
+    /// 从前「测试连接」是唯一的入口，勾打了也就代表测过；现在那块牌子说的是
+    /// 「此刻有没有会话」，所以每条都得有个记号，未连接的那条还得给个「连接」按钮。
+    #[test]
+    fn the_sidebar_separates_connected_from_configured() {
+        let mut panel = panel(&["甲库", "乙库"]);
+        let texts = sidebar_texts(&mut panel);
+        assert!(
+            texts.iter().any(|t| t == "已连接 0 / 2"),
+            "开局一条都没连，这行得说实话：{texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t == "✓"),
+            "没连过的不该提前打勾：{texts:?}"
+        );
+        assert_eq!(
+            texts.iter().filter(|t| *t == "○").count(),
+            2,
+            "两行都得留着那颗「未连接」的记号：{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "连接"),
+            "没连上要就地给个入口：{texts:?}"
+        );
+
+        panel.connect_now("甲库");
+        settle(&mut panel);
+        let texts = sidebar_texts(&mut panel);
+        assert!(
+            texts.iter().any(|t| t == "已连接 1 / 2"),
+            "只连一条就报 1 / 2：{texts:?}"
+        );
+        assert!(texts.iter().any(|t| t == "✓"), "连上的那条要亮绿勾");
+        assert_eq!(
+            texts.iter().filter(|t| *t == "○").count(),
+            1,
+            "另一条不许跟着亮：{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "断开连接"),
+            "连上了就得给出口：{texts:?}"
         );
     }
 }

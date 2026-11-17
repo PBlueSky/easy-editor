@@ -222,7 +222,10 @@ mod tests {
             "非 UTF-8 不能坏一个格子，更不该把整条结果丢掉"
         );
         assert_eq!(to_cell(Some(&Value::Int(-7))), Cell::Text("-7".into()));
-        assert_eq!(to_cell(Some(&Value::UInt(70000))), Cell::Text("70000".into()));
+        assert_eq!(
+            to_cell(Some(&Value::UInt(70000))),
+            Cell::Text("70000".into())
+        );
     }
 
     #[test]
@@ -252,10 +255,7 @@ mod tests {
         let err = with_statement(MyError::MySqlError(server), "SELECT FROM");
         assert_eq!(err.code, Some(1064));
         assert!(err.message.contains("SELECT FROM"), "实际 {err}");
-        assert!(
-            !err.needs_reconnect,
-            "语法错不该让 hub 把连接丢掉：{err}"
-        );
+        assert!(!err.needs_reconnect, "语法错不该让 hub 把连接丢掉：{err}");
     }
 
     #[test]

@@ -30,8 +30,10 @@ The release package is a **single exe** (about 12 MB, 5.2 MB zipped). No .NET, n
 | Recursive split panes | The tmux / i3 binary pane tree — split as deep as you like, default keys match Windows Terminal | [Split panes](#split-panes) |
 | Journal blocks | Task blocks written directly into ordinary text files, mixed with prose and versioned with git | [Journal blocks](#journal-blocks) |
 | SQL blocks | Jupyter-style: the query lives in a plain text file, `Ctrl+Enter` runs it and the result lands below the editor. `Ctrl+Alt+N` starts a fresh `query-<timestamp>.sql` with the connection already bound | [SQL blocks](#sql-blocks) |
-| Multiple results at once | One panel per statement, so a broken second query does not throw away the first result; batch headers, pop-out windows, copy as TSV, export as CSV, sideways-scrolling wide tables, whole-row selection, per-row detail window | [Results dock](#results-dock) |
-| MySQL connections | Named connections in `config.json`, browsed as connection → database → table, passwords via `env:` so no secret sits on disk. The test verdict (`✓` / `✗` / `⚠`) and the current default are visible wherever the connection is | [Connections](#connections) |
+| Multiple results at once | One tab per statement, so a broken second query does not throw away the first result; up to 10 results, switched by a tab bar; batch headers, pop-out windows, copy as TSV, export as CSV, sideways-scrolling wide tables, whole-row selection, per-row detail window that closes when you click elsewhere | [Results dock](#results-dock) |
+| Several connections at once | One worker thread per connection, so a slow query on one never blocks another; the auto-run gate is per connection too | [Connections](#connections) |
+| MySQL connections | Named connections in `config.json`, browsed as connection → database → table, passwords via `env:` so no secret sits on disk. Nothing connects at start-up; `✓ 已连接` / `○ 未连接` / `⏳ 正在连接` / `✗ 连不上` show wherever the connection appears, with an explicit connect / disconnect button and idle reaping | [Connections](#connections) |
+| Interaction feedback | A pointing hand over everything clickable, hover highlights that do not shift layout, and a tooltip wherever the meaning is not obvious | [Interaction feedback](#interaction-feedback) |
 | Cursor position history | Like IDEA's Navigate Back / Forward; a position only counts as a stop after the cursor sits there for 350 ms | [Cursor position history](#cursor-position-history) |
 | Find and replace | Case sensitivity, regex, all matches highlighted, hands stay in the input box | [Find and replace](#find-and-replace) |
 | Project-wide search | Streams `rg --json` first, falls back to a built-in byte-level scanner when ripgrep is absent | [Project-wide search](#project-wide-search) |
@@ -203,20 +205,21 @@ Header = `-- sql` + title + `YYYY-MM-DD HH:MM` + `[status]` + tail keys. Two tai
 
 ### Results dock
 
-**One statement, one panel**, and several panels stay on screen at once. That is deliberate: in a block with three `SELECT`s where the second one is broken, the first result is still worth reading, so it is not thrown away with the error. Statements queued behind a failure are marked `未执行` ("not run") instead of spinning forever, and the dock keeps the last 6 panels — the oldest are evicted.
+**One statement, one tab**, and up to 10 results stay on the books at once. Per-statement is deliberate: in a block with three `SELECT`s where the second one is broken, the first result is still worth reading, so it is not thrown away with the error. Statements queued behind a failure are marked `未执行` ("not run") instead of spinning forever, and the oldest result is the one evicted.
 
-Six panels stacked in one strip is its own problem, so the dock separates them three ways at once:
+Ten results in one strip would squeeze the editor out, so only one of them is on screen: a tab bar, one tab per statement, labelled `3·SELECT name FROM u` with a status dot on the left (green done / red failed / blue waiting / grey not run) and its own `✕` on the right. Click a tab to show only that result; the others stay available. Closing the active tab falls back to the first one still on screen, so the dock is never left pointing at nothing.
 
-- **One header row per submission** — `14:03:12  demo · 「活跃用户」 · 共 3 条`. When two blocks produce nearly identical statements, the timestamp is the only thing that says which batch is which
-- **`1/3`, `2/3`, `3/3`** in each panel title, so the order within a batch survives scrolling
-- **A 2.5 pt status bar painted down the left edge** of every panel (green done / red failed / blue waiting). Titles repeat; colour does not
+- Long labels truncate at 26 characters — hover gives the full statement plus rows and timing; when the batch has more tabs than fit, the tab bar scrolls sideways
+- **One header row per submission** stays above the tabs — `14:03:12  demo · 「活跃用户」 · 共 3 条`. When two blocks produce nearly identical statements, the timestamp is the only thing that says which batch is which
+- **`1/3`, `2/3`, `3/3`** in each panel title, so the order within a batch survives switching tabs
 
-- Each panel header carries `回块` (jump back to the block it came from), `放大` / `收起` (put *this* result into its own resizable window — the way to read a wide table that the bottom strip cannot stretch to fit), `复制` (the whole result as tab-separated text, ready to paste into a spreadsheet), `导出` (CSV), `关掉整块` (close every panel of this submission) and `✕`; clicking the header row itself collapses just that panel
+- Each panel header carries `回块` (jump back to the block it came from), `放大` / `收起` (put *this* result into its own resizable window — the way to read a wide table that the bottom strip cannot stretch to fit), `复制` (the whole result as tab-separated text, ready to paste into a spreadsheet), `导出` (CSV), `关掉整块` (close every tab of this submission) and `✕`
 - Grid cells are single-line and truncated — that is what keeps a wide table readable. A copy of any cell, row or table is on its right-click menu
 - **Wide tables scroll sideways.** `egui_extras` gives a table body a vertical bar and nothing else, so the grid is wrapped in its own horizontal scroll area — header and body travel together, so columns cannot slip out of alignment. Each column starts at 140 pt, keeps a 56 pt floor and is still drag-resizable; the `#` column is 46 pt and slides along with the rest. One caveat the nesting brings: the table's vertical bar now sits at the right edge of the *content*, so it can be off-screen while you are scrolled left — the wheel still scrolls vertically there
 - **The `▸` at the head of a row opens that row in its own window, pinned to the right of the screen**: one `column = full value` field per line, wrapped, selectable, with `复制整行` at the bottom. The same chevron closes it, one window per panel, and it reopens where you left it. It used to unfold a block inside the grid, which could not be folded back and kept getting clipped by the table's own viewport
+- **That window closes itself when you click anywhere else** — on a tab, another cell, the editor — so hunting for a `✕` is no longer part of reading a result. The `钉住` checkbox in its top-right turns that off while you compare a few rows; pinning follows the result, so switching tabs and back keeps it pinned
 - **Click a row number to select the whole row.** Every cell of it lights up and an action bar appears under the grid: `复制整行` (that row as TSV), `看详情` (the same right-side window) and `取消选中`. Copying lives on the bar rather than on `Ctrl+C` on purpose — that keystroke belongs to the editor, and stealing it would swap whatever you were about to copy there
-- A cell that is genuinely too narrow for its content shows a hover tooltip with the head of the value, and **double-clicking it opens that one cell in its own window** — wrapped, scrollable, select-all, with `复制本格` putting the *untruncated* value on the clipboard (the same item is on the right-click menu as `查看完整内容`). Same-grid, same-data: the window reads the panel it came from
+- A cell that is genuinely too narrow for its content shows a hover tooltip with the head of the value, and **double-clicking it opens that one cell in its own window** — wrapped, scrollable, select-all, with `复制本格` putting the *untruncated* value on the clipboard (the same item is on the right-click menu as `查看完整内容`). Same-grid, same-data: the window reads the panel it came from. Like the row window, it closes on any click outside and can be pinned
 - The bottom strip is resizable even before anything has run — dragging the divider up used to spring back to the default height, because an empty dock only measured one line of text and the panel booked that
 - The dock bar has `全部收起 / 全部展开`, `清空` (closes finished panels and keeps the ones still waiting for a reply) and `关闭`
 - A query prints `connection · N 行 · M ms` above a scrollable grid — the dock gives it 120 pt, the popped-out window gives it whatever it asks for. Writes print `影响 N 行` plus the last insert id and the warning count when MySQL reports them
@@ -230,7 +233,7 @@ Put `auto` in the header and stop typing: 700 ms after the last keystroke the bl
 
 - only blocks explicitly marked `auto`, and **only when every statement in the body is read-only** — `INSERT` / `UPDATE` / `DELETE` / `DROP` and friends never run themselves, whatever the header says
 - one body runs once: the pair (block, text) is remembered, so you have to change the SQL to get another pass; there is no polling loop
-- nothing new is submitted while the dock is still waiting for replies, so a slow server cannot stack batches
+- nothing new is submitted to a connection while it still has replies outstanding, so a slow server cannot stack batches on it. The gate is per connection: another connection being slow never holds this block back
 
 Writes still need a human `Ctrl+Enter`.
 
@@ -258,16 +261,23 @@ Everything database-related hangs off the single `Database` dropdown in the tool
 
 `password` accepts `env:VAR`, resolved from `VAR` and then from `EASY_EDITOR_VAR` when the connection is actually opened, so the config file does not have to hold the secret. A literal password works too — remember that `config.json` is readable by your Windows account.
 
-**Whether a connection actually works is said out loud.** `测试连接` used to answer with a small grey line next to the button, which on a screen this busy meant "did nothing". Now the verdict is a colour-filled block of its own in the form and a mark on the connection's row everywhere it appears:
+**Whether a session is up is said out loud.** This used to be "a small grey line next to `测试连接`", which on a screen this busy meant "did nothing". The mark now says what the *session* is doing, not what some test found earlier, and it shows everywhere the connection appears:
 
 | Mark | Meaning |
 | --- | --- |
-| `⏳ 正在测试…` | submitted, the answer is on its way — this frame is up before the thread has even started |
-| `✓ 连接可用 · 8.0.33` | opened, version read back |
+| `○ 未连接` | nothing has been said to this server. **Every connection starts here** |
+| `⏳ 正在连接…` | the handshake is in flight — it gives up and turns `✗` after 20 s, so it never strands a spinner |
+| `✓ 已连接 · 8.0.33` | a session is up, version read back |
 | `✗ 连不上 · 2003 …` | the server's own words, selectable so you can copy them |
-| `⚠ 配置改过了` | there *was* a verdict, but the host / port / user / password / database behind it has since changed |
+| `⚠ 配置改过了` | a session *was* established, but the host / port / user / password / database behind it has since changed |
 
-That last row is the point of the whole design: a verdict is claimed by a hash of the connection's fields, so editing the form retires the old `✓` instead of continuing to vouch for a server you have never contacted since. `⚠` is what "stale" looks like. The same mark shows in the sidebar row, in the `Database` dropdown header and in the status bar, all of them reading the one record — and a verdict that belongs to a connection you deleted or renamed away from is dropped, not replayed.
+**Nothing connects when the app starts.** Ten configured connections of which you use two should not mean ten threads and ten TCP handshakes. Startup opens zero — `startup_connects_nothing` makes that a test, not a habit. A session appears by exactly three routes: the `连接` chip in the sidebar, `测试连接` in the form, or simply `Ctrl+Enter`, which connects the block's own connection on demand. The sidebar footer says `已连接 2 / 10`, so "configured" and "connected" are never confused again.
+
+Sessions do not linger either: a connection idle for 5 minutes (`IDLE_LINK`) has its worker thread reaped and its mark back to `○` — one that is mid-statement is left alone. `断开连接` drops the thread and the cached tree right away, and says so in the status line ("the next run reconnects by itself"). When the server kills a session (`2006` / `2013` / `2055`) the mark flips to `✗` and the next run reconnects; a plain SQL error does not count as a break — the server answered, so the session is still good.
+
+The mark is claimed by a hash of the connection's fields (`ConnectionSpec::stamp()`), so editing a field turns `✓` into `⚠` on that frame instead of continuing to vouch for a server you have never contacted since. Renaming *does* reset the mark to `○`: the name is the worker thread's key, and a verdict may not survive onto a session that never shook hands. Verdicts belonging to a connection you deleted are dropped, not replayed onto someone else.
+
+**Several connections run at the same time, really.** Each connection has its own background thread and replies are matched by (connection, statement id), so a three-minute report on one connection never stops another from answering `SELECT 1`. A `⏳N` badge on a sidebar row is how many statements that connection still owes. The auto-run gate follows the same split: it only holds when *this* connection still has outstanding replies.
 
 **`Database ▸ Sidebar database tree`** opens the `Database` tab: connection → databases → tables, each level fetched lazily the first time you expand it, with a `重试` (retry) button on the row that failed. Double-click a table to copy its qualified name; its context menu also copies a ready-made `SELECT * FROM db.table LIMIT 100;`.
 
@@ -279,6 +289,17 @@ Two rows answer "where does my SQL go", and they answer it separately:
 - **database** — click the name and it becomes *that connection's* current database, overriding the `database` field in `config.json` for everything sent to it. Nothing is written to disk: it is a session choice, and it is what `effective_spec()` builds the outgoing connection from, so the tree, the status chip and the wire cannot disagree
 
 Both are restated at the head of the tab — `默认连接 demo · root@127.0.0.1:3306` and `当前库 shop` — because a tree that only shows the connection is a tree that hides half the answer.
+
+That card carries a third line, `已连接 2 / 10`, and a chip that changes with the state: `连接` when the session is down, `断开连接` when it is up. It is deliberately not hidden in the right-click menu — when the mark says "not connected", the same screen should say how to change that. The context menu offers the same thing.
+
+### Interaction feedback
+
+Whatever you can click should look clickable, and this round pushed that through the whole app rather than only the database screens:
+
+- **The cursor becomes a pointing hand over anything actionable** — buttons, checkboxes, result tabs, tree rows, every cell of the search results, file tree rows, pane titles, journal block titles. Two layers do it: egui's own `visuals.interact_cursor` is set globally, which covers every `Button` (including `small_button` and the inline chips), and the hand-painted rectangles — result tabs, sidebar rows, file tree rows, the `钉住` checkbox in the row window — each get `on_hover_cursor(HAND)` because the global style does not reach them
+- **Hover lights up, without moving anything.** Those inline controls that look like text but are buttons (`回块`, `放大`, `复制`, `导出`, `连接` / `断开连接`) use egui's "hide the frame while inactive": the background appears only on hover and press, while the padding is always reserved, so pressing one does not shove the row sideways
+- **The whole row is the hit target** in the sidebar tree and the file tree — you aim at a row, not at fourteen pixels of text — while the `▸` / `▾` column stays expand-only, so it can never quietly change where your SQL goes
+- **Every hover has a sentence.** The tab gives the full statement plus rows and timing, a clipped cell gives the head of the untruncated value, a tree row spells out what clicking the name, the chevron or right-clicking each does, and the `SQL → …` status chip says which database this keystroke would hit
 
 **Which connection a block goes to is never a guess.** That fact is written in three places at once: the `默认连接` / `当前库` card at the head of the sidebar (above), a `默认` badge on the connection row itself, and the `SQL → demo ✓` chip in the status bar while the file you are looking at is SQL (by extension, by block, or by mode). The chip is a button: click it and the sidebar switches to the `Database` tab. Before any click at all, the default is the first connection in `config.json`, and that is what the badge shows — the display follows `active_conn()`, the same function `Ctrl+Enter` asks, so the two cannot drift apart.
 
@@ -476,7 +497,7 @@ About 21,600 lines of Rust in a single binary crate, 23 source files:
 | `src/search.rs` | Project-wide search: ripgrep first, built-in scanner as the fallback |
 | `src/journal.rs` | Journal block parsing and insertion |
 | `src/sql.rs` | SQL block text layer: scan and build blocks, split statements **with byte spans**, pick out the one a byte offset falls in, decide what is read-only. Touches neither database nor UI |
-| `src/database.rs` | Sidebar `Database` tab and the connection manager window: cached tree, in-flight requests, the connection draft, and the stored test verdict with the fingerprint that retires it |
+| `src/database.rs` | Sidebar `Database` tab and the connection manager window: cached tree, in-flight requests, the connection draft, and the live session state (`○` / `⏳` / `✓` / `✗`) with the fingerprint that retires it |
 | `src/db/mod.rs` | Engine-agnostic protocol: `ConnectionSpec` → `Driver`, one worker thread per connection, events back out, plus `MockDriver` so the UI is testable without a server |
 | `src/db/mysql.rs` | The only file that knows MySQL: connect options, the text protocol → cells, one statement per call |
 | `src/results.rs` | Results dock: one panel per statement, batch headers, pop-out window, status write-back, TSV for `复制`, RFC 4180 CSV for `导出`, sideways scroll, whole-row selection, per-row detail window |
@@ -551,7 +572,7 @@ The two icons cover different surfaces:
 - Files over 16 MB are refused outright, with a message in the status bar.
 - CJK glyph widths depend on `unicode-width` plus Microsoft YaHei; switch fonts and the baseline alignment parameters (see [CJK baseline](#cjk-baseline)) probably need recomputing.
 - **MySQL is the only engine** that has a driver, and the sidebar tree speaks `SHOW DATABASES` / `SHOW TABLES`. The connection form has no TLS, SSH-tunnel or `init_connect` settings either, so what you get on the wire is whatever the `mysql` crate defaults to.
-- A statement is capped at 1000 rows and the dock at 6 panels; the cap is labelled `（截断）` rather than hidden. `DELIMITER` blocks (stored procedures) are out of scope — the splitter cuts on `;`, so split those by hand.
+- A statement is capped at 1000 rows and the dock at 10 results; the cap is labelled `（截断）` rather than hidden. `DELIMITER` blocks (stored procedures) are out of scope — the splitter cuts on `;`, so split those by hand.
 - Automatic execution only ever runs blocks marked `auto` **and** read-only; anything that writes needs a deliberate `Ctrl+Enter`.
 - **SQL mode is a property of the tab, not of the file.** Switching it on for `notes.txt` is remembered while that tab is open and forgotten when you close it; reopening the file falls back to whatever its extension says. Nothing is written into the file to mark it.
 - A literal password in `config.json` is readable by anyone with your Windows account — write `env:VAR` instead if that matters.
@@ -646,11 +667,11 @@ Inside that outer scroll area, the available width is unbounded, which rules out
 
 The same nesting changes what a headless test can observe. A cell whose clip rect has degenerated to nothing (fully scrolled out) is dropped by `Painter::add` before it ever reaches `FullOutput.shapes` — it is not painted off-screen, it does not exist in the output. So `a_wide_table_can_be_scrolled_sideways` asserts `c8` is *absent* before the wheel event and *present* after it, instead of comparing x coordinates across the two passes.
 
-### A connection verdict is claimed by a fingerprint, not by a name
+### Session state is claimed by a fingerprint, keyed by a name
 
-`测试连接` answers a few hundred milliseconds later, on another thread, and by then the form may have been edited, renamed, saved or cancelled. So the verdict is stored per connection *name* alongside `ConnectionSpec::stamp()` — a hash of host / port / user / password / database / kind — and every renderer asks `probe_of(spec)`, which returns nothing unless the two stamps match. Editing any field therefore downgrades `✓` to `⚠ 配置改过了` on the same frame, which is honest, instead of leaving a green tick on a server that has never been contacted since.
+A reply arrives a few hundred milliseconds later, on another thread, and by then the form may have been edited, renamed, saved or cancelled. So the session state lives in one `LinkRecord` per connection *name* — `○ 未连接` simply means the map has no record — alongside `ConnectionSpec::stamp()`, a hash of host / port / user / password / database / kind, and every renderer compares the stored stamp with the live config's before showing `✓`. Editing any field downgrades it to `⚠ 配置改过了` on the same frame, which is honest, instead of leaving a green tick on a server that has never been contacted since.
 
-Two things are deliberately *not* in the hash. `name` is not, because verdicts are already keyed by name — hashing it too would turn a cosmetic rename into "stale", with the connection parameters untouched; `save_draft` moves the record to the new name instead. And the hash is computed over **trimmed** fields, because saving trims them too — a fingerprint carrying the spaces the user typed would report a change that saving then erased.
+`name` is deliberately *not* in that hash, because the records are already keyed by name — hashing it too would turn a cosmetic rename into "stale" with the parameters untouched. Renaming still resets the mark, for a different and correct reason: the name is the worker thread's key, `save_draft` calls `forget()` on both the old and the new name, and a verdict may not go on living in a session that never shook hands. The hash is computed over **trimmed** fields, because saving trims them too — a fingerprint carrying the spaces the user typed would report a change that saving then erased.
 
 ### SQL highlighting borrows the `.sql` extension
 

@@ -20,52 +20,252 @@ pub struct ActionDef {
 /// 全部可绑定动作。顺序即界面里的显示顺序。
 pub const ACTIONS: &[ActionDef] = &[
     // 文件
-    ActionDef { id: "open_folder", label: "打开文件夹", group: "文件", default: "Ctrl+O" },
-    ActionDef { id: "save", label: "保存", group: "文件", default: "Ctrl+S" },
-    ActionDef { id: "save_all", label: "全部保存", group: "文件", default: "Ctrl+Shift+S" },
-    ActionDef { id: "quick_open", label: "快速打开文件", group: "文件", default: "Ctrl+P" },
-    ActionDef { id: "new_file", label: "新建文件", group: "文件", default: "Ctrl+N" },
-    ActionDef { id: "new_folder", label: "新建文件夹", group: "文件", default: "Ctrl+Shift+N" },
-    ActionDef { id: "tab_close", label: "关闭当前标签", group: "文件", default: "Ctrl+W" },
+    ActionDef {
+        id: "open_folder",
+        label: "打开文件夹",
+        group: "文件",
+        default: "Ctrl+O",
+    },
+    ActionDef {
+        id: "save",
+        label: "保存",
+        group: "文件",
+        default: "Ctrl+S",
+    },
+    ActionDef {
+        id: "save_all",
+        label: "全部保存",
+        group: "文件",
+        default: "Ctrl+Shift+S",
+    },
+    ActionDef {
+        id: "quick_open",
+        label: "快速打开文件",
+        group: "文件",
+        default: "Ctrl+P",
+    },
+    ActionDef {
+        id: "new_file",
+        label: "新建文件",
+        group: "文件",
+        default: "Ctrl+N",
+    },
+    ActionDef {
+        id: "new_folder",
+        label: "新建文件夹",
+        group: "文件",
+        default: "Ctrl+Shift+N",
+    },
+    ActionDef {
+        id: "tab_close",
+        label: "关闭当前标签",
+        group: "文件",
+        default: "Ctrl+W",
+    },
     // 导航
-    ActionDef { id: "nav_back", label: "光标位置后退", group: "导航", default: "Ctrl+Alt+Left" },
-    ActionDef { id: "nav_forward", label: "光标位置前进", group: "导航", default: "Ctrl+Alt+Right" },
-    ActionDef { id: "global_search", label: "全局搜索", group: "导航", default: "Ctrl+Shift+F" },
-    ActionDef { id: "find", label: "当前文件查找", group: "导航", default: "Ctrl+F" },
-    ActionDef { id: "replace", label: "当前文件替换", group: "导航", default: "Ctrl+H" },
+    ActionDef {
+        id: "nav_back",
+        label: "光标位置后退",
+        group: "导航",
+        default: "Ctrl+Alt+Left",
+    },
+    ActionDef {
+        id: "nav_forward",
+        label: "光标位置前进",
+        group: "导航",
+        default: "Ctrl+Alt+Right",
+    },
+    ActionDef {
+        id: "global_search",
+        label: "全局搜索",
+        group: "导航",
+        default: "Ctrl+Shift+F",
+    },
+    ActionDef {
+        id: "find",
+        label: "当前文件查找",
+        group: "导航",
+        default: "Ctrl+F",
+    },
+    ActionDef {
+        id: "replace",
+        label: "当前文件替换",
+        group: "导航",
+        default: "Ctrl+H",
+    },
     // 日志
-    ActionDef { id: "journal_insert", label: "插入日志块", group: "日志", default: "Ctrl+J" },
-    ActionDef { id: "journal_prev", label: "上一个日志块", group: "日志", default: "Ctrl+Alt+Up" },
-    ActionDef { id: "journal_next", label: "下一个日志块", group: "日志", default: "Ctrl+Alt+Down" },
-    ActionDef { id: "journal_toggle", label: "切换完成状态", group: "日志", default: "Ctrl+Alt+D" },
+    ActionDef {
+        id: "journal_insert",
+        label: "插入日志块",
+        group: "日志",
+        default: "Ctrl+J",
+    },
+    ActionDef {
+        id: "journal_prev",
+        label: "上一个日志块",
+        group: "日志",
+        default: "Ctrl+Alt+Up",
+    },
+    ActionDef {
+        id: "journal_next",
+        label: "下一个日志块",
+        group: "日志",
+        default: "Ctrl+Alt+Down",
+    },
+    ActionDef {
+        id: "journal_toggle",
+        label: "切换完成状态",
+        group: "日志",
+        default: "Ctrl+Alt+D",
+    },
     // 数据库
-    ActionDef { id: "sql_new_query", label: "新建查询文件", group: "数据库", default: "Ctrl+Alt+N" },
-    ActionDef { id: "sql_insert", label: "插入 SQL 块", group: "数据库", default: "Ctrl+Shift+J" },
-    ActionDef { id: "sql_run", label: "执行 SQL（选中语句或光标那一句）", group: "数据库", default: "Ctrl+Enter" },
-    ActionDef { id: "sql_run_block", label: "执行整个 SQL 块", group: "数据库", default: "Ctrl+Shift+Enter" },
-    ActionDef { id: "results_toggle", label: "显示 / 隐藏结果区", group: "数据库", default: "Ctrl+Shift+R" },
+    ActionDef {
+        id: "sql_new_query",
+        label: "新建查询文件",
+        group: "数据库",
+        default: "Ctrl+Alt+N",
+    },
+    ActionDef {
+        id: "sql_insert",
+        label: "插入 SQL 块",
+        group: "数据库",
+        default: "Ctrl+Shift+J",
+    },
+    ActionDef {
+        id: "sql_run",
+        label: "执行 SQL（选中语句或光标那一句）",
+        group: "数据库",
+        default: "Ctrl+Enter",
+    },
+    ActionDef {
+        id: "sql_run_block",
+        label: "执行整个 SQL 块",
+        group: "数据库",
+        default: "Ctrl+Shift+Enter",
+    },
+    ActionDef {
+        id: "results_toggle",
+        label: "显示 / 隐藏结果区",
+        group: "数据库",
+        default: "Ctrl+Shift+R",
+    },
     // 视图
-    ActionDef { id: "side_toggle", label: "显示 / 隐藏侧栏", group: "视图", default: "Ctrl+B" },
-    ActionDef { id: "terminal_toggle", label: "聚焦终端面板", group: "视图", default: "Ctrl+Backtick" },
-    ActionDef { id: "terminal_new", label: "新建终端面板", group: "视图", default: "Ctrl+Shift+Backtick" },
-    ActionDef { id: "font_inc", label: "放大字号", group: "视图", default: "Ctrl+Plus" },
-    ActionDef { id: "font_dec", label: "缩小字号", group: "视图", default: "Ctrl+Minus" },
-    ActionDef { id: "wrap_toggle", label: "切换自动换行", group: "视图", default: "Alt+Z" },
-    ActionDef { id: "help", label: "快捷键设置", group: "视图", default: "F1" },
-    ActionDef { id: "screenshot", label: "截图", group: "视图", default: "F12" },
+    ActionDef {
+        id: "side_toggle",
+        label: "显示 / 隐藏侧栏",
+        group: "视图",
+        default: "Ctrl+B",
+    },
+    ActionDef {
+        id: "terminal_toggle",
+        label: "聚焦终端面板",
+        group: "视图",
+        default: "Ctrl+Backtick",
+    },
+    ActionDef {
+        id: "terminal_new",
+        label: "新建终端面板",
+        group: "视图",
+        default: "Ctrl+Shift+Backtick",
+    },
+    ActionDef {
+        id: "font_inc",
+        label: "放大字号",
+        group: "视图",
+        default: "Ctrl+Plus",
+    },
+    ActionDef {
+        id: "font_dec",
+        label: "缩小字号",
+        group: "视图",
+        default: "Ctrl+Minus",
+    },
+    ActionDef {
+        id: "wrap_toggle",
+        label: "切换自动换行",
+        group: "视图",
+        default: "Alt+Z",
+    },
+    ActionDef {
+        id: "help",
+        label: "快捷键设置",
+        group: "视图",
+        default: "F1",
+    },
+    ActionDef {
+        id: "screenshot",
+        label: "截图",
+        group: "视图",
+        default: "F12",
+    },
     // 分屏：默认键抄 Windows Terminal（Alt+Shift+D 自动拆 / + 左右 / - 上下，Alt+方向键切焦点）
-    ActionDef { id: "split_auto", label: "自动拆分面板", group: "分屏", default: "Alt+Shift+D" },
-    ActionDef { id: "split_col", label: "向右拆分面板", group: "分屏", default: "Alt+Shift+Plus" },
-    ActionDef { id: "split_row", label: "向下拆分面板", group: "分屏", default: "Alt+Shift+Minus" },
-    ActionDef { id: "pane_close", label: "关闭当前面板", group: "分屏", default: "Ctrl+Shift+W" },
-    ActionDef { id: "pane_next", label: "下一个面板", group: "分屏", default: "Ctrl+Shift+Tab" },
-    ActionDef { id: "pane_prev", label: "上一个面板", group: "分屏", default: "Ctrl+Alt+Shift+Tab" },
-    ActionDef { id: "focus_pane_left", label: "聚焦左侧面板", group: "分屏", default: "Alt+Left" },
-    ActionDef { id: "focus_pane_right", label: "聚焦右侧面板", group: "分屏", default: "Alt+Right" },
-    ActionDef { id: "focus_pane_up", label: "聚焦上方面板", group: "分屏", default: "Alt+Up" },
-    ActionDef { id: "focus_pane_down", label: "聚焦下方面板", group: "分屏", default: "Alt+Down" },
+    ActionDef {
+        id: "split_auto",
+        label: "自动拆分面板",
+        group: "分屏",
+        default: "Alt+Shift+D",
+    },
+    ActionDef {
+        id: "split_col",
+        label: "向右拆分面板",
+        group: "分屏",
+        default: "Alt+Shift+Plus",
+    },
+    ActionDef {
+        id: "split_row",
+        label: "向下拆分面板",
+        group: "分屏",
+        default: "Alt+Shift+Minus",
+    },
+    ActionDef {
+        id: "pane_close",
+        label: "关闭当前面板",
+        group: "分屏",
+        default: "Ctrl+Shift+W",
+    },
+    ActionDef {
+        id: "pane_next",
+        label: "下一个面板",
+        group: "分屏",
+        default: "Ctrl+Shift+Tab",
+    },
+    ActionDef {
+        id: "pane_prev",
+        label: "上一个面板",
+        group: "分屏",
+        default: "Ctrl+Alt+Shift+Tab",
+    },
+    ActionDef {
+        id: "focus_pane_left",
+        label: "聚焦左侧面板",
+        group: "分屏",
+        default: "Alt+Left",
+    },
+    ActionDef {
+        id: "focus_pane_right",
+        label: "聚焦右侧面板",
+        group: "分屏",
+        default: "Alt+Right",
+    },
+    ActionDef {
+        id: "focus_pane_up",
+        label: "聚焦上方面板",
+        group: "分屏",
+        default: "Alt+Up",
+    },
+    ActionDef {
+        id: "focus_pane_down",
+        label: "聚焦下方面板",
+        group: "分屏",
+        default: "Alt+Down",
+    },
     // 格式化
-    ActionDef { id: "format", label: "格式化", group: "编辑", default: "Alt+Shift+F" },
+    ActionDef {
+        id: "format",
+        label: "格式化",
+        group: "编辑",
+        default: "Alt+Shift+F",
+    },
 ];
 
 pub fn default_binding(action: &str) -> &'static str {
@@ -126,7 +326,8 @@ fn key_from_name(name: &str) -> Option<Key> {
     Key::from_name(name).or_else(|| {
         let mut chars = name.chars();
         let first = chars.next()?;
-        let titled = first.to_uppercase().collect::<String>() + &chars.as_str().to_ascii_lowercase();
+        let titled =
+            first.to_uppercase().collect::<String>() + &chars.as_str().to_ascii_lowercase();
         Key::from_name(&titled)
     })
 }
@@ -161,7 +362,10 @@ pub fn capture(ctx: &egui::Context) -> Option<String> {
     ctx.input(|i| {
         for event in &i.events {
             if let egui::Event::Key {
-                key, pressed: true, modifiers, ..
+                key,
+                pressed: true,
+                modifiers,
+                ..
             } = event
             {
                 out = Some(format(*modifiers, *key));
@@ -321,8 +525,14 @@ mod tests {
     #[test]
     fn parses_and_formats_roundtrip() {
         for def in ACTIONS {
-            let (mods, key) = parse(def.default).unwrap_or_else(|| panic!("{} 解析失败", def.default));
-            assert_eq!(format(mods, key), def.default, "{} 归一化不一致", def.default);
+            let (mods, key) =
+                parse(def.default).unwrap_or_else(|| panic!("{} 解析失败", def.default));
+            assert_eq!(
+                format(mods, key),
+                def.default,
+                "{} 归一化不一致",
+                def.default
+            );
         }
     }
 

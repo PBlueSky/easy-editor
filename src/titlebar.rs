@@ -40,7 +40,12 @@ mod win {
 
     #[link(name = "dwmapi")]
     extern "system" {
-        fn DwmSetWindowAttribute(hwnd: *mut c_void, attr: u32, value: *const c_void, size: u32) -> i32;
+        fn DwmSetWindowAttribute(
+            hwnd: *mut c_void,
+            attr: u32,
+            value: *const c_void,
+            size: u32,
+        ) -> i32;
     }
 
     /// 深色标题栏开关。Windows 10 1903/1909 用的是 19，2004 起改成 20，两个都试一次。

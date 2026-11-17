@@ -103,10 +103,7 @@ impl FindState {
             } else {
                 find_all_ci(text.as_bytes(), needle)
             };
-            self.matches = starts
-                .into_iter()
-                .map(|s| (s, s + needle.len()))
-                .collect();
+            self.matches = starts.into_iter().map(|s| (s, s + needle.len())).collect();
         }
 
         self.matches.len()
@@ -257,10 +254,7 @@ pub fn find_occurrences(text: &str, needle: &str, whole_word: bool) -> Vec<(usiz
 
 /// 匹配片段左右是否紧贴着单词字符——贴着说明它只是某个更长的词的一部分。
 fn touches_word(text: &str, start: usize, end: usize) -> bool {
-    text[..start]
-        .chars()
-        .next_back()
-        .is_some_and(is_word_char)
+    text[..start].chars().next_back().is_some_and(is_word_char)
         || text[end..].chars().next().is_some_and(is_word_char)
 }
 

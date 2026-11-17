@@ -14,8 +14,9 @@ use egui_extras::{Column, TableBuilder};
 
 use crate::db::{preview_of, Cell, DbEvent, DbOutcome, StatementResult};
 
-/// 屏上同时最多留几个面板。跑几次多语句块就能把旧的挤掉，留太多没人往下看。
-pub const MAX_PANELS: usize = 6;
+/// 屏上同时最多留几个页签。跑几次多语句块就能把旧的挤掉，留太多没人往下看。
+/// 十条是因为页签是横着排的：一次执行常见三四条，两三次执行正好铺满一行。
+pub const MAX_PANELS: usize = 10;
 
 /// 一个面板现在有什么可看的。
 pub enum Slot {
@@ -62,7 +63,7 @@ pub struct Panel {
     pub conn: String,
     /// SQL 块标题，块外选中一段执行时是「选中内容」
     pub title: String,
-    /// 这批是哪一秒提交的。六个面板叠在一起时，这是「哪批是哪批」唯一的凭据
+    /// 这批是哪一秒提交的。十份结果挤在一条页签栏里时，这是「哪批是哪批」唯一的凭据
     pub stamp: String,
     /// 这批里的第几条（1 基）/ 一共几条
     pub seq: usize,
@@ -73,7 +74,6 @@ pub struct Panel {
     /// 这条语句出自哪个文件的哪个字节，用来跳回去、跑完回写状态
     pub origin: Option<Origin>,
     pub slot: Slot,
-    pub collapsed: bool,
     /// 整行选中的那一行（0 基）。选中只是高亮 + 下面那排按钮，不动剪贴板。
     pub selected: Option<usize>,
     /// 单独在右边看详情的那一行。一行一个面板：摊开的明细比表格还占地方，
@@ -96,6 +96,11 @@ pub struct Detail {
     pub row: usize,
     /// 按下那一帧的光标位置：窗口固定在屏幕右侧，纵向跟着这一下走，之后归用户拖
     pub at: egui::Pos2,
+    /// 钉住的那份详情不会被「点别处」关掉。
+    ///
+    /// 认这一份而不是全局开关：详情窗口是跟着面板走的，一个面板钉住不该影响
+    /// 另一个面板新开的详情。
+    pub pinned: bool,
 }
 
 /// 单独查看某一格。
@@ -105,6 +110,8 @@ pub struct Peek {
     pub col: usize,
     /// 按下那一帧的光标位置：弹窗头一次开在它边上，之后归用户拖
     pub at: egui::Pos2,
+    /// 和详情窗口同一条规矩：点别处就收，钉住了才留着
+    pub pinned: bool,
 }
 
 /// 一批结果全部到家，app 可以拿去做收尾（比如把块头部的 `[待执行]` 改掉）。
@@ -127,6 +134,12 @@ pub struct Export {
 pub struct ResultsDock {
     /// 新的在上面：一次执行 splice 到 0，同批内部仍按语句顺序。
     panels: Vec<Panel>,
+    /// 页签栏当前选中哪一份结果（按语句 id）。屏上只铺这一个面板。
+    ///
+    /// 为什么只画一个：十个面板竖着叠，结果区再怎么拖高也只看得见头两三个，
+    /// 下面的等于没有。页签横着排一次就装十条，切换只要一下。
+    /// 叫 `active` 不叫 `selected`：面板里那个 `selected` 是选中的结果行，两个撞名迟早看错。
+    active: Option<u64>,
     next_run: u64,
     /// 已提交、还没收尾的那几批。`settled` 只认这里的，报过就摘掉。
     waiting: Vec<u64>,
@@ -153,6 +166,7 @@ impl ResultsDock {
     pub fn new() -> Self {
         Self {
             panels: Vec::new(),
+            active: None,
             next_run: 1,
             waiting: Vec::new(),
             open: false,
@@ -181,9 +195,48 @@ impl ResultsDock {
         self.panels.len()
     }
 
+    /// 页签栏当前亮着哪一份结果（按语句 id）。
+    ///
+    /// 只有测试从隔壁模块读它；界面自己画的是内部那份状态。
+    #[cfg(test)]
+    pub fn active_task(&self) -> Option<u64> {
+        self.active
+    }
+
+    /// 屏上的那几份结果，新的在前。上层只读：动列表都走这里面的方法。
+    #[cfg(test)]
+    pub fn panels(&self) -> &[Panel] {
+        &self.panels
+    }
+
     /// 有没有还在等的回执。app 靠它决定要不要继续重画。
     pub fn running(&self) -> bool {
         self.panels.iter().any(|p| p.slot.is_running())
+    }
+
+    /// 每条连接各自还有几条没回来。侧栏那排「执行中 N 条」用它，
+    /// 自动执行那道闸也用它——连接之间互不等待，闸就不能看全局。
+    pub fn busy_by_conn(&self) -> Vec<(String, usize)> {
+        let mut out: Vec<(String, usize)> = Vec::new();
+        for panel in &self.panels {
+            if !panel.slot.is_running() {
+                continue;
+            }
+            match out.iter_mut().find(|(conn, _)| *conn == panel.conn) {
+                Some((_, n)) => *n += 1,
+                None => out.push((panel.conn.clone(), 1)),
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// 这条连接此刻排着活没有。同一连接只有一个工作线程，句和句只能排队；
+    /// 别的连接各走各的线程，不该被这里挡住。
+    pub fn busy_on(&self, conn: &str) -> bool {
+        self.panels
+            .iter()
+            .any(|p| p.slot.is_running() && p.conn == conn)
     }
 
     /// 一次提交开了哪些面板，逐条挂在这里等回执。返回这批的 run 号。
@@ -198,29 +251,27 @@ impl ResultsDock {
         self.next_run += 1;
         let stamp = chrono::Local::now().format("%H:%M:%S").to_string();
         let total = parts.len();
-        let batch = parts
-            .iter()
-            .enumerate()
-            .map(|(i, part)| Panel {
-                task: part.task,
-                run,
-                conn: conn.to_string(),
-                title: title.to_string(),
-                stamp: stamp.clone(),
-                seq: i + 1,
-                total,
-                stmt: part.stmt.clone(),
-                stmt_range: part.range,
-                origin: origin.clone(),
-                slot: Slot::Running,
-                collapsed: false,
-                selected: None,
-                detail: None,
-                peek: None,
-            });
+        let batch = parts.iter().enumerate().map(|(i, part)| Panel {
+            task: part.task,
+            run,
+            conn: conn.to_string(),
+            title: title.to_string(),
+            stamp: stamp.clone(),
+            seq: i + 1,
+            total,
+            stmt: part.stmt.clone(),
+            stmt_range: part.range,
+            origin: origin.clone(),
+            slot: Slot::Running,
+            selected: None,
+            detail: None,
+            peek: None,
+        });
         self.panels.splice(0..0, batch);
         self.waiting.push(run);
         self.trim();
+        // 新交的这批直接上台：用户按完 Ctrl+Enter 要等的是它，不是上一次留下的那页
+        self.active = self.panels.first().map(|p| p.task);
         self.open = true;
         run
     }
@@ -310,22 +361,28 @@ impl ResultsDock {
         self.panels.retain(|p| p.slot.is_running());
     }
 
-    pub fn set_all_collapsed(&mut self, collapsed: bool) {
-        for panel in &mut self.panels {
-            panel.collapsed = collapsed;
-        }
-    }
-
     fn trim(&mut self) {
         if self.panels.len() > MAX_PANELS {
             self.panels.truncate(MAX_PANELS);
         }
     }
 
+    /// 页签选中项没了（被挤掉、被关掉）就退到第一份。
+    ///
+    /// 同一帧内就归位，不留「这一页什么都不画」的那一帧：从旧账翻到新页本该是一次点击的事。
+    fn normalize_active(&mut self) {
+        if !self
+            .active
+            .is_some_and(|task| self.panels.iter().any(|p| p.task == task))
+        {
+            self.active = self.panels.first().map(|p| p.task);
+        }
+    }
+
     pub fn show(&mut self, ui: &mut Ui, run_hint: &str) {
         let count = self.panels.len();
         let running = self.running();
-        let any_open = self.panels.iter().any(|p| !p.collapsed);
+        self.normalize_active();
 
         ui.horizontal(|ui| {
             let head = if running {
@@ -335,32 +392,22 @@ impl ResultsDock {
             };
             ui.label(RichText::new(head).size(11.5).strong());
             ui.label(weak(
-                "一条语句一个面板 · 双击格子看整格全文 · 点行号选中整行 · 行首 ▸ 在右侧开详情",
+                "点页签换一份 · 双击格子看整格全文 · 点行号选中整行 · 行首 ▸ 在右侧开详情",
             ));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui
-                    .add(egui::Button::new(RichText::new("关闭").size(11.5)).frame(false))
+                if crate::theme::chip(ui, "关闭")
                     .on_hover_text("收起结果区（结果留着，顶栏「数据库 → 结果区」再打开）")
                     .clicked()
                 {
                     self.open = false;
                 }
                 if count > 0
-                    && ui
-                        .add(egui::Button::new(RichText::new("清空").size(11.5)).frame(false))
+                    && crate::theme::chip(ui, "清空")
                         .on_hover_text("关掉跑完的面板，执行中的留着")
                         .clicked()
                 {
                     self.clear_finished();
-                }
-                if count > 1 {
-                    let text = if any_open { "全部收起" } else { "全部展开" };
-                    if ui
-                        .add(egui::Button::new(RichText::new(text).size(11.5)).frame(false))
-                        .clicked()
-                    {
-                        self.set_all_collapsed(any_open);
-                    }
+                    self.normalize_active();
                 }
             });
         });
@@ -371,6 +418,11 @@ impl ResultsDock {
             popup: self.popup,
             ..Default::default()
         };
+        // 页签栏走在滚动区外面：它要是跟着内容一起滚，十条排开时点谁都像点在边缘上。
+        if !empty {
+            tab_bar(ui, &self.panels, self.active, &mut act);
+            ui.separator();
+        }
         // 铺满底部面板给的那一格，装不下的走这里的滚动条（面板高度用户能拖）。
         // 缩成内容高反而不行：面板先按起始尺寸预留，多出来的那一截掉在窗口下沿
         // 外面，看着就是「只画了第一个面板」。
@@ -387,29 +439,30 @@ impl ResultsDock {
                     )));
                     return;
                 }
-                // 同批面板在列表里连着排（一批 splice 到 0，批内按语句顺序），
-                // 所以只要盯住 run 变了没，就能在每批开头插一行抬头。
-                let mut last_run = 0u64;
-                for panel in &mut self.panels {
-                    if panel.run != last_run {
-                        last_run = panel.run;
-                        batch_row(ui, panel);
-                    }
-                    if panel.collapsed {
-                        collapsed_row(ui, panel, &mut act);
-                    } else {
-                        open_panel(ui, panel, &mut act);
-                    }
-                    ui.add_space(3.0);
-                }
+                let Some(index) = self
+                    .active
+                    .and_then(|task| self.panels.iter().position(|p| p.task == task))
+                else {
+                    return;
+                };
+                // 页签只留一份在屏上，抬头那行说的就是这一份出自哪一批
+                batch_row(ui, &self.panels[index]);
+                open_panel(ui, &mut self.panels[index], &mut act);
             });
+        if let Some(task) = act.pick {
+            self.active = Some(task);
+        }
 
         // 渲染期间只记账，动列表在这儿
         if let Some(target) = act.jump {
             self.pending_jump = Some(target);
         }
         if let Some(task) = act.zoom_toggle {
-            self.popup = if self.popup == Some(task) { None } else { Some(task) };
+            self.popup = if self.popup == Some(task) {
+                None
+            } else {
+                Some(task)
+            };
         }
         if act.export.is_some() {
             self.pending_export = act.export;
@@ -429,6 +482,7 @@ impl ResultsDock {
             }
             self.close_run(run);
         }
+        self.normalize_active();
         self.draw_windows(ui.ctx());
     }
 
@@ -472,9 +526,42 @@ impl ResultsDock {
     /// 窗口只画一份、归结果区管，放大出来的那份结果和底部面板共用同一个状态。
     fn draw_windows(&mut self, ctx: &egui::Context) {
         for panel in &mut self.panels {
+            // 只画还在屏上那两份（当前页签 + 放大窗口）的小窗。换页签时留着上一份的
+            // 行详情，屏幕上就浮着一屏不属于当前结果的字段，看着像当前这行报的错。
+            if self.active != Some(panel.task) && self.popup != Some(panel.task) {
+                panel.detail = None;
+                panel.peek = None;
+                continue;
+            }
             draw_row_detail(panel, ctx);
             draw_cell_peek(panel, ctx);
         }
+    }
+}
+
+/// 详情和单格窗口共用的收尾：窗口还在不在。
+///
+/// 两条收法。窗口标题栏那个 ✕ 归 egui 记账（`open` 被它写成 false）；
+/// 另一条是「点了别处就自己收」——详情多半只瞟一眼，看完手就移回表格，
+/// 每次都要瞄着一个小 ✕ 按反而累赘。钉住的那份不参与第二条判断，
+/// 因为「一边改 SQL 一边对照这几列」正是要它一直亮着的时候。
+///
+/// 开窗口的那一下也落在窗口外面，但它的光标位置和 `at` 是同一个值：
+/// 拿这一条挡一下，否则刚点开就把自己关掉，换行时也换不过去。
+fn stays_open<R>(
+    ctx: &egui::Context,
+    shown: Option<egui::InnerResponse<Option<R>>>,
+    open: &mut bool,
+    at: egui::Pos2,
+    pinned: bool,
+) {
+    let Some(inner) = shown else { return };
+    if *open && !pinned {
+        let clicked = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary));
+        let outside = ctx
+            .input(|i| i.pointer.latest_pos())
+            .is_some_and(|pos| !inner.response.rect.contains(pos) && pos.distance(at) > 0.75);
+        *open = !(clicked && outside);
     }
 }
 
@@ -483,7 +570,9 @@ impl ResultsDock {
 /// 纵向跟着点下去的那一下走，横向固定贴右——详情比表格还宽，压在格子上就看不见
 /// 选中的是哪一行了。换一行只换内容，窗口摆哪儿归用户拖。
 fn draw_row_detail(panel: &mut Panel, ctx: &egui::Context) {
-    let Some(detail) = panel.detail else { return };
+    let Some(mut detail) = panel.detail else {
+        return;
+    };
     // 列名和值先抄成自己拥有的：对 panel.slot 的借读不能跨过整个窗口，
     // 窗口没了还要写回 panel.detail。
     let fields: Vec<(String, String)> = match &panel.slot {
@@ -507,11 +596,12 @@ fn draw_row_detail(panel: &mut Panel, ctx: &egui::Context) {
     // 贴右：宽度给足才装得下「列名 = 完整值」
     let screen = ctx.viewport_rect();
     let x = (screen.max.x - 452.0).max(screen.min.x);
-    let y = screen.min.y
-        + (detail.at.y - screen.min.y).clamp(8.0, (screen.height() - 130.0).max(8.0));
+    let y =
+        screen.min.y + (detail.at.y - screen.min.y).clamp(8.0, (screen.height() - 130.0).max(8.0));
     let title = format!("详情 · 第 {} 行", detail.row + 1);
+    let mut pinned = detail.pinned;
     let mut open = true;
-    egui::Window::new(title)
+    let shown = egui::Window::new(title)
         .id(egui::Id::unique(("db_row_detail", panel.task)))
         .default_pos(egui::pos2(x, y))
         .default_size(egui::vec2(430.0, 300.0))
@@ -538,22 +628,30 @@ fn draw_row_detail(panel: &mut Panel, ctx: &egui::Context) {
             ui.separator();
             ui.horizontal(|ui| {
                 ui.label(weak(format!("{} 列", fields.len())));
-                if ui
-                    .add(egui::Button::new(RichText::new("复制整行").size(11.0)).frame(false))
+                if crate::theme::chip(ui, "复制整行")
                     .on_hover_text("制表符分隔的一行，直接粘进表格软件")
                     .clicked()
                 {
                     let line = tsv_row(fields.iter().map(|(_, v)| v.as_str().into()));
                     ui.ctx().copy_text(line);
                 }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.checkbox(&mut pinned, "钉住")
+                        .on_hover_cursor(crate::theme::HAND)
+                        .on_hover_text(
+                            "钉住：点别处它也不关。\n不勾时点了窗口外面任何一处，这一份自己收掉。",
+                        );
+                });
             });
         });
+    detail.pinned = pinned;
+    stays_open(ctx, shown, &mut open, detail.at, pinned);
     panel.detail = open.then_some(detail);
 }
 
 /// 双击格子开出来的「这一格全文」小窗。
 fn draw_cell_peek(panel: &mut Panel, ctx: &egui::Context) {
-    let Some(peek) = panel.peek else { return };
+    let Some(mut peek) = panel.peek else { return };
     let one = match &panel.slot {
         Slot::Done(one) => one,
         _ => {
@@ -573,7 +671,8 @@ fn draw_cell_peek(panel: &mut Panel, ctx: &egui::Context) {
     let title = format!("{} · 第 {} 行", column.name, peek.row + 1);
     let type_name = column.type_name.clone();
     let mut open = true;
-    egui::Window::new(title)
+    let mut pinned = peek.pinned;
+    let shown = egui::Window::new(title)
         .id(egui::Id::unique((
             "db_cell_peek",
             panel.task,
@@ -607,21 +706,28 @@ fn draw_cell_peek(panel: &mut Panel, ctx: &egui::Context) {
                     ui.label(weak(type_name));
                 }
                 ui.label(weak(format!("共 {count} 字")));
-                if ui
-                    .add(egui::Button::new(RichText::new("复制本格").size(11.0)).frame(false))
+                if crate::theme::chip(ui, "复制本格")
                     .on_hover_text("原文拷进剪贴板，不受上面显示长度的限制")
                     .clicked()
                 {
                     ui.ctx().copy_text(value.clone());
                 }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.checkbox(&mut pinned, "钉住")
+                        .on_hover_text("钉住：点别处它也不关。\n不勾时点了窗口外面任何一处，这一格自己收掉。");
+                });
             });
         });
+    peek.pinned = pinned;
+    stays_open(ctx, shown, &mut open, peek.at, pinned);
     panel.peek = open.then_some(peek);
 }
 
 /// 一帧里从各个面板收上来的点击。渲染期间不动列表，账先记这儿。
 #[derive(Default)]
 struct Clicked {
+    /// 按了哪个页签的 ✕，或者哪个页签要上台
+    pick: Option<u64>,
     closable: Vec<u64>,
     close_runs: Vec<u64>,
     jump: Option<(PathBuf, usize)>,
@@ -634,12 +740,17 @@ struct Clicked {
 }
 
 /// 一批结果上面那一行：几点跑的、发到哪、出自哪个块、一共几条。
-/// 六个面板叠在一起时，标题会重复、语句长得像，只有时间戳分得清哪批是哪批。
+/// 十份结果挤在一条页签栏里时，标题会重复、语句长得像，只有时间戳分得清哪批是哪批。
 fn batch_row(ui: &mut Ui, panel: &Panel) {
     ui.add_space(2.0);
     ui.horizontal(|ui| {
         let accent = ui.visuals().hyperlink_color;
-        ui.label(RichText::new(&panel.stamp).size(10.5).strong().color(accent));
+        ui.label(
+            RichText::new(&panel.stamp)
+                .size(10.5)
+                .strong()
+                .color(accent),
+        );
         ui.label(weak(format!(
             "{} · 「{}」 · 共 {} 条",
             panel.conn, panel.title, panel.total
@@ -675,20 +786,117 @@ fn open_panel(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
     }
 }
 
-fn collapsed_row(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
-    let dark = ui.visuals().dark_mode;
-    let bg = if dark {
-        Color32::from_rgba_unmultiplied(255, 255, 255, 10)
-    } else {
-        Color32::from_rgba_unmultiplied(0, 0, 0, 8)
-    };
-    egui::Frame::new()
-        .fill(bg)
-        .corner_radius(4.0)
-        .inner_margin(egui::Margin::symmetric(6, 1))
+/// 页签宽到这一格就截断：十条排开时一句长 SQL 能把整栏顶出屏。
+const TAB_LIMIT: usize = 26;
+
+/// 页签栏那一横排。
+///
+/// 为什么是页签：一次执行三四条语句、连跑几批就是十几份结果，竖着叠只看得见
+/// 头两三个，剩下的得先拖高结果区再滚动——等于没有。横排一页签一次装十条，
+/// 换一份只要一下，和 DBeaver 那个结果栏一个用法。
+fn tab_bar(ui: &mut Ui, panels: &[Panel], active: Option<u64>, act: &mut Clicked) {
+    ScrollArea::horizontal()
+        .id_salt("db_result_tabs")
+        .auto_shrink([false, true])
         .show(ui, |ui| {
-            header(ui, panel, act);
+            ui.spacing_mut().item_spacing.x = 3.0;
+            for panel in panels {
+                tab(ui, panel, active == Some(panel.task), act);
+            }
         });
+}
+
+/// 一个页签：状态点 + 语句预览 + ✕。
+///
+/// 整块矩形自己画、自己命中，为的是「亮着的那一格」和「能点的那一格」严丝合缝。
+/// 用 `selectable_label` 反而不行：它选中的底色和结果表里选中行的底色是同一个，
+/// 测试就分不出屏上那块亮究竟是一页签还是一行。
+fn tab(ui: &mut Ui, panel: &Panel, on: bool, act: &mut Clicked) {
+    let accent = ui.visuals().hyperlink_color;
+    let hovered = ui.visuals().widgets.hovered.weak_bg_fill;
+    let text = tab_label(panel);
+    let galley = ui.painter().layout_no_wrap(
+        text.clone(),
+        egui::FontId::proportional(11.0),
+        if on {
+            accent
+        } else {
+            ui.visuals().text_color()
+        },
+    );
+    let dot_w = 16.0;
+    let close_w = 15.0;
+    let size = egui::vec2(
+        dot_w + galley.size().x + close_w + 8.0,
+        ui.spacing().interact_size.y.max(20.0),
+    );
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let fill = if on {
+        accent.gamma_multiply(0.15)
+    } else if resp.hovered() {
+        hovered
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, 3.0, fill);
+    ui.painter().circle_filled(
+        egui::pos2(rect.left() + 9.0, rect.center().y),
+        3.0,
+        dot_color(panel),
+    );
+    ui.painter().galley(
+        egui::pos2(rect.left() + dot_w, rect.center().y - galley.size().y * 0.5),
+        galley,
+        if on {
+            accent
+        } else {
+            ui.visuals().text_color()
+        },
+    );
+    let close = egui::Rect::from_min_max(
+        egui::pos2(rect.right() - close_w, rect.top()),
+        rect.right_bottom(),
+    );
+    ui.painter().text(
+        close.center(),
+        egui::Align2::CENTER_CENTER,
+        "✕",
+        egui::FontId::proportional(9.5),
+        if resp.hovered() || on {
+            ui.visuals().text_color()
+        } else {
+            ui.visuals().text_color().gamma_multiply(0.4)
+        },
+    );
+    let hover = format!(
+        "{}\n{}\n点一下只看这一份，点 ✕ 关掉它",
+        panel.preview(),
+        summary(panel)
+    );
+    let pos = resp.interact_pointer_pos();
+    let clicked = resp
+        .on_hover_cursor(crate::theme::HAND)
+        .on_hover_text(hover)
+        .clicked();
+    if clicked {
+        if pos.is_some_and(|p| close.contains(p)) {
+            act.closable.push(panel.task);
+        } else {
+            act.pick = Some(panel.task);
+        }
+    }
+}
+
+/// 页签上的字：同一批的第几条，加上截到 {TAB_LIMIT} 字的语句。
+fn tab_label(panel: &Panel) -> String {
+    let head: String = panel.preview().chars().take(TAB_LIMIT).collect();
+    let cut = panel.preview().chars().count() > TAB_LIMIT;
+    let stmt = if cut { format!("{head}…") } else { head };
+    if panel.total > 1 {
+        format!("{}·{stmt}", panel.seq)
+    } else {
+        stmt
+    }
 }
 
 /// 标题行。右边那组按钮先排，再把剩下的宽度整块交给左组——
@@ -704,15 +912,13 @@ fn header(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
         egui::vec2(width, row_h),
         Layout::right_to_left(Align::Center),
         |ui| {
-            if ui
-                .add(egui::Button::new(RichText::new("✕").size(11.0)).frame(false))
+            if crate::theme::chip(ui, "✕")
                 .on_hover_text("关掉这个结果面板")
                 .clicked()
             {
                 act.closable.push(panel.task);
             }
-            if ui
-                .add(egui::Button::new(RichText::new("关掉整块").size(11.0)).frame(false))
+            if crate::theme::chip(ui, "关掉整块")
                 .on_hover_text("关掉这次执行的所有面板")
                 .clicked()
             {
@@ -721,15 +927,13 @@ fn header(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
             if matches!(&panel.slot, Slot::Done(one) if one.is_query()) {
                 // 窗口开着就换成「收起」，否则点了没反应的样子会让人反复按
                 let text = if act.popup == Some(panel.task) { "收起" } else { "放大" };
-                if ui
-                    .add(egui::Button::new(RichText::new(text).size(11.0)).frame(false))
+                if crate::theme::chip(ui, text)
                     .on_hover_text("单独开一个窗口看这份结果，宽表不受底部那一格的宽度限制")
                     .clicked()
                 {
                     act.zoom_toggle = Some(panel.task);
                 }
-                if ui
-                    .add(egui::Button::new(RichText::new("复制").size(11.0)).frame(false))
+                if crate::theme::chip(ui, "复制")
                     .on_hover_text("整份结果按制表符分隔拷进剪贴板，直接粘进表格软件。\n单个格子右键也有复制。")
                     .clicked()
                 {
@@ -737,8 +941,7 @@ fn header(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
                         ui.ctx().copy_text(to_tsv(one));
                     }
                 }
-                if ui
-                    .add(egui::Button::new(RichText::new("导出").size(11.0)).frame(false))
+                if crate::theme::chip(ui, "导出")
                     .on_hover_text("把这份结果存成 CSV 文件")
                     .clicked()
                 {
@@ -751,8 +954,7 @@ fn header(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
                 }
             }
             if let Some(origin) = panel.origin.clone() {
-                if ui
-                    .add(egui::Button::new(RichText::new("回块").size(11.0)).frame(false))
+                if crate::theme::chip(ui, "回块")
                     .on_hover_text("跳回文件里这个 SQL 块")
                     .clicked()
                 {
@@ -761,18 +963,6 @@ fn header(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
             }
             ui.label(weak(summary(panel)));
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                let arrow = if panel.collapsed { "▸" } else { "▾" };
-                if ui
-                    .add(
-                        egui::Label::new(RichText::new(arrow).size(11.0))
-                            .selectable(false)
-                            .sense(egui::Sense::click()),
-                    )
-                    .on_hover_text("收起 / 展开")
-                    .clicked()
-                {
-                    panel.collapsed = !panel.collapsed;
-                }
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                 ui.painter()
                     .circle_filled(rect.center(), 3.0, dot_color(panel));
@@ -867,7 +1057,7 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                 // 这儿往里量的可用宽度是无限，横向必须缩到内容宽才有真实的溢出边界，
                 // 水平滚动条才出得来（列少时也不会凭空多一根条）。纵向照旧封顶。
                 .auto_shrink([true, true])
-                // 行数少就照内容收，多了封顶走这块自己的滚动条。不封顶的话六个面板叠起来，
+                // 行数少就照内容收，多了封顶走这块自己的滚动条。不封顶的话几份结果叠起来，
                 // 结果区再怎么拖也装不下两条完整结果。
                 .min_scrolled_height(0.0)
                 .max_scroll_height(height)
@@ -917,8 +1107,18 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                             let at = resp
                                 .interact_pointer_pos()
                                 .unwrap_or_else(|| resp.rect.center());
-                            if resp.on_hover_text("在右边单独开一个窗口看这一行").clicked() {
-                                *detail = (!opened).then_some(Detail { row: index, at });
+                            if resp
+                                .on_hover_cursor(crate::theme::HAND)
+                                .on_hover_text("在右边单独开一个窗口看这一行")
+                                .clicked()
+                            {
+                                // 钉住的那份换行时保持钉住：对着几行来回看正是钉的理由
+                                let pin = detail.is_some_and(|d| d.pinned);
+                                *detail = (!opened).then_some(Detail {
+                                    row: index,
+                                    at,
+                                    pinned: pin,
+                                });
                             }
                             let mut num = RichText::new(format!("{}", index + 1)).size(10.5);
                             num = if *selected == Some(index) {
@@ -931,7 +1131,11 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                                     .selectable(false)
                                     .sense(egui::Sense::click()),
                             );
-                            if resp.on_hover_text("点一下选中 / 取消整行").clicked() {
+                            if resp
+                                .on_hover_cursor(crate::theme::HAND)
+                                .on_hover_text("点一下选中 / 取消整行")
+                                .clicked()
+                            {
                                 *selected = (*selected != Some(index)).then_some(index);
                             }
                         });
@@ -970,32 +1174,48 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                                         row: index,
                                         col: col_index,
                                         at,
+                                        pinned: peek.is_some_and(|p| p.pinned),
                                     });
                                 }
                                 resp.context_menu(|ui| {
                                     if ui
                                         .button("查看完整内容")
-                                        .on_hover_text("单独开一个窗口放这一格：能换行、能滚动、整段选中拷贝")
+                                        .on_hover_text(
+                                            "单独开一个窗口放这一格：能换行、能滚动、整段选中拷贝",
+                                        )
                                         .clicked()
                                     {
                                         *peek = Some(Peek {
                                             row: index,
                                             col: col_index,
                                             at,
+                                            pinned: peek.is_some_and(|p| p.pinned),
                                         });
                                         ui.close();
                                     }
-                                    if ui.button("复制单元格").clicked() {
+                                    if ui
+                                        .button("复制单元格")
+                                        .on_hover_cursor(crate::theme::HAND)
+                                        .clicked()
+                                    {
                                         ui.ctx().copy_text(text.clone());
                                         ui.close();
                                     }
-                                    if ui.button("复制整行").clicked() {
+                                    if ui
+                                        .button("复制整行")
+                                        .on_hover_cursor(crate::theme::HAND)
+                                        .clicked()
+                                    {
                                         let line =
                                             tsv_row(one.rows[index].iter().map(Cell::display));
                                         ui.ctx().copy_text(line);
                                         ui.close();
                                     }
-                                    if ui.button("复制整表").clicked() {
+                                    if ui
+                                        .button("复制整表")
+                                        .on_hover_cursor(crate::theme::HAND)
+                                        .clicked()
+                                    {
                                         ui.ctx().copy_text(to_tsv(one));
                                         ui.close();
                                     }
@@ -1016,27 +1236,30 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                     .size(10.5)
                     .strong(),
             );
-            if ui
-                .add(egui::Button::new(RichText::new("复制整行").size(11.0)).frame(false))
+            if crate::theme::chip(ui, "复制整行")
                 .on_hover_text("制表符分隔的一行，直接粘进表格软件")
                 .clicked()
             {
                 let line = tsv_row(one.rows[index].iter().map(Cell::display));
                 ui.ctx().copy_text(line);
             }
-            let resp = ui
-                .add(egui::Button::new(RichText::new("看详情").size(11.0)).frame(false))
-                .on_hover_text("在右边单独开一个窗口，逐列看完整值");
+            let resp = crate::theme::chip(ui, "看详情").on_hover_text(
+                "在右边单独开一个窗口，逐列看完整值。\n点了别处它自己收；要一直看着就勾上窗口里的「钉住」。",
+            );
             if resp.clicked() {
+                // 记的是这一下按在哪，不是按钮中心：详情窗口拿它挡「点外面就关」，
+                // 差着几个像素就会被当成外面，刚开就关。
+                let at = resp
+                    .interact_pointer_pos()
+                    .unwrap_or_else(|| resp.rect.center());
+                let pin = detail.is_some_and(|d| d.pinned);
                 *detail = Some(Detail {
                     row: index,
-                    at: resp.rect.center(),
+                    at,
+                    pinned: pin,
                 });
             }
-            if ui
-                .add(egui::Button::new(RichText::new("取消选中").size(11.0)).frame(false))
-                .clicked()
-            {
+            if crate::theme::chip(ui, "取消选中").clicked() {
                 *selected = None;
             }
         });
@@ -1216,6 +1439,7 @@ mod tests {
         DbEvent {
             id,
             conn: "本机".into(),
+            dead: false,
             outcome,
         }
     }
@@ -1291,12 +1515,10 @@ mod tests {
 
     fn walk_text(shape: &egui::Shape, v: &mut Vec<(String, egui::Rect)>) {
         match shape {
-            egui::Shape::Text(text) => {
-                v.push((
-                    text.galley.job.text.clone(),
-                    text.galley.rect.translate(text.pos.to_vec2()),
-                ))
-            }
+            egui::Shape::Text(text) => v.push((
+                text.galley.job.text.clone(),
+                text.galley.rect.translate(text.pos.to_vec2()),
+            )),
             egui::Shape::Vec(shapes) => {
                 for s in shapes {
                     walk_text(s, v);
@@ -1485,7 +1707,10 @@ mod tests {
         // 8 列 × 140 早就越过 900 宽的结果区了。裁在外面的那些压根不往 shapes 里
         // 落笔（格子 clip 后矩形为空，epaint 直接丢），所以屏上只剩左边六列。
         let shown = texts(&out);
-        assert!(shown.contains(&"c1".to_string()), "第一列就该在屏上：{shown:?}");
+        assert!(
+            shown.contains(&"c1".to_string()),
+            "第一列就该在屏上：{shown:?}"
+        );
         assert!(
             !shown.contains(&"c8".to_string()),
             "最右边那一列不该还没滚就看得见：{shown:?}"
@@ -1546,10 +1771,7 @@ mod tests {
         dock.start_run("本机", "查用户", &parts(&["SELECT note FROM t"]), None);
         let one = table(
             &["note"],
-            vec![
-                vec![Cell::Text("甲".into())],
-                vec![Cell::Text("乙".into())],
-            ],
+            vec![vec![Cell::Text("甲".into())], vec![Cell::Text("乙".into())]],
         );
         dock.on_event(&event(1, Ok(DbOutcome::Statement(one))));
 
@@ -1596,7 +1818,10 @@ mod tests {
         dock.start_run("本机", "查用户", &parts(&["SELECT * FROM t"]), None);
         let one = table(
             &["name", "note"],
-            vec![vec![Cell::Text("甲".into()), Cell::Text("很长的一段备注".into())]],
+            vec![vec![
+                Cell::Text("甲".into()),
+                Cell::Text("很长的一段备注".into()),
+            ]],
         );
         dock.on_event(&event(1, Ok(DbOutcome::Statement(one))));
 
@@ -1666,10 +1891,7 @@ mod tests {
         let mut dock = dock();
         dock.on_event(&event(1, Ok(query(1, 2))));
         dock.on_event(&event(2, Ok(query(2, 2))));
-        assert!(
-            dock.settled().is_empty(),
-            "第三条还在等，整批就还不算跑完"
-        );
+        assert!(dock.settled().is_empty(), "第三条还在等，整批就还不算跑完");
         dock.on_event(&event(3, Ok(query(3, 2))));
         let done = dock.settled();
         assert_eq!(done.len(), 1);
@@ -1685,7 +1907,11 @@ mod tests {
         dock.on_event(&event(1, Ok(query(1, 2))));
         dock.on_event(&event(2, Err(DbError::new("断了").to_string())));
         let done = dock.settled();
-        assert_eq!(done.len(), 1, "报错会把排在后面的一起标掉，整批当场就有下文了");
+        assert_eq!(
+            done.len(),
+            1,
+            "报错会把排在后面的一起标掉，整批当场就有下文了"
+        );
         assert!(!done[0].ok, "有一条失败，整块就该标 [失败]");
     }
 
@@ -1729,6 +1955,39 @@ mod tests {
             .collect()
     }
 
+    /// 「谁在跑」只能按连接报：每条连接一个自己的线程。
+    ///
+    /// 全局一个「执行中」的牌子会在两条同时跑时只亮一次，看着像乙在等甲——
+    /// 侧栏那个「⏳ N」和自动执行的闸都靠这份按连接分的账。
+    #[test]
+    fn busy_is_accounted_per_connection() {
+        let mut dock = ResultsDock::new();
+        dock.start_run(
+            "甲",
+            "块",
+            &offset_parts(&["SELECT 1", "SELECT 2"], 1),
+            None,
+        );
+        dock.start_run("乙", "块", &offset_parts(&["SELECT 3"], 10), None);
+        assert_eq!(
+            dock.busy_by_conn(),
+            vec![("乙".to_string(), 1), ("甲".to_string(), 2)],
+            "两条连接各报各的排队数（按名字排，侧栏那一列才对得上）"
+        );
+        assert!(dock.busy_on("甲"));
+        assert!(dock.busy_on("乙"));
+        assert!(!dock.busy_on("没配过的"), "没人排队就别拦自动执行");
+
+        dock.on_event(&event(2, Ok(query(2, 1))));
+        dock.on_event(&event(11, Ok(query(11, 1))));
+        assert_eq!(
+            dock.busy_by_conn(),
+            vec![("甲".to_string(), 1)],
+            "回了执的不该还算在排队"
+        );
+        assert!(!dock.busy_on("乙"));
+    }
+
     #[test]
     fn one_panel_per_statement() {
         let dock = dock();
@@ -1759,11 +2018,11 @@ mod tests {
     fn failure_skips_the_statements_behind_it() {
         let mut dock = dock();
         dock.on_event(&event(1, Ok(query(1, 2))));
-        dock.on_event(&event(
-            2,
-            Err(DbError::new("1064 · 语法错了").to_string()),
-        ));
-        assert!(matches!(dock.panels[0].slot, Slot::Done(_)), "先跑完的得留着");
+        dock.on_event(&event(2, Err(DbError::new("1064 · 语法错了").to_string())));
+        assert!(
+            matches!(dock.panels[0].slot, Slot::Done(_)),
+            "先跑完的得留着"
+        );
         assert!(matches!(&dock.panels[1].slot, Slot::Failed(t) if t.contains("语法错了")));
         assert!(matches!(dock.panels[2].slot, Slot::Skipped));
         assert!(!dock.running(), "没跑的那些标成未执行，不许继续转圈");
@@ -1785,7 +2044,7 @@ mod tests {
     #[test]
     fn old_panels_get_evicted() {
         let mut dock = ResultsDock::new();
-        for run in 0..3 {
+        for run in 0..5 {
             let batch: Vec<Part> = (0..3)
                 .map(|i| Part {
                     task: run * 10 + i + 1,
@@ -1796,7 +2055,10 @@ mod tests {
             dock.start_run("本机", "块", &batch, None);
         }
         assert_eq!(dock.count(), MAX_PANELS, "最多留 {MAX_PANELS} 个");
-        assert_eq!(dock.panels[0].task, 21, "挤剩的该是最早那批的尾巴");
+        assert_eq!(
+            dock.panels[0].task, 41,
+            "新交的排在头里，被挤掉的该是最旧的"
+        );
     }
 
     #[test]
@@ -1846,14 +2108,16 @@ mod tests {
     fn clear_keeps_the_waiting_ones() {
         let mut dock = dock();
         dock.on_event(&event(1, Ok(query(1, 2))));
-        dock.on_event(&event(
-            2,
-            Err(DbError::new("断了").to_string()),
-        ));
+        dock.on_event(&event(2, Err(DbError::new("断了").to_string())));
         // 1 出结果、2 报错、3 被连累标成「未执行」：这一批都不会再产出什么，清空就该全走
         dock.clear_finished();
         assert_eq!(dock.count(), 0);
-        dock.start_run("本机", "还在跑", &offset_parts(&["SELECT 5", "SELECT 6"], 10), None);
+        dock.start_run(
+            "本机",
+            "还在跑",
+            &offset_parts(&["SELECT 5", "SELECT 6"], 10),
+            None,
+        );
         dock.on_event(&event(11, Ok(query(11, 1))));
         dock.clear_finished();
         assert_eq!(dock.count(), 1, "还在等的得留下");
@@ -1870,13 +2134,56 @@ mod tests {
         assert_eq!(dock.panels[0].title, "另一块");
     }
 
+    /// 页签换的是「屏上留哪一份」。一次跑三条，竖着叠只看得见头一两个，
+    /// 剩下的得先拖高结果区再滚——等于没有。
     #[test]
-    fn collapse_switches_every_panel() {
+    fn tabs_switch_which_result_is_shown() {
         let mut dock = dock();
-        dock.set_all_collapsed(true);
-        assert!(dock.panels.iter().all(|p| p.collapsed));
-        dock.set_all_collapsed(false);
-        assert!(dock.panels.iter().all(|p| !p.collapsed));
+        for id in 1..=3 {
+            dock.on_event(&event(id, Ok(query(id, 2))));
+        }
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+
+        let first = show_pass(&mut dock, &ctx, vec![], 1.0);
+        assert_eq!(dock.active, Some(1), "一批结果先亮第一条");
+        let shown = texts(&first);
+        for label in ["1·SELECT 1", "2·SELECT 2", "3·SELECT 3"] {
+            assert!(
+                shown.iter().any(|t| t == label),
+                "页签栏少了「{label}」：{shown:?}"
+            );
+        }
+        // 屏上正文那一句只有一份：抬头行里的语句预览（纯 "SELECT n"）和页签的
+        // 「n·SELECT n」是两个不同的字串，正好用来分辨「列在页签上」和「画在屏上」。
+        let bodies: Vec<&String> = shown.iter().filter(|t| t.starts_with("SELECT ")).collect();
+        assert_eq!(bodies, vec!["SELECT 1"], "页签一次只留一份在屏上");
+
+        let at = spot(&first, "3·SELECT 3").expect("第三条那个页签没画出来");
+        click(&mut dock, &ctx, at, 2.0);
+        assert_eq!(dock.active, Some(3), "点页签没换过去");
+        // 换页签那一帧画的还是旧的一份，新的一份下一帧才跟上
+        let third = texts(&show_pass(&mut dock, &ctx, vec![], 2.20));
+        let bodies: Vec<&String> = third.iter().filter(|t| t.starts_with("SELECT ")).collect();
+        assert_eq!(bodies, vec!["SELECT 3"], "点完只留第三条");
+    }
+
+    /// 页签选中项被挤掉、被关掉，同一帧就得退到还有结果的那一格，
+    /// 不能留一帧「屏上什么都没有」。
+    #[test]
+    fn closing_the_active_result_falls_back_to_the_first() {
+        let mut dock = dock();
+        for id in 1..=3 {
+            dock.on_event(&event(id, Ok(query(id, 2))));
+        }
+        dock.active = Some(2);
+        dock.close(2);
+        dock.normalize_active();
+        assert_eq!(dock.active, Some(1), "关掉了当前那份，得自动退到第一份");
+
+        dock.clear_finished();
+        dock.normalize_active();
+        assert_eq!(dock.active, None, "全清空了不该还指着一条");
     }
 
     #[test]
@@ -1948,14 +2255,10 @@ mod tests {
 
     #[test]
     fn csv_quotes_lines_that_span_rows() {
-        let one = table(
-            &["log"],
-            vec![vec![Cell::Text("第一行\n第二行".into())]],
-        );
+        let one = table(&["log"], vec![vec![Cell::Text("第一行\n第二行".into())]]);
         let csv = to_csv(&one);
         assert_eq!(
-            csv,
-            "log\r\n\"第一行\n第二行\"\r\n",
+            csv, "log\r\n\"第一行\n第二行\"\r\n",
             "字段里的换行不包起来，读的人就数不清有几行了：{csv:?}"
         );
     }
@@ -2000,11 +2303,7 @@ mod tests {
             dock.panels.iter().all(|p| p.total == 3),
             "同一批每条都该写着「共 3 条」"
         );
-        let seq = dock
-            .panels
-            .iter()
-            .map(|p| p.seq)
-            .collect::<Vec<usize>>();
+        let seq = dock.panels.iter().map(|p| p.seq).collect::<Vec<usize>>();
         assert_eq!(seq, vec![1, 2, 3], "面板从上到下就是语句顺序");
         let first = dock.panels[0].stamp.clone();
         assert!(!first.is_empty(), "批次抬头要有一个时间戳");

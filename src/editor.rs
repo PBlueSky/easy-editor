@@ -181,9 +181,16 @@ impl OpenFile {
     pub fn apply_edit(&mut self, edit: PendingEdit) {
         let (start, end) = match edit.range {
             Some((a, b)) => (a.min(self.text.len()), b.min(self.text.len())),
-            None => (self.caret_byte.min(self.text.len()), self.caret_byte.min(self.text.len())),
+            None => (
+                self.caret_byte.min(self.text.len()),
+                self.caret_byte.min(self.text.len()),
+            ),
         };
-        let (start, end) = if start <= end { (start, end) } else { (end, start) };
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
         self.text.replace_range(start..end, &edit.insert);
         self.reindex();
         self.refresh_dirty();
@@ -304,7 +311,10 @@ fn selection_term(text: &str, a: usize, b: usize) -> Option<(String, bool)> {
         .chars()
         .next_back()
         .is_some_and(crate::find::is_word_char)
-        || text[tb..].chars().next().is_some_and(crate::find::is_word_char);
+        || text[tb..]
+            .chars()
+            .next()
+            .is_some_and(crate::find::is_word_char);
     Some((trimmed.to_string(), !glued))
 }
 
@@ -457,9 +467,11 @@ pub fn show(
         let byte = byte.min(file.text.len());
         let char_idx = byte_to_char_index(&file.text, byte);
         if let Some(mut state) = TextEdit::load_state(ui.ctx(), edit_id) {
-            state.cursor.set_char_range(Some(
-                egui::text::CCursorRange::one(egui::text::CCursor::new(char_idx)),
-            ));
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::one(
+                    egui::text::CCursor::new(char_idx),
+                )));
             state.store(ui.ctx(), edit_id);
             file.pending_jump = None;
             file.caret_byte = byte;
@@ -478,10 +490,12 @@ pub fn show(
         if let Some(mut state) = TextEdit::load_state(ui.ctx(), edit_id) {
             let ca = byte_to_char_index(&file.text, range.0);
             let cb = byte_to_char_index(&file.text, range.1);
-            state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
-                egui::text::CCursor::new(cb),
-                egui::text::CCursor::new(ca),
-            )));
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(cb),
+                    egui::text::CCursor::new(ca),
+                )));
             state.store(ui.ctx(), edit_id);
             want_focus = true;
             file.pending_select = None;
@@ -509,8 +523,10 @@ pub fn show(
     ui.spacing_mut().item_spacing.y = 0.0;
     ui.horizontal_top(|ui| {
         // 行号栏先占掉左边那一格，剩下的整块都给滚动区
-        let (gutter_rect, _) =
-            ui.allocate_exact_size(Vec2::new(gutter_width, ui.available_height()), Sense::hover());
+        let (gutter_rect, _) = ui.allocate_exact_size(
+            Vec2::new(gutter_width, ui.available_height()),
+            Sense::hover(),
+        );
 
         let out = area.show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
@@ -530,38 +546,37 @@ pub fn show(
             let occurrences = file.occurrences.clone();
             let sql_errors = file.sql_errors.clone();
             let current_match = file.current_match;
-            let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| -> Arc<Galley> {
-                let text = buf.as_str();
-                let spans = hl.highlight(Some(&path), text);
-                // 报错的语句排在最前：`paint_overlay` 先到先得，
-                // 红底不能被查找 / 选词高亮盖掉——那条语句才是这一帧要人看的地方。
-                let mut overlay: Vec<Seg> = sql_errors
-                    .iter()
-                    .map(|(a, b)| (*a, *b, err_bg))
-                    .collect();
-                overlay.extend(merge_overlay(
-                    &matches,
-                    current_match,
-                    &occurrences,
-                    match_bg,
-                    cur_match_bg,
-                    occ_bg,
-                ));
-                // wrap_width 是 TextEdit 这一帧真正能给到文字的宽度：开了横向滚动它是
-                // 无穷大（不折行时本来就要保持原样），折行时正好就是视口宽度。
-                let galley = build_galley(
-                    ui,
-                    text,
-                    &spans,
-                    &overlay,
-                    &font_id,
-                    fg,
-                    row_height,
-                    if wrap { wrap_width } else { f32::INFINITY },
-                );
-                *row_tops.borrow_mut() = (line_row_tops(&galley), galley.rect.height());
-                galley
-            };
+            let mut layouter =
+                |ui: &Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| -> Arc<Galley> {
+                    let text = buf.as_str();
+                    let spans = hl.highlight(Some(&path), text);
+                    // 报错的语句排在最前：`paint_overlay` 先到先得，
+                    // 红底不能被查找 / 选词高亮盖掉——那条语句才是这一帧要人看的地方。
+                    let mut overlay: Vec<Seg> =
+                        sql_errors.iter().map(|(a, b)| (*a, *b, err_bg)).collect();
+                    overlay.extend(merge_overlay(
+                        &matches,
+                        current_match,
+                        &occurrences,
+                        match_bg,
+                        cur_match_bg,
+                        occ_bg,
+                    ));
+                    // wrap_width 是 TextEdit 这一帧真正能给到文字的宽度：开了横向滚动它是
+                    // 无穷大（不折行时本来就要保持原样），折行时正好就是视口宽度。
+                    let galley = build_galley(
+                        ui,
+                        text,
+                        &spans,
+                        &overlay,
+                        &font_id,
+                        fg,
+                        row_height,
+                        if wrap { wrap_width } else { f32::INFINITY },
+                    );
+                    *row_tops.borrow_mut() = (line_row_tops(&galley), galley.rect.height());
+                    galley
+                };
 
             let editor = TextEdit::multiline(&mut file.text)
                 .id(edit_id)
@@ -669,7 +684,11 @@ pub fn show(
                 egui::Align2::RIGHT_CENTER,
                 (i + 1).to_string(),
                 FontId::monospace(font_size * 0.88),
-                if is_current { active_num_color } else { num_color },
+                if is_current {
+                    active_num_color
+                } else {
+                    num_color
+                },
             );
         }
     });
@@ -903,12 +922,8 @@ fn build_galley(
     // 等宽字体里 ASCII 一格约 0.55em，而 CJK 字形按 1em 排，中文只占 1.82 格，
     // 后面的英文列就会整体前移。给每个双宽字符补一点前导空白，让它正好占两格；
     // leading_space 不占字符，光标和选区的下标不受影响。
-    let (cell_width, wide_advance) = ui.fonts_mut(|f| {
-        (
-            f.glyph_width(font_id, '0'),
-            f.glyph_width(font_id, '中'),
-        )
-    });
+    let (cell_width, wide_advance) =
+        ui.fonts_mut(|f| (f.glyph_width(font_id, '0'), f.glyph_width(font_id, '中')));
     let wide_pad = (2.0 * cell_width - wide_advance).max(0.0);
 
     for (i, line) in text.split('\n').enumerate() {
@@ -988,7 +1003,11 @@ fn paint_overlay(galley: &mut Arc<Galley>, text: &str, overlay: &[Seg]) {
             if right <= left || y <= 0.0 {
                 continue;
             }
-            insert_rect(row, Rect::from_min_max(pos2(left, 0.0), pos2(right, y)), color);
+            insert_rect(
+                row,
+                Rect::from_min_max(pos2(left, 0.0), pos2(right, y)),
+                color,
+            );
         }
     }
 }
@@ -1151,14 +1170,21 @@ mod tests {
         let text = "aaa find aaa\n中文 查找 命中\n";
         let overlay = vec![
             (4usize, 8usize, bg),
-            (text.find("查找").unwrap(), text.find("查找").unwrap() + "查找".len(), bg),
+            (
+                text.find("查找").unwrap(),
+                text.find("查找").unwrap() + "查找".len(),
+                bg,
+            ),
         ];
         let font_id = FontId::monospace(14.0);
         let line_height = theme::mono_row_height(14.0, 1.0);
 
         let mut captured: Option<Arc<Galley>> = None;
         let raw = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
             ..Default::default()
         };
         let mut out = ctx.run_pass(raw, |ctx| {

@@ -221,7 +221,13 @@ mod tests {
             name: name.into(),
             ..Default::default()
         };
-        let mut list = vec![named("本地"), named(""), named("   "), named("本地"), named("线上")];
+        let mut list = vec![
+            named("本地"),
+            named(""),
+            named("   "),
+            named("本地"),
+            named("线上"),
+        ];
         prune_connections(&mut list);
         let names: Vec<&str> = list.iter().map(|c| c.name.as_str()).collect();
         // 重名只留第一条：留哪条都行，但绝不能留两条让结果串台

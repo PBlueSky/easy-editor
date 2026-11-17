@@ -95,7 +95,10 @@ fn thumb_rect(track: Rect, history: usize, offset: usize, rows: usize) -> Rect {
         (history - offset.min(history)) as f32 / history as f32
     };
     Rect::from_min_size(
-        egui::pos2(track.center().x - SB_BAR_W * 0.5, track.top() + progress * span),
+        egui::pos2(
+            track.center().x - SB_BAR_W * 0.5,
+            track.top() + progress * span,
+        ),
         Vec2::new(SB_BAR_W, height),
     )
 }
@@ -169,7 +172,9 @@ impl ShellKind {
         match self {
             Self::Pwsh => which("pwsh.exe"),
             Self::WindowsPowerShell => which("powershell.exe"),
-            Self::Cmd => which("cmd.exe").or_else(|| std::env::var_os("COMSPEC").map(PathBuf::from)),
+            Self::Cmd => {
+                which("cmd.exe").or_else(|| std::env::var_os("COMSPEC").map(PathBuf::from))
+            }
             Self::GitBash => find_git_bash(),
             Self::Wsl => which("wsl.exe"),
         }
@@ -235,7 +240,10 @@ pub struct TerminalSettings {
 }
 
 impl TerminalSettings {
-    pub fn from_config(programs: &BTreeMap<String, String>, args: &BTreeMap<String, String>) -> Self {
+    pub fn from_config(
+        programs: &BTreeMap<String, String>,
+        args: &BTreeMap<String, String>,
+    ) -> Self {
         Self {
             programs: programs.clone(),
             args: args.clone(),
@@ -420,7 +428,10 @@ impl Terminal {
             .map_err(|e| format!("创建伪终端失败：{e}"))?;
 
         let cmd = shell.build(cwd, settings).ok_or_else(|| {
-            format!("找不到 {} 的可执行文件，可在终端设置里指定路径", shell.label())
+            format!(
+                "找不到 {} 的可执行文件，可在终端设置里指定路径",
+                shell.label()
+            )
         })?;
 
         let child = pair
@@ -668,10 +679,9 @@ impl Terminal {
 
         // 鼠标位置 -> 绝对行/列。行号跟随回滚偏移，滚动后选区仍指向原来的文字。
         let point_at = |pos: egui::Pos2| -> SelPoint {
-            let row = (((pos.y - rect.top()) / row_h).floor() as i32)
-                .clamp(0, rows as i32 - 1);
-            let col = (((pos.x - rect.left()) / char_w).floor() as i32)
-                .clamp(0, cols as i32 - 1) as usize;
+            let row = (((pos.y - rect.top()) / row_h).floor() as i32).clamp(0, rows as i32 - 1);
+            let col = (((pos.x - rect.left()) / char_w).floor() as i32).clamp(0, cols as i32 - 1)
+                as usize;
             SelPoint {
                 line: (row - display_offset as i32).clamp(topmost, bottommost),
                 col,
@@ -766,7 +776,11 @@ impl Terminal {
                                 color,
                             );
                         }
-                        run = if is_default { None } else { Some((col, cell_bg)) };
+                        run = if is_default {
+                            None
+                        } else {
+                            Some((col, cell_bg))
+                        };
                     }
                     None => {
                         if !is_default {
@@ -791,7 +805,11 @@ impl Terminal {
                 let (start, end) = sel.ordered();
                 if line.0 >= start.line && line.0 <= end.line {
                     let c0 = if line.0 == start.line { start.col } else { 0 };
-                    let c1 = if line.0 == end.line { end.col } else { cols - 1 };
+                    let c1 = if line.0 == end.line {
+                        end.col
+                    } else {
+                        cols - 1
+                    };
                     if c0 <= c1 && c0 < cols {
                         let c1 = c1.min(cols - 1);
                         painter.rect_filled(
@@ -831,7 +849,10 @@ impl Terminal {
                 let s = ch.encode_utf8(&mut buf);
                 // 以 cell 区域居中，宽字符自然占两格
                 painter.text(
-                    egui::pos2(rect.left() + col as f32 * char_w + width * 0.5, y + row_h * 0.5),
+                    egui::pos2(
+                        rect.left() + col as f32 * char_w + width * 0.5,
+                        y + row_h * 0.5,
+                    ),
                     egui::Align2::CENTER_CENTER,
                     s,
                     font.clone(),
@@ -884,8 +905,8 @@ impl Terminal {
         if let Some(t) = track {
             let thumb = thumb_rect(t, history, display_offset, rows);
             let dragging = self.sb_grab.is_some();
-            let over = dragging
-                || ui.input(|i| i.pointer.hover_pos().is_some_and(|p| t.contains(p)));
+            let over =
+                dragging || ui.input(|i| i.pointer.hover_pos().is_some_and(|p| t.contains(p)));
             if over {
                 let track_bg = if dark {
                     Color32::from_rgba_unmultiplied(255, 255, 255, 14)
@@ -994,11 +1015,7 @@ fn snap_to_bottom(term: &mut Term<Listener>) {
 }
 
 /// 从网格里按选区取文字。行号是绝对行，网格索引负责换算回滚历史。
-fn extract_selection(
-    grid: &Grid<Cell>,
-    cols: usize,
-    selection: Selection,
-) -> Option<String> {
+fn extract_selection(grid: &Grid<Cell>, cols: usize, selection: Selection) -> Option<String> {
     let (start, end) = selection.ordered();
     if start.line == end.line && start.col == end.col {
         return None;
@@ -1364,7 +1381,10 @@ mod tests {
     #[test]
     fn splits_args_with_quotes() {
         assert_eq!(split_args("-i -l"), ["-i", "-l"]);
-        assert_eq!(split_args("  -NoProfile   -NoLogo "), ["-NoProfile", "-NoLogo"]);
+        assert_eq!(
+            split_args("  -NoProfile   -NoLogo "),
+            ["-NoProfile", "-NoLogo"]
+        );
         assert_eq!(split_args(r#"--cd "C:\My Dir""#), ["--cd", r"C:\My Dir"]);
         assert_eq!(split_args(""), Vec::<String>::new());
         // 引号里的空串仍然是一个参数
@@ -1389,8 +1409,10 @@ mod tests {
     #[test]
     fn configured_program_beats_detection() {
         let mut s = TerminalSettings::default();
-        s.programs
-            .insert("gitbash".into(), r"D:\Softwares\GitBash\bin\bash.exe".into());
+        s.programs.insert(
+            "gitbash".into(),
+            r"D:\Softwares\GitBash\bin\bash.exe".into(),
+        );
         // 路径存在与否交给启动时报错，这里必须认账，否则用户改了配置却静默失效
         assert!(ShellKind::GitBash.program(&s).is_some());
         assert!(ShellKind::detect(&s).contains(&ShellKind::GitBash));
@@ -1457,7 +1479,11 @@ mod tests {
                 (0..cols)
                     .map(|col| {
                         let c = line[Column(col)].c;
-                        if c == '\0' { ' ' } else { c }
+                        if c == '\0' {
+                            ' '
+                        } else {
+                            c
+                        }
                     })
                     .collect::<String>()
                     .trim_end()
@@ -1610,7 +1636,10 @@ mod tests {
         let t = panel.get_mut(term_id).unwrap();
         // 宽字符占两格，第二格是空的占位格，拼回一行时得把它剔掉
         let screen = visible_lines(&t.term, t.dims.rows, t.dims.cols);
-        let flat: String = screen.iter().flat_map(|l| l.chars().filter(|c| *c != ' ')).collect();
+        let flat: String = screen
+            .iter()
+            .flat_map(|l| l.chars().filter(|c| *c != ' '))
+            .collect();
         assert!(
             flat.contains("中文"),
             "输入法提交的中文没写进 PTY，屏幕是：{screen:?}"
@@ -1630,7 +1659,10 @@ mod tests {
         assert_ne!(scrolled, 0, "没能滚回历史，后面没法验");
         let _ = draw(&mut panel, vec![key_event(egui::Key::Enter)]);
         let offset = panel.get_mut(term_id).unwrap().term.grid().display_offset();
-        assert_eq!(offset, 0, "敲了键盘却还钉在历史里，屏幕上一直是不动的旧内容");
+        assert_eq!(
+            offset, 0,
+            "敲了键盘却还钉在历史里，屏幕上一直是不动的旧内容"
+        );
 
         panel.remove(term_id);
     }
@@ -1662,7 +1694,11 @@ mod tests {
         );
 
         snap_to_bottom(&mut term);
-        assert_eq!(term.grid().display_offset(), 0, "归位后 display_offset 没清零");
+        assert_eq!(
+            term.grid().display_offset(),
+            0,
+            "归位后 display_offset 没清零"
+        );
         let after = visible_lines(&term, dims.rows, dims.cols);
         assert_ne!(after, pinned, "归位后屏幕上还是旧的那几行");
         assert!(
