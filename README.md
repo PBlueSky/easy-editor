@@ -452,6 +452,16 @@ Font size, theme, sidebar visibility, active sidebar tab, hidden-file visibility
 
 `keymap` records only the entries that differ from the defaults, and you may hand-edit it. An empty string means "deliberately unbound". Chords are written `Ctrl+Alt+Shift+Key`; key names are case-insensitive, arrow keys are `Left`/`Right`/`Up`/`Down`, and everything else looks like `Enter`, `Tab`, `Esc`, `F1`, `Backtick`, `Plus`, `A`, `0`.
 
+**When that file cannot be read**
+
+Hand-editing JSON is easy to get wrong — a missing quote, or an enum spelled in lowercase (`db_connections[].kind` accepts `"Mysql"`, not `"mysql"`). The app then starts with defaults, but it does **not** write those defaults over your file:
+
+- the unreadable file is renamed to `config.json.broken` in the same folder (if one is already there, the next one gets a number — an earlier backup is never overwritten);
+- a dialog appears in the middle of the screen saying where it tripped (serde's own message, with line and column), where the backup went, and offering to copy the path. Dismissing it stops the dialog, not the protection;
+- if even the rename failed, or the file could not be read at all, the app **does not save for the rest of the session**: font size changes and new connections are dropped on exit rather than written over your hand-written config.
+
+A zero-byte `config.json` counts as "nothing configured yet", not as damage — no backup, no dialog.
+
 **Optional environment variables**
 
 | Variable | Effect |
@@ -682,6 +692,14 @@ A reply arrives a few hundred milliseconds later, on another thread, and by then
 The file-tree header has a name that grows and three buttons that must not move, in a row egui will never wrap. Left-to-right cannot do it: the layout does not know how wide the button cluster is until it has laid it out, so a long workspace name simply draws over `新文件`. Right-to-left fixes the buttons but then the *name* is the thing being pushed, and a bare `with_layout(right_to_left)` on the panel ui also claims every pixel of height the panel has left and vertically centres the row in the middle of the sidebar.
 
 So the row is `ui.horizontal` (one line of height) containing a right-to-left scope for the buttons, whose used rect is then subtracted from the panel width, and the name is drawn in a second scope whose `max_rect` is that leftover rectangle. The height of that rect has to be pinned by hand: `available_rect_before_wrap` returns the whole remaining panel, and egui books the child's *used* rect — give the name the panel's full height and the search box and every file row below it are pushed off-panel.
+
+### An unreadable config is not the same as no config
+
+`Config::load()` used to end in `Err(_) => Self::default()`, which looks robust and is the worst kind of robust: a parse failure took the same path as a first run, and the debounced write then put defaults back into the file. Whatever the user had hand-written in `db_connections` or `keymap` was gone, with nothing said about it — all it took was one typo (`"kind": "mysql"` where the enum wants `"Mysql"`).
+
+`load()` now hands back `Loaded { config, trouble }`: the bad file is `rename`d to `config.json.broken` first (numbers appended if that name is taken), and only a successful move lets saving continue. If the move failed, or the file could not be read at all, `Trouble::blocks_save()` pins `save_now()` shut — losing this session's tweaks beats overwriting the user's own edits. The parsing lives in `load_from(&Path)` so the tests run against a temporary directory and never touch the real `%APPDATA%`; the dialog itself is covered by one of those headless interface tests built on `frame()`, which checks that it paints and that 「知道了」 dismisses it.
+
+An empty file is treated as "nothing configured yet": sync clients and editors have both left a zero-byte `config.json` behind, and that does not deserve a dialog.
 
 ## Contributing and license
 

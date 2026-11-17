@@ -118,6 +118,8 @@ pub struct EasyEditorApp {
     /// 顶栏内容上一帧的高度（取整）。面板高度是照上一帧量的，换行后旧高度会把第二排裁掉
     toolbar_h: i32,
     status: String,
+    /// 「配置文件读不出来」那个弹窗被用户点掉过没有。没点掉就一直摆在正中。
+    config_trouble_seen: bool,
     quick_open: Option<QuickOpen>,
     pending_close: Option<usize>,
     show_help: bool,
@@ -287,6 +289,7 @@ impl EasyEditorApp {
             word_wrap,
             toolbar_h: 0,
             status: "Ctrl+O 打开文件夹 · Ctrl+P 快速打开 · Ctrl+` 终端".into(),
+            config_trouble_seen: false,
             quick_open: None,
             pending_close: None,
             show_help: false,
@@ -316,6 +319,15 @@ impl EasyEditorApp {
         app.last_editor_pane = Some(root);
         // 配置里指定的终端偏好：本机没有这个种类就保持自动选择
         app.terminal.apply_pref(&app.config.data.terminal_shell);
+        // 配置文件读坏了要立刻留个话：这一份启动是按默认值跑的，
+        // 而且原文没保住之前落盘是停着的，不说明白用户只会以为「配置又自己丢了」
+        if let Some(trouble) = &app.config.trouble {
+            app.status = if trouble.blocks_save() {
+                "配置文件读不出来，也没敢往回写 —— 看弹窗说明".to_string()
+            } else {
+                "配置文件读不出来，已按默认值启动，原文留档了 —— 看弹窗说明".to_string()
+            };
+        }
 
         // 命令行参数优先
         if let Some(path) = target {
@@ -3861,6 +3873,62 @@ impl EasyEditorApp {
         }
     }
 
+    /// 配置文件没读出来时的一次性说明。
+    ///
+    /// 这个弹窗不点掉不收：以前遇到解析失败是悄悄按默认值启动、然后照常落盘，
+    /// 用户看到的后果就是「连接列表和自定义快捷键自己没了」。现在既不静默，
+    /// 也不在原文没保住的情况下写回，这两件事都得让用户先看见。
+    fn config_trouble_window(&mut self, ctx: &egui::Context) {
+        if self.config_trouble_seen {
+            return;
+        }
+        let Some(trouble) = &self.config.trouble else {
+            return;
+        };
+        let file = trouble.file().to_path_buf();
+        let lines = trouble.lines();
+        let mut dismiss = false;
+        egui::Window::new("配置文件没读出来")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(430.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                for line in &lines {
+                    ui.label(line.as_str());
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    // 长路径没有可折行的空格，label 会横着捅穿边框，所以截断 + 悬浮看全 + 可复制
+                    muted_line(ui, file.display().to_string());
+                    if theme::chip(ui, "复制路径")
+                        .on_hover_text("整条路径进剪贴板，粘到资源管理器地址栏就能打开")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(file.display().to_string());
+                    }
+                });
+                if trouble.blocks_save() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("在它被改对之前，这次的设置都不会写回这个文件。")
+                            .size(11.5)
+                            .weak(),
+                    );
+                }
+                ui.add_space(8.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("知道了").clicked() {
+                        dismiss = true;
+                    }
+                });
+            });
+
+        if dismiss {
+            self.config_trouble_seen = true;
+        }
+    }
+
     fn close_confirm(&mut self, ctx: &egui::Context) {
         let Some(idx) = self.pending_close else {
             return;
@@ -4259,6 +4327,8 @@ impl EasyEditorApp {
         self.terminal_settings_window(&ctx);
         self.database.manager_window(&ctx);
         self.results.show_popup(&ctx);
+        // 排最后：这是开局的告警，盖在其他浮窗上面才不会被当成普通窗口埋掉
+        self.config_trouble_window(&ctx);
 
         // 编辑器在 central() 里才会把最新光标写回 OpenFile，所以放在最后收
         self.poll_caret(&ctx);
@@ -7175,5 +7245,64 @@ mod tests {
             !shown.iter().any(|t| t.starts_with("SQL → ")),
             "这个文件跟数据库没关系：{shown:?}"
         );
+    }
+
+    /// 配置文件读坏了不能只打个日志就完事。走真输入管线量两件事：
+    /// 弹窗画没画出来，以及「知道了」点下去收不收掉。
+    #[test]
+    fn a_damaged_config_speaks_up_until_acknowledged() {
+        let (ctx, mut app, dir) = app_in_folder("ee_config_trouble", "SELECT 1\n");
+        app.config.trouble = None;
+        let shown = texts(&frame(&mut app, &ctx, vec![]));
+        assert!(
+            !shown.iter().any(|t| t == "配置文件没读出来"),
+            "配置没毛病时不该弹这个窗：{shown:?}"
+        );
+
+        app.config.trouble = Some(config::Trouble::Unparked {
+            file: dir.join("config.json"),
+            reason: "unknown variant `mysql`, expected `Mysql` at line 1 column 42".into(),
+        });
+        // 头两帧只在量窗口尺寸，尺寸落定 egui 才让窗口里的东西参与交互
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let shot = frame(&mut app, &ctx, vec![]);
+        let shown = texts(&shot);
+        assert!(
+            shown.iter().any(|t| t == "配置文件没读出来"),
+            "弹窗标题要在：{shown:?}"
+        );
+        assert!(
+            shown.iter().any(|t| t.contains("unknown variant")),
+            "serde 的原话要交给用户，不然他只知道自己改坏了、不知道改哪：{shown:?}"
+        );
+        assert!(
+            shown.iter().any(|t| t.contains("都不会写回")),
+            "原文没保住时「这次不落盘」得写在脸上：{shown:?}"
+        );
+
+        let ok = find_text(&shot, "知道了")
+            .expect("得有「知道了」按钮")
+            .center();
+        frame(
+            &mut app,
+            &ctx,
+            pointer(ok, egui::PointerButton::Primary, true),
+        );
+        frame(
+            &mut app,
+            &ctx,
+            pointer(ok, egui::PointerButton::Primary, false),
+        );
+        // 抬手那一帧弹窗还画着（点完才记下的标记），收掉是下一帧的事
+        let shot = frame(&mut app, &ctx, vec![]);
+        assert!(
+            !texts(&shot).iter().any(|t| t == "配置文件没读出来"),
+            "点过以后不该再弹"
+        );
+        // 收掉弹窗不等于撤销保护：原文没保住就永远不许写回
+        assert!(app.config.trouble.as_ref().is_some_and(|t| t.blocks_save()));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
