@@ -34,7 +34,10 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1400.0, 880.0])
             .with_min_inner_size([900.0, 560.0])
             .with_title("EasyEditor")
-            .with_icon(window_icon()),
+            .with_icon(window_icon())
+            // Windows 上关掉这个开关，`RawInput::dropped_files` 就永远是空的。
+            // winit 本身默认开着，这里写死是免得哪天默认翻了，拖拽打开静悄悄失效。
+            .with_drag_and_drop(true),
         ..Default::default()
     };
 

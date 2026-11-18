@@ -38,6 +38,7 @@ The release package is a **single exe** (about 12 MB, 5.2 MB zipped). No .NET, n
 | Find and replace | Case sensitivity, regex, all matches highlighted, hands stay in the input box | [Find and replace](#find-and-replace) |
 | Project-wide search | Streams `rg --json` first, falls back to a built-in byte-level scanner when ripgrep is absent | [Project-wide search](#project-wide-search) |
 | Files from anywhere | `Ctrl+Shift+O` (or the toolbar `Open file`) picks one or many files, wherever they live; the workspace, the index, the terminal's cwd and your open tabs stay put | [Opening files](#opening-files) |
+| Drag and drop | Drag files or a folder in from Explorer; while your button is still down a hint floats in the middle of the window | [Opening files](#opening-files) |
 | `.txt` file association | Registers itself into the Windows "Open with" list and Settings → Default apps at start-up, and opens whatever file you double-clicked | [.txt file association](#txt-file-association) |
 | Word occurrence highlight | Select a word with the mouse and every identical word in the file is marked immediately | [Find and replace](#find-and-replace) |
 | JSON / XML formatting | Edits the in-memory buffer only; nothing touches the disk until `Ctrl+S` | [Formatting](#formatting) |
@@ -108,13 +109,15 @@ With no arguments, the startup folder is chosen by: **command-line argument > cu
 
 ### Opening files
 
-The folder in the sidebar is an **entry point**, not a boundary on what you are allowed to read. `Ctrl+Shift+O` and the toolbar `Open file` button are the same thing: they open the system file picker (multi-select) and put the chosen files into tabs. That is the only place the entry lives — the welcome page and the empty sidebar offer a line of text instead of a second row of buttons.
+The folder in the sidebar is an **entry point**, not a boundary on what you are allowed to read. `Ctrl+Shift+O` and the toolbar `Open file` button are the same thing: they open the system file picker (multi-select) and put the chosen files into tabs. That is the only place a button for it lives — the welcome page and the empty sidebar offer a line of text instead of a second row of buttons. The other way in is dragging from Explorer, covered below.
 
 Opening a file that lives outside the workspace **leaves the workspace completely alone** — the tree still shows the same folder, the quick-open index is not rescanned, terminal panes keep their cwd, and not one existing tab is closed. If you want the neighbourhood too, that is a separate `Open folder` (`Ctrl+O`). The picker starts in the current workspace; with no workspace open it specifies nothing, so Windows remembers where it was last.
 
 Saving writes back to the file's own absolute path. No same-named copy appears inside the workspace.
 
 A `.txt` double-clicked in Explorer arrives as a command-line path and follows the same rule: that one file becomes a tab, and its parent folder is *not* promoted to workspace. Otherwise every double-click on a note in Downloads would index all of Downloads and clobber the working directory you were restoring (see [.txt file association](#txt-file-association)).
+
+**Dropping things from Explorer** walks those same two roads, and it does not matter where in the window you drop — panes are not targets. Files behave like `Open file`: they land in the tab strip and the workspace is left completely alone. A folder behaves like `Open folder`: it becomes the workspace, tabs and all, exactly as if you had clicked the button. Drop both kinds at once and the folder is settled first, so the files in the same batch are not swept away with the old tabs; several folders at once means the first one wins. While the button is still down, a hint floats in the middle of the window — `松开打开 <name>`, or just a count for a batch — and it disappears when you drop or drag out.
 
 **Same-named files** (`D:\docs\note.txt` next to `D:\work\note.txt`) no longer collapse into one identical tab label. Only the colliding group gets extra parent directories spelled out, one segment at a time, until its members differ; everything else stays a bare filename so the tab strip does not grow for no reason. The `…/` prefix marks the part that is still hidden. Pane titles and the close-confirmation dialog use the same names, and the dialog adds the full path on a second line — "Save and close" landing in the wrong folder is worse than not saving.
 

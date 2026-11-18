@@ -600,6 +600,29 @@ impl EasyEditorApp {
         }
     }
 
+    /// 从资源管理器拖进来的东西：文件照旧只进标签、不动工作区，文件夹才换工作区。
+    /// 两类一起拖时先认文件夹再开文件——`open_workspace` 会清标签，反过来排会把
+    /// 同一批里拖进来的文件清掉。多个文件夹只认第一个，一次拖进来本来就是同一件事。
+    fn open_dropped(&mut self, paths: Vec<PathBuf>) {
+        let dirs: Vec<PathBuf> = paths.iter().filter(|p| p.is_dir()).cloned().collect();
+        let files: Vec<PathBuf> = paths.into_iter().filter(|p| !p.is_dir()).collect();
+        if let Some(dir) = dirs.first() {
+            self.open_workspace(dir.clone());
+        }
+        let before = self.tabs.len();
+        for file in &files {
+            self.open_file(file.clone(), None);
+        }
+        let opened = self.tabs.len() - before;
+        // 只拖文件、或只拖文件夹时 open_file / open_workspace 已经各自写过状态；
+        // 混着拖就得收尾说一句，不然屏幕上只剩其中一半的结果。
+        if !dirs.is_empty() && opened > 0 {
+            self.status = format!("已打开 {}，另开 {opened} 个文件", dirs[0].display());
+        } else if opened > 1 {
+            self.status = format!("已打开 {opened} 个文件");
+        }
+    }
+
     fn open_file(&mut self, path: PathBuf, line: Option<usize>) {
         // 文件已在某个标签中打开？把对应面板切到前台
         if let Some(idx) = self.tabs.iter().position(|t| t.path == path) {
@@ -4756,6 +4779,33 @@ impl EasyEditorApp {
             self.open_files_dialog();
         }
 
+        // 拖拽：`dropped_files` 每帧从 winit 那边一次性交过来，这一帧不处理就没了；
+        // `hovered_files` 反过来会一直留着，只用来在松手前给一句「放开就打开」。
+        let (hovered, dropped) = ctx.input(|i| {
+            let hovered = i
+                .raw
+                .hovered_files
+                .iter()
+                .filter_map(|f| f.path.as_ref())
+                .map(|p| {
+                    p.file_name()
+                        .unwrap_or(p.as_os_str())
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect::<Vec<_>>();
+            let dropped = i
+                .raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .collect::<Vec<_>>();
+            (hovered, dropped)
+        });
+        if !dropped.is_empty() {
+            self.open_dropped(dropped);
+        }
+
         egui::Panel::top("toolbar")
             .frame(
                 egui::Frame::new()
@@ -4802,6 +4852,37 @@ impl EasyEditorApp {
         // 有终端活着就要持续拉输出；大约 30fps，够跟上手速也不至于空转
         if !self.terminal.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        }
+
+        // 悬停提示压在最上面：拖到编辑器或侧栏上时也得看得见，不然用户不知道松手有没有用。
+        if !hovered.is_empty() {
+            let head = if hovered.len() == 1 {
+                format!("松开打开 {}", hovered[0])
+            } else {
+                format!("松开打开 {} 项", hovered.len())
+            };
+            egui::Area::new(egui::Id::unique("drop-hint"))
+                .order(egui::Order::Foreground)
+                .movable(false)
+                .interactable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, -60.0])
+                .show(&ctx, |ui| {
+                    egui::Frame::new()
+                        .fill(ui.visuals().window_fill())
+                        .shadow(ui.visuals().window_shadow)
+                        .corner_radius(8.0)
+                        .inner_margin(egui::Margin::symmetric(14, 10))
+                        .show(ui, |ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.label(RichText::new(head).size(crate::theme::md(ui)).strong());
+                                ui.label(
+                                    RichText::new("文件夹换到工作区，文件进标签条")
+                                        .size(crate::theme::sm(ui))
+                                        .weak(),
+                                );
+                            });
+                        });
+                });
         }
 
         // 输入法锚点要最后处理：前面画完才知道这一帧谁拿到了锚点
@@ -5089,17 +5170,70 @@ mod tests {
         size: Vec2,
         events: Vec<egui::Event>,
     ) -> egui::FullOutput {
-        let raw = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
-            events,
-            ..Default::default()
-        };
+        frame_raw(
+            app,
+            ctx,
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// 直接喂一份 `RawInput` 跑一帧。拖放这类不走 `events` 的输入只能从这里进。
+    fn frame_raw(
+        app: &mut EasyEditorApp,
+        ctx: &egui::Context,
+        raw: egui::RawInput,
+    ) -> egui::FullOutput {
         let mut out = ctx.run_pass(raw, |ctx| {
             ctx.root_ui(|ui| app.draw(ui));
         });
         // 没有真的渲染器消费字体图集的增量，epaint 会在 drop 时断言
         out.textures_delta.clear();
         out
+    }
+
+    /// `RawInput::dropped_files` 里那只句柄：winit 给的是真实文件，测试里只要路径。
+    #[derive(Debug)]
+    struct Dropped(PathBuf);
+
+    impl egui::DroppedFile for Dropped {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            std::fs::read(&self.0).map_err(|e| e.to_string())
+        }
+    }
+
+    /// 拼一帧「用户把这几样拖到窗口上并松了手」。
+    fn drop_raw(paths: &[PathBuf]) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SCREEN)),
+            dropped_files: paths
+                .iter()
+                .map(|p| std::sync::Arc::new(Dropped(p.clone())) as egui::DroppedFileHandle)
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// 拼一帧「拖进来的东西还悬在窗口上方，没松手」。
+    fn hover_raw(paths: &[PathBuf]) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SCREEN)),
+            hovered_files: paths
+                .iter()
+                .map(|p| egui::HoveredFile {
+                    path: Some(p.clone()),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
     }
 
     fn pointer(pos: Pos2, button: egui::PointerButton, pressed: bool) -> Vec<egui::Event> {
@@ -8222,6 +8356,135 @@ mod tests {
         assert_eq!(app.tabs[0].path, dir.join("note.txt"));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 从资源管理器拖一个文件到窗口上 = 走「打开文件」那条路：只进标签，工作区不动。
+    #[test]
+    fn dropping_a_file_opens_it_without_touching_the_workspace() {
+        let (ctx, mut app, _dir) = app_in_folder("easy-editor-app-drop-file", "in workspace\n");
+        let outside = temp_dir("easy-editor-app-drop-file-target");
+        std::fs::write(outside.join("note.txt"), "dragged in\n").unwrap();
+
+        let root_before = app.root.clone();
+        let index_before = app.index.clone();
+
+        frame_raw(&mut app, &ctx, drop_raw(&[outside.join("note.txt")]));
+
+        assert_eq!(app.root, root_before, "拖进来一个文件却换了工作区");
+        assert_eq!(app.index, index_before, "拖进来一个文件却重扫了索引");
+        assert_eq!(app.tabs.len(), 1, "拖进来的文件没进标签条：{}", app.status);
+        assert_eq!(app.tabs[0].text, "dragged in\n");
+
+        // drop 事件一帧只交一次，下一帧不该再开一遍
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.tabs.len(), 1, "同一个文件被开了两遍");
+
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    /// 拖一个文件夹进来 = 走「打开文件夹」那条路：换工作区、清标签。
+    #[test]
+    fn dropping_a_folder_switches_the_workspace() {
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-drop-folder", "a\n");
+        let other = temp_dir("easy-editor-app-drop-folder-target");
+        std::fs::write(other.join("b.txt"), "b\n").unwrap();
+        app.open_file(dir.join("a.txt"), None);
+        assert_eq!(app.tabs.len(), 1);
+
+        frame_raw(&mut app, &ctx, drop_raw(std::slice::from_ref(&other)));
+
+        assert_eq!(
+            app.root,
+            Some(other.clone()),
+            "拖进来的是文件夹，工作区却没换：{}",
+            app.status
+        );
+        assert!(app.tabs.is_empty(), "换了工作区旧标签还在");
+        assert_eq!(app.index.len(), 1, "新工作区没重新扫：{:?}", app.index);
+        assert!(
+            app.status.contains("easy-editor-app-drop-folder-target"),
+            "状态栏没说换了工作区：{}",
+            app.status
+        );
+
+        std::fs::remove_dir_all(&other).unwrap();
+    }
+
+    /// 一次拖进来既有文件夹又有文件：先认文件夹再开文件，文件不能转头被
+    /// `open_workspace` 清空——不管资源管理器把哪一样排在前面。
+    #[test]
+    fn dropping_a_folder_with_files_keeps_the_files() {
+        for folder_first in [true, false] {
+            let (ctx, mut app, _) = app_in_folder("easy-editor-app-drop-mix", "a\n");
+            let folder = temp_dir("easy-editor-app-drop-mix-target");
+            std::fs::write(folder.join("b.txt"), "b\n").unwrap();
+            let file = temp_dir("easy-editor-app-drop-mix-file");
+            std::fs::write(file.join("c.txt"), "c\n").unwrap();
+
+            let paths = if folder_first {
+                vec![folder.clone(), file.join("c.txt")]
+            } else {
+                vec![file.join("c.txt"), folder.clone()]
+            };
+            frame_raw(&mut app, &ctx, drop_raw(&paths));
+
+            assert_eq!(
+                app.root,
+                Some(folder.clone()),
+                "folder_first={folder_first}：文件夹没认成工作区"
+            );
+            assert_eq!(
+                app.tabs.len(),
+                1,
+                "folder_first={folder_first}：同批拖进来的文件没了，状态={}",
+                app.status
+            );
+            assert_eq!(app.tabs[0].path, file.join("c.txt"));
+
+            std::fs::remove_dir_all(&folder).unwrap();
+            std::fs::remove_dir_all(&file).unwrap();
+        }
+    }
+
+    /// 手还没松开时给一句准信；松手或拖出窗口之后提示得走。
+    #[test]
+    fn hovering_a_drag_shows_the_drop_hint() {
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-drop-hint", "a\n");
+
+        // egui 对新出现的 Area 先跑一帧只量不画的 sizing pass，所以第一帧看不到提示
+        let paths = [dir.join("a.txt")];
+        frame_raw(&mut app, &ctx, hover_raw(&paths));
+        let out = frame_raw(&mut app, &ctx, hover_raw(&paths));
+        assert!(
+            find_text(&out, "松开打开 a.txt").is_some(),
+            "悬停一个文件却没有提示：{:?}",
+            texts(&out)
+        );
+        assert!(
+            texts(&out)
+                .iter()
+                .any(|t| t == "文件夹换到工作区，文件进标签条"),
+            "提示里没说清楚松手会发生什么：{:?}",
+            texts(&out)
+        );
+
+        // 一次拖好几样：路径名各写一遍太挤，只报数量
+        let out = frame_raw(
+            &mut app,
+            &ctx,
+            hover_raw(&[dir.join("a.txt"), dir.join("b.txt")]),
+        );
+        assert!(
+            find_text(&out, "松开打开 2 项").is_some(),
+            "悬停多项时没报数量：{:?}",
+            texts(&out)
+        );
+
+        let out = frame(&mut app, &ctx, vec![]);
+        assert!(
+            find_text(&out, "松开打开 a.txt").is_none(),
+            "松手以后提示还赖着"
+        );
     }
 
     /// 两个不同目录下的同名文件一起开着，标签条得能认出哪一个是哪一个。
