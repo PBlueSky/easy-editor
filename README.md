@@ -26,7 +26,7 @@ The release package is a **single exe** (about 12 MB, 5.2 MB zipped). No .NET, n
 | Feature | In one line | Details |
 |---|---|---|
 | Code editing | Line numbers, current-line highlight, syntect grammar highlighting; long lines either wrap or scroll sideways | [Editing](#editing) |
-| Multiple terminals | Real PTYs via `portable-pty`, VT parsing via `alacritty_terminal`; open several and let each run its own thing | [Terminal](#terminal) |
+| Multiple terminals | Real PTYs via `portable-pty`, VT parsing via `alacritty_terminal`; open several and let each run its own thing. Five shells are auto-detected, anything else (MSYS2, busybox) you add yourself | [Terminal](#terminal) |
 | Recursive split panes | The tmux / i3 binary pane tree — split as deep as you like, default keys match Windows Terminal | [Split panes](#split-panes) |
 | Journal blocks | Task blocks written directly into ordinary text files, mixed with prose and versioned with git | [Journal blocks](#journal-blocks) |
 | SQL blocks | Jupyter-style: the query lives in a plain text file, `Ctrl+Enter` runs it and the result lands below the editor. `Ctrl+Alt+N` starts a fresh `query-<timestamp>.sql` with the connection already bound | [SQL blocks](#sql-blocks) |
@@ -43,7 +43,7 @@ The release package is a **single exe** (about 12 MB, 5.2 MB zipped). No .NET, n
 | East Asian input methods | Pinyin and Japanese work in the new-file dialog, the rename box, the editor body and the terminal | [Input methods](#input-methods) |
 | CJK / Latin alignment | Baselines are corrected, so Chinese glyphs do not sink to the bottom of the line | [CJK baseline](#cjk-baseline) |
 | Light and dark themes | Repaints the Windows system title bar colour and button glyphs along with them | [System title bar](#the-system-title-bar-has-to-be-repainted-by-hand) |
-| Two font-size knobs | *UI font size* moves every piece of text outside the editor — top bar, sidebar, tabs, results dock, every pop-up window; *editor font size* covers only the editor and terminal body, and is what `Ctrl+=` changes. Row heights, column widths and button sizes are measured from the font rather than written down | [Settings window](#settings-window) |
+| Two font-size knobs | *UI font size* moves every piece of text outside the editor — top bar, sidebar, tabs, results dock, every pop-up window; *editor font size* covers only the editor and terminal body, and is what `Ctrl+=` changes. Row heights, column widths and button sizes are measured from the font rather than written down, and the sliders only take effect when you press `应用` — dragging them live made the whole page flicker | [Settings window](#settings-window) |
 | One settings window | Left-hand sections: Appearance / Keybindings / Terminal / System / Database. The old keybinding panel, terminal-settings window and the `.txt` switch all moved inside; the top bar's `?` and `⚙` are just shortcuts to a section | [Settings window](#settings-window) |
 | Custom keybindings | `F1` opens the settings window on the Keybindings section: click, press the new chord, done. Conflicts are flagged in red | [Customizing keybindings](#customizing-keybindings) |
 | Persistent settings | Both font sizes, theme, terminal preferences and your key changes all live in `%APPDATA%\easy-editor\config.json` | [Configuration](#configuration) |
@@ -315,7 +315,7 @@ Whatever you can click should look clickable, and this round pushed that through
 
 ``Ctrl+` `` focuses a terminal pane (opening one if there is none), ``Ctrl+Shift+` `` always opens a new one. Right-clicking a folder in the file tree — or a file inside one — and choosing "Open terminal here" starts the new shell in that directory.
 
-The terminal is not a dedicated bottom panel: it is **a pane in the same tree as the editor**. By default it splits to the right of the current pane, and you can line up several, each running its own shell. The `shell:` dropdown in the toolbar picks *which shell the next terminal uses*, auto-detecting PowerShell 7 / Windows PowerShell / cmd / Git Bash / WSL on your machine; already-open terminals are unaffected.
+The terminal is not a dedicated bottom panel: it is **a pane in the same tree as the editor**. By default it splits to the right of the current pane, and you can line up several, each running its own shell. The `shell:` dropdown in the toolbar picks *which shell the next terminal uses*, auto-detecting PowerShell 7 / Windows PowerShell / cmd / Git Bash / WSL on your machine plus any custom entry you added in settings; already-open terminals are unaffected.
 
 When a terminal has focus, `Tab` (completion), the arrow keys (history / cursor movement) and `Esc` are handled by the terminal itself and are not stolen by egui to move widget focus. After selecting text with the mouse:
 
@@ -339,6 +339,19 @@ Auto-detection does not always find things (Git Bash missing from PATH, for exam
 ```
 
 Shell ids are `pwsh` / `powershell` / `cmd` / `gitbash` / `wsl`; `terminal_args` is space-separated, quote arguments that contain spaces.
+
+**Anything outside those five can be added.** If the bash you actually use is not one of them — MSYS2, Cygwin, a git-bash installed somewhere unusual, busybox sh — the `+ 新增自定义 shell` button at the bottom of the section adds an entry that appears in the picker immediately; selecting it swaps the form to **display name** / **program path** / **startup arguments**, and changes apply as you type. `删除这条` removes only the record, never the executable.
+
+```json
+{
+  "terminal_shell": "custom:custom-1",
+  "terminal_custom_shells": [
+    { "id": "custom-1", "name": "MSYS2 Bash", "program": "D:/msys64/usr/bin/bash.exe", "args": "--login -i" }
+  ]
+}
+```
+
+Custom entries are referenced by `id`, so `terminal_shell` stores `custom:<id>` rather than the display name — renaming "MSYS2 Bash" does not orphan the preference or the panes already running it. A blank name shows as "未命名 shell" so the row is still clickable and legible. A blank path deliberately *stays* in the list: filtering out unusable entries would make a just-added row vanish before you have anywhere to type the path, so instead the form states that the path is still empty and starting a terminal with it reports the name and the missing path rather than silently falling back to cmd. Entries with a blank or duplicate `id` are dropped when the config is loaded — nothing can reference the first, and the second puts the same name in the picker twice.
 
 ### Split panes
 
@@ -384,13 +397,17 @@ Opened by the top bar's `⚙`, by `?`, or by `F1` — a section list on the left
 
 | Section | What is in it |
 |---|---|
-| Appearance | **UI font size** (10–20, in 0.5 steps), **editor font size** (10–28), light / dark, long-line word wrap |
+| Appearance | **UI font size** (10–20, in 0.5 steps) and **editor font size** (10–28), both staged behind `应用` / `放弃改动`; light / dark, long-line word wrap |
 | Keybindings | The whole action table: click a row, then type the new chord. Conflicts turn red; each row has `reset`, and there is `restore all defaults` |
-| Terminal | Which shell a new terminal uses, plus that shell's program path and startup arguments |
+| Terminal | Which shell a new terminal uses; the five built-in shells can have their path and arguments overridden, and `+ 新增自定义 shell` adds one the picker does not know |
 | System | The `.txt` association switch, the config file path and a "reveal in folder" button |
 | Database | The button that opens the connection manager, plus "N saved connections, the default is X" and what `conn=` does |
 
 **The two font sizes each own their half.** There used to be one adjustable size, and it only covered the editor and terminal body: every other piece of text in the app had its own literal written at the call site, so "I raised the font size and nothing outside the editor moved" was simply true. The UI slider now drives the style table's five rungs (Body / Button / Small / Heading / Monospace), and everything outside the editor takes its size from those rungs. Geometry has to follow the font or the text ends up drawn on itself, so the keybinding table measures its two columns from the widest label at the current size, row heights come from `Ui::text_style_height`, and window widths and the wrap threshold in the top bar are converted through `theme::scale`.
+
+**Which is exactly why the sliders do not apply live.** Dragging one used to repaint the whole app per event: re-rasterising the font atlas, then re-laying out every panel, every row height and every button — and the slider itself moves under the pointer while you are holding it. That reads as the page strobing. Dragging now writes `pending_ui_font` / `pending_font`, and only `应用` (disabled while nothing has changed) hands them to the setters that re-apply the style and persist it; `放弃改动` pulls the staged values back, and so does closing the window, so a slider can never sit at a value that is quietly not in effect. The muted line under them spells out what is pending ("UI 13.5 → 15.0, editor 14 → 16").
+
+Two things deliberately stayed live: the top bar's `- 14 +` and `Ctrl+=` step one notch per press, which produces no event storm and which you reach for constantly, and the light/dark and word-wrap switches, which change no glyph metrics.
 
 The window is resizable from its bottom-right corner and stays where you drag it: it only asks to be centred during the first few frames, because an `anchor()` applied every frame pins the window dead centre and it can no longer be moved.
 
@@ -458,7 +475,7 @@ Every key it writes is under its own names (`EasyEditor.txt`, `Applications\<exe
 
 ## Configuration
 
-Font size (`font_size` is the editor and terminal body, `ui_font_size` is everything else on screen), theme, sidebar visibility, active sidebar tab, hidden-file visibility, word wrap, the `.txt` association switch, last workspace, terminal preferences, database connections and your keybinding changes are stored automatically in `%APPDATA%\easy-editor\config.json` and restored on the next start. Fields that are not written fall back to defaults (`ui_font_size: 13.5`, `font_size: 14.0`, `word_wrap: false` i.e. long lines scroll sideways; `txt_association: true`; `db_connections: []`). Writes are debounced by 600 ms (so dragging the font size does not hammer the disk) and flushed once more on exit.
+Font size (`font_size` is the editor and terminal body, `ui_font_size` is everything else on screen), theme, sidebar visibility, active sidebar tab, hidden-file visibility, word wrap, the `.txt` association switch, last workspace, terminal preferences (including the `terminal_custom_shells` you added yourself), database connections and your keybinding changes are stored automatically in `%APPDATA%\easy-editor\config.json` and restored on the next start. Fields that are not written fall back to defaults (`ui_font_size: 13.5`, `font_size: 14.0`, `word_wrap: false` i.e. long lines scroll sideways; `txt_association: true`; `db_connections: []`; `terminal_custom_shells: []`). Writes are debounced by 600 ms and flushed once more on exit; the font sliders in the settings window only write when you press `应用`, so dragging never touches the file at all.
 
 ```json
 {
@@ -602,7 +619,7 @@ The two icons cover different surfaces:
 
 - **Only Windows 10 / 11 x64 has been used day to day.** Windows-specific code (system title bar colours, exe resources, console switches) is wrapped in `#[cfg(windows)]`; other platforms should compile, but nobody has verified them.
 - **`.txt` association is registration, not takeover.** EasyEditor appears in "Open with" and in Settings → Default apps; it does not quietly become your default text editor, and on Win10/11 a program cannot make itself one — `UserChoice` is hash-protected ([why](#txt-file-association)).
-- Terminal shell auto-detection covers PowerShell 7 / Windows PowerShell / cmd / Git Bash / WSL. If it misses one, set the path by hand in the settings window's Terminal section.
+- Terminal shell auto-detection covers PowerShell 7 / Windows PowerShell / cmd / Git Bash / WSL. If it misses one, set the path by hand in the settings window's Terminal section — or add the shell itself with `+ 新增自定义 shell` if it is not one of those five flavours.
 - Large files rendered in read-only virtual mode (> 1 MB or > 20,000 lines) neither wrap nor scroll horizontally — widen the pane to see a long line. These files also refuse formatting.
 - Files over 16 MB are refused outright, with a message in the status bar.
 - CJK glyph widths depend on `unicode-width` plus Microsoft YaHei; switch fonts and the baseline alignment parameters (see [CJK baseline](#cjk-baseline)) probably need recomputing.
@@ -750,7 +767,23 @@ After the results strip was unified, the rest of the app still held a hundred-od
 
 The new number is `ui_font_size`, spread by `theme::apply_style` over the style table's five rungs; everywhere outside the editor is now only allowed to take a rung (`theme::sm` / `md` / `xs` / `display`, all derived from Body). What made this more than a find-and-replace was **geometry**: raise the font and the row heights, column widths, button sizes and window widths all have to follow, or the text draws on itself. So the keybinding table's two columns are now "measure the widest label in this batch at the current size", list rows take `Ui::text_style_height`, and window widths plus the top bar's wrap threshold go through `theme::scale` — leaving that at a literal 380 pt meant a large UI font pushed the right-hand group straight through the left-hand buttons.
 
-Two traps for the tests. The `保存` button is a usable probe because its height is font-derived, so the assertion is "raise the UI font and that button grows by more than 15%, stays on screen, and no two pieces of top-bar text overlap". And headless tests read the **user's own** `config.json`, where `font_size` happens to be 15 rather than the default 14 — so "changing the UI font must not touch the editor font" has to snapshot the current value instead of comparing against `EDITOR_FONT_DEFAULT`.
+Two traps for the tests. The `保存` button is a usable probe because its height is font-derived, so the assertion is "raise the UI font and that button grows by more than 15%, stays on screen, and no two pieces of top-bar text overlap". And headless tests read the **user's own** `config.json`, where `font_size` happens to be 15 rather than the default 14 — so "changing the UI font must not touch the editor font" has to snapshot the current value instead of comparing against `EDITOR_FONT_DEFAULT`. "The top bar fits on one row at 1400 pt" turned out to drift with the UI font too, for the same reason: any assertion that talks about concrete pixel widths has to start with `set_ui_font_size(theme::UI_FONT_DEFAULT, &ctx)` rather than hoping the user's file happens to be default.
+
+### A slider that applies live flickers right under the pointer
+
+The font sliders used to take effect on every drag event, and the report was that the page strobed. That is not slow drawing: `ui_font_size` drives all five style rungs, so each event re-rasterises the font atlas and re-lays out every panel — row heights, column widths, button sizes and card splits are all functions of the font — and the slider you are holding gets re-laid out from under your finger.
+
+Dragging now writes `pending_ui_font` / `pending_font`; only the `应用` button (disabled while nothing is pending) calls the real setters, which re-apply the style and mirror the committed value back. Three details carry the weight: `恢复默认` also stages rather than commits, so "reset" is still a suggestion you have to accept; `放弃改动` **and closing the window** pull the staged values back to the live ones, because otherwise the slider would sit at a value that silently is not in effect and the next time you open the window you would be editing a ghost; and the muted line under the sliders states the pending change explicitly.
+
+The top bar's `- 14 +` and `Ctrl+=` stayed live on purpose — one notch per press produces no event storm, and they are the controls you reach for without thinking, so routing them through a button would make them worse. Theme and word wrap likewise stay live; neither touches glyph metrics.
+
+### Custom shells are claimed by id, not by name
+
+The five built-in shells are a `Copy` enum and the settings could only override their paths — there was no way to get a sixth. MSYS2, Cygwin and busybox need the user to name a program, and an enum is not a closed set any more, so the model became `Shell::Builtin(ShellKind)` / `Shell::Custom(CustomShell)` and `Shell` stopped being `Copy`: selection, pane titles and `spawn` all go through clones and references now.
+
+What actually cost something was **losing the selection while renaming**. `refresh()` recomputes the available list and then re-claims the current shell *by id*, which is why `terminal_shell` stores `custom:custom-1` instead of the display name — rename "MSYS2 Bash" to whatever you like and the picker still points at it, and the ids come from the first unused `custom-N` so deleting and re-adding cannot collide.
+
+One deliberate counter-intuition: **a custom entry with an empty path stays in the picker.** Filtering the list down to usable entries would make the row you just added disappear before you had anywhere to type the path, so it is listed, the form says plainly that the path is still empty, and starting a terminal with it fails with the entry's name and the missing path instead of quietly spawning cmd.
 
 ### Asking "how much width is left" inside an `auto_sized` window asks for infinity
 
@@ -759,6 +792,8 @@ The connection manager is a `Window::auto_sized()`. Turning its form into two co
 The fix is that this window's body width is a locked constant (460 pt at the default UI font, pushed into both `set_min_width` and `set_max_width`), and every column, card cell and list row is computed downward from that single number through `theme::scale` — never from what the layout claims is left. Locking the width earns its keep twice over: long paths and server error strings used to expand an `auto_sized` window until it ran off the screen.
 
 One more thing the headless test had to learn here: an `auto_sized` window **grows** when the form opens after you click a connection, so assertions about the form have to filter by the `area_rect` read after that click. Using the rect captured before it reports every newly grown row as "not painted".
+
+The third trap was text from *behind* the window leaking into the results. The welcome page's big headings sit inside the floating window's rect, so "no two labels in the window overlap" was failing on pairs that were never in the window. Filtering by clip rect is the right idea but not with `area.contains_rect(c.clip_rect)`: egui's clip rects only extend down-and-right to the screen edge — the window's own content pass is `[464,294] - [1400,880]` while the window rect is `[463,293] - [937,588]` — so `contains_rect` rejects the window's own text and the test flips to complaining that the list never painted `本机`. The corner you can trust is the top-left: content belonging to an area never starts its clip outside it, hence `area.contains(c.clip_rect.min)`.
 
 ## Contributing and license
 

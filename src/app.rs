@@ -21,7 +21,7 @@ use crate::results::{self, ResultsDock, Settled};
 use crate::search::SearchState;
 use crate::sql;
 use crate::syntax::Highlighter;
-use crate::terminal::{TerminalPanel, TerminalSettings};
+use crate::terminal::{CustomShell, Shell, ShellKind, TerminalPanel, TerminalSettings};
 use crate::theme;
 use crate::titlebar;
 
@@ -145,6 +145,11 @@ pub struct EasyEditorApp {
     font_size: f32,
     /// 界面字号：非编辑区所有文字跟着它走（见 `theme` 模块头）
     ui_font: f32,
+    /// 「外观」分区里滑块正在调的两个字号。拖动只改这里，点「应用」才写回上面那两个。
+    /// 即时生效的话，每来一次拖动事件就要重铺字体图集、整页重排——连滑块自己都会被挪走，
+    /// 界面就在指针底下闪。设置窗口关掉时这份暂存会被丢掉。
+    pending_font: f32,
+    pending_ui_font: f32,
     dark: bool,
     /// 主窗口的原生句柄，用来把系统标题栏刷成当前主题；无头测试里是 `None`
     hwnd: Option<isize>,
@@ -315,6 +320,7 @@ impl EasyEditorApp {
                 TerminalSettings::from_config(
                     &config.data.terminal_programs,
                     &config.data.terminal_args,
+                    &config.data.terminal_custom_shells,
                 ),
             ),
             search: SearchState::default(),
@@ -322,6 +328,8 @@ impl EasyEditorApp {
             hl: Highlighter::new(dark),
             font_size,
             ui_font,
+            pending_font: font_size,
+            pending_ui_font: ui_font,
             dark,
             hwnd: None,
             word_wrap,
@@ -453,19 +461,23 @@ impl EasyEditorApp {
             self.config.data.keymap = km;
             changed = true;
         }
-        // 终端：默认种类 + 路径/参数覆盖。覆盖项先去掉空串再比，配置文件才不会长毛。
-        let pref = self.terminal.shell.id().to_string();
+        // 终端：默认种类 + 路径/参数覆盖 + 自己加的 shell。覆盖项先去掉空串再比，配置文件才不会长毛。
+        let pref = self.terminal.shell.id();
         if self.config.data.terminal_shell != pref {
             self.config.data.terminal_shell = pref;
             changed = true;
         }
-        let (programs, args) = self.terminal.settings.to_config();
+        let (programs, args, customs) = self.terminal.settings.to_config();
         if self.config.data.terminal_programs != programs {
             self.config.data.terminal_programs = programs;
             changed = true;
         }
         if self.config.data.terminal_args != args {
             self.config.data.terminal_args = args;
+            changed = true;
+        }
+        if self.config.data.terminal_custom_shells != customs {
+            self.config.data.terminal_custom_shells = customs;
             changed = true;
         }
         // 连接列表整份比：条目不多，而「少存了一条连接」比多写几字节贵得多
@@ -2381,6 +2393,7 @@ impl EasyEditorApp {
 
     fn set_font_size(&mut self, size: f32, ctx: &egui::Context) {
         self.font_size = size.clamp(theme::EDITOR_FONT_MIN, theme::EDITOR_FONT_MAX);
+        self.pending_font = self.font_size;
         let _ = ctx;
     }
 
@@ -2388,6 +2401,7 @@ impl EasyEditorApp {
     /// 否则要等到下次切主题才看得出动静。
     fn set_ui_font_size(&mut self, size: f32, ctx: &egui::Context) {
         self.ui_font = size.clamp(theme::UI_FONT_MIN, theme::UI_FONT_MAX);
+        self.pending_ui_font = self.ui_font;
         theme::apply_style(ctx, self.dark, self.ui_font);
     }
 
@@ -2781,7 +2795,7 @@ impl EasyEditorApp {
                 }
                 let h_dec = hint("font_dec");
                 if ui.small_button("-").on_hover_text(h_dec).clicked() {
-                    self.font_size = (self.font_size - 1.0).max(theme::EDITOR_FONT_MIN);
+                    self.set_font_size(self.font_size - 1.0, ui.ctx());
                 }
                 ui.label(
                     RichText::new(format!("{:.0}", self.font_size))
@@ -2790,7 +2804,7 @@ impl EasyEditorApp {
                 );
                 let h_inc = hint("font_inc");
                 if ui.small_button("+").on_hover_text(h_inc).clicked() {
-                    self.font_size = (self.font_size + 1.0).min(theme::EDITOR_FONT_MAX);
+                    self.set_font_size(self.font_size + 1.0, ui.ctx());
                 }
 
                 if let Some(root) = &self.root {
@@ -4062,6 +4076,9 @@ impl EasyEditorApp {
     /// 合成一个窗口后入口只剩这一个，顶栏的 `?` 与 `⚙` 只是各自跳到对应分区。
     fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.show_settings {
+            // 没开着就没有「还没应用」这回事：把暂存对齐回实际值，下次打开照实显示
+            self.pending_font = self.font_size;
+            self.pending_ui_font = self.ui_font;
             return;
         }
         // 录制中：把这一帧的按键抓下来当新绑定。抓在窗口壳里而不放在分区里，
@@ -4153,20 +4170,24 @@ impl EasyEditorApp {
     /// 两个字号各管一摊：界面字号管编辑区以外的所有文字（档位怎么由它铺开见 `theme`
     /// 模块头「字号只有一处来源」），编辑器字号只管编辑器和终端正文。
     /// 以前只有后面那一个旋钮，所以「字号调了，只有编辑器动，别处纹丝不动」。
+    ///
+    /// 字号拖动只写 `pending_*`，点「应用」才提交：改界面字号要重铺字体图集并让整页重排，
+    /// 拖动过程中每一帧都排一次，滑块自己也会被挪走，看起来就是整片在闪。
+    /// 主题和自动换行不动字形度量，仍然即时生效。
     fn settings_appearance(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         setting_head(ui, "界面字号");
         muted_line(ui, "顶栏、侧栏、页签、结果区和各个窗口里的字一起跟着这一档走。");
         ui.horizontal(|ui| {
-            let mut size = self.ui_font;
-            let slider = egui::Slider::new(&mut size, theme::UI_FONT_MIN..=theme::UI_FONT_MAX)
-                .step_by(0.5)
-                .text("点");
-            if ui.add(slider).changed() {
-                self.set_ui_font_size(size, &ctx);
-            }
+            let slider = egui::Slider::new(
+                &mut self.pending_ui_font,
+                theme::UI_FONT_MIN..=theme::UI_FONT_MAX,
+            )
+            .step_by(0.5)
+            .text("点");
+            ui.add(slider);
             if ui.button("恢复默认").clicked() {
-                self.set_ui_font_size(theme::UI_FONT_DEFAULT, &ctx);
+                self.pending_ui_font = theme::UI_FONT_DEFAULT;
             }
         });
 
@@ -4174,18 +4195,56 @@ impl EasyEditorApp {
         setting_head(ui, "编辑器字号");
         muted_line(ui, "只管编辑器正文和终端正文；Ctrl+= 与 Ctrl+- 调的是这一档。");
         ui.horizontal(|ui| {
-            let mut size = self.font_size;
-            let slider =
-                egui::Slider::new(&mut size, theme::EDITOR_FONT_MIN..=theme::EDITOR_FONT_MAX)
-                    .step_by(1.0)
-                    .text("点");
-            if ui.add(slider).changed() {
-                self.set_font_size(size, &ctx);
-            }
+            let slider = egui::Slider::new(
+                &mut self.pending_font,
+                theme::EDITOR_FONT_MIN..=theme::EDITOR_FONT_MAX,
+            )
+            .step_by(1.0)
+            .text("点");
+            ui.add(slider);
             if ui.button("恢复默认").clicked() {
-                self.set_font_size(theme::EDITOR_FONT_DEFAULT, &ctx);
+                self.pending_font = theme::EDITOR_FONT_DEFAULT;
             }
         });
+
+        ui.add_space(8.0);
+        let dirty = self.pending_ui_font != self.ui_font || self.pending_font != self.font_size;
+        ui.horizontal(|ui| {
+            let apply = ui
+                .add_enabled(
+                    dirty,
+                    egui::Button::new(RichText::new("应用").size(theme::md(ui))),
+                )
+                .on_hover_cursor(theme::HAND);
+            if apply.clicked() {
+                let (next_ui, next_editor) = (self.pending_ui_font, self.pending_font);
+                self.set_ui_font_size(next_ui, &ctx);
+                self.set_font_size(next_editor, &ctx);
+                self.status = format!(
+                    "字号已应用：界面 {next_ui:.1} 点，编辑器 {next_editor:.1} 点"
+                );
+            }
+            if dirty
+                && ui
+                    .button("放弃改动")
+                    .on_hover_cursor(theme::HAND)
+                    .clicked()
+            {
+                self.pending_ui_font = self.ui_font;
+                self.pending_font = self.font_size;
+            }
+        });
+        muted_line(
+            ui,
+            if dirty {
+                format!(
+                    "有未应用的改动：界面 {} → {}，编辑器 {} → {}。",
+                    self.ui_font, self.pending_ui_font, self.font_size, self.pending_font
+                )
+            } else {
+                "拖动滑块界面不会跟着动，点「应用」才换字号。".to_string()
+            },
+        );
 
         ui.add_space(12.0);
         setting_head(ui, "主题");
@@ -4273,9 +4332,10 @@ impl EasyEditorApp {
         muted_line(ui, "不同连接各跑各的：自动执行闸按连接分开，一条在等回包不挡另一条。");
     }
 
-    /// 「终端」分区：选 shell、给选中的那种指定程序路径和启动参数，改动直接进 config.json。
+    /// 「终端」分区：选 shell、改它的路径和启动参数，或者自己加一条，改动直接进 config.json。
     ///
-    /// 装在非标准目录的 Git Bash（`which` 和内置候选都摸不到）靠这两栏才起得来。
+    /// 装在非标准目录的 Git Bash（`which` 和内置候选都摸不到）靠路径覆盖才起得来；
+    /// 内置那五种之外的 shell（装在别处的 MSYS2、busybox……）靠底下的「新增自定义」。
     fn settings_terminal(&mut self, ui: &mut Ui) {
         ui.label(
             RichText::new("新建终端用哪种 shell")
@@ -4286,18 +4346,43 @@ impl EasyEditorApp {
         egui::ComboBox::from_id_salt("shell_picker_settings")
             .selected_text(self.terminal.shell.label())
             .show_ui(ui, |ui| {
-                for kind in self.terminal.available.clone() {
+                for shell in self.terminal.available.clone() {
                     if ui
-                        .selectable_label(self.terminal.shell == kind, kind.label())
+                        .selectable_label(self.terminal.shell == shell, shell.label())
                         .clicked()
                     {
-                        self.terminal.shell = kind;
+                        self.terminal.shell = shell;
                     }
                 }
             });
         ui.separator();
 
-        let kind = self.terminal.shell;
+        // 内置的和自定义的填法不一样：前者填的是「覆盖」，后者填的就是那一条本身
+        let shell = self.terminal.shell.clone();
+        match shell {
+            Shell::Builtin(kind) => self.shell_fields_builtin(ui, kind),
+            Shell::Custom(c) => self.shell_fields_custom(ui, c),
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+        if ui
+            .button("+ 新增自定义 shell")
+            .on_hover_cursor(theme::HAND)
+            .on_hover_text("给装在别处的 shell 加一条，加完就在上面的下拉里，填好路径即可新建终端")
+            .clicked()
+        {
+            self.terminal.add_custom();
+            self.status = "新加了一条自定义 shell，填上程序路径就能用".to_string();
+        }
+        muted_line(
+            ui,
+            format!("改动即时生效，并写进 {}", config::Config::path().display()),
+        );
+    }
+
+    /// 内置 shell：程序路径与启动参数的**覆盖项**，留空回到自动探测 / 内置参数。
+    fn shell_fields_builtin(&mut self, ui: &mut Ui, kind: ShellKind) {
         let id = kind.id().to_string();
         // 先取本地副本：闭包里既要读又要写 self.terminal.settings，直接借会打架
         let mut program = self
@@ -4322,11 +4407,7 @@ impl EasyEditorApp {
         );
         ui.separator();
 
-        ui.label(
-            RichText::new("程序路径（留空 = 自动探测）")
-                .size(crate::theme::sm(ui))
-                .weak(),
-        );
+        field_label(ui, "程序路径（留空 = 自动探测）");
         let p_resp = ui.add(
             egui::TextEdit::singleline(&mut program)
                 .hint_text(r"C:\Program Files\Git\bin\bash.exe")
@@ -4342,21 +4423,13 @@ impl EasyEditorApp {
         }
 
         ui.add_space(6.0);
-        ui.label(
-            RichText::new("启动参数（留空 = 内置参数）")
-                .size(crate::theme::sm(ui))
-                .weak(),
-        );
+        field_label(ui, "启动参数（留空 = 内置参数）");
         let a_resp = ui.add(
             egui::TextEdit::singleline(&mut args)
                 .hint_text("例如：-NoProfile -NoLogo")
                 .desired_width(f32::INFINITY),
         );
         muted_line(ui, "按空格拆分，带空格的参数用双引号包住。");
-        muted_line(
-            ui,
-            format!("改动即时生效，并写进 {}", config::Config::path().display()),
-        );
 
         ui.add_space(6.0);
         let mut cleared = false;
@@ -4377,6 +4450,68 @@ impl EasyEditorApp {
                 .insert(id, args.trim().to_string());
             // 路径可能让某个种类从「没有」变成「可用」，可用列表要跟着重算
             self.terminal.refresh();
+        }
+    }
+
+    /// 自定义 shell：名字、路径、参数都是**这一条自己的**内容，没有「回到默认」可言。
+    fn shell_fields_custom(&mut self, ui: &mut Ui, shell: CustomShell) {
+        let id = shell.id.clone();
+        let mut name = shell.name;
+        let mut program = shell.program;
+        let mut args = shell.args;
+
+        ui.label(
+            RichText::new(format!("自定义 shell（{id}）"))
+                .size(crate::theme::md(ui))
+                .strong(),
+        );
+        ui.separator();
+
+        field_label(ui, "显示名称");
+        let n_resp = ui.add(
+            egui::TextEdit::singleline(&mut name)
+                .hint_text("例如：MSYS2 Bash")
+                .desired_width(f32::INFINITY),
+        );
+
+        ui.add_space(6.0);
+        field_label(ui, "程序路径");
+        let p_resp = ui.add(
+            egui::TextEdit::singleline(&mut program)
+                .hint_text(r"D:\Softwares\msys64\usr\bin\bash.exe")
+                .desired_width(f32::INFINITY),
+        );
+        let path = program.trim().to_string();
+        if path.is_empty() {
+            muted_line(ui, "路径还空着，这时候新建终端选了它会起不来。");
+        } else if !Path::new(&path).is_file() {
+            ui.colored_label(ui.visuals().error_fg_color, "这个路径现在还不存在");
+        } else {
+            muted_line(ui, format!("启动的就是这个：{path}"));
+        }
+
+        ui.add_space(6.0);
+        field_label(ui, "启动参数（留空 = 不带参数）");
+        let a_resp = ui.add(
+            egui::TextEdit::singleline(&mut args)
+                .hint_text("例如：-i -l")
+                .desired_width(f32::INFINITY),
+        );
+        muted_line(ui, "按空格拆分，带空格的参数用双引号包住。");
+
+        ui.add_space(6.0);
+        if n_resp.changed() || p_resp.changed() || a_resp.changed() {
+            self.terminal
+                .update_custom(&id, &name, &program, &args);
+        }
+        if ui
+            .button("删除这条")
+            .on_hover_cursor(theme::HAND)
+            .on_hover_text("只删这条自定义记录，那个程序本身不动")
+            .clicked()
+        {
+            self.terminal.remove_custom(&id);
+            self.status = "已删除这条自定义 shell".to_string();
         }
     }
 
@@ -4627,13 +4762,14 @@ impl eframe::App for EasyEditorApp {
     }
 }
 
-/// 窄面板里的一行说明：超宽就截断，全文交给悬浮提示。
-///
-/// 浮窗宽度是固定的，而 `C:\Users\<很长>\AppData\Roaming\...` 这种串没有可折行的空格，
-/// 直接 label 会横着捅穿窗口边框，盖住底下的内容。
 /// 设置页每条的小标题。
 fn setting_head(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).size(crate::theme::md(ui)).strong());
+}
+
+/// 输入框上面那一行的字段名。
+fn field_label(ui: &mut Ui, text: &str) {
+    ui.label(RichText::new(text).size(crate::theme::sm(ui)).weak());
 }
 
 /// 一行次要说明：字号走小字档，太长就截断，完整内容挂悬浮。
@@ -5095,7 +5231,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         app.tree.as_mut().unwrap().expanded.insert(dir.join("sub"));
         app.terminal.settings = TerminalSettings::default();
-        app.terminal.shell = crate::terminal::ShellKind::Cmd;
+        app.terminal.shell = Shell::Builtin(crate::terminal::ShellKind::Cmd);
 
         let before = app.terminal.len();
         let out = frame(&mut app, &ctx, vec![]);
@@ -5346,6 +5482,17 @@ mod tests {
         out.shapes.iter().find_map(|c| walk(&c.shape, &pred))
     }
 
+    /// 这一笔绘制是不是从 `area` 那一格里开始画的。
+    ///
+    /// 光比文字矩形不够：窗口浮在欢迎页上时，欢迎页那几行大字也落在窗口那块矩形里，
+    /// 「窗口里的文字不许互相压着」就全是假阳性。裁剪框能分开两者，但不能反着比大小——
+    /// egui 的裁剪框只往右下开到屏幕边缘（窗口内容那一格是 `窗口左上角 → 屏幕右下角`），
+    /// 所以 `contains_rect` 永远不成立。能信的是左上角：谁的内容就谁的框，
+    /// 起点不会跑到自己外面去。
+    fn clipped_in(c: &egui::epaint::ClippedShape, area: Rect) -> bool {
+        area.contains(c.clip_rect.min)
+    }
+
     /// 落在 `area` 里的、文字正好等于 `needle` 的那些矩形。
     ///
     /// 「终端」「数据库」这类导航项的名字在顶栏和侧栏也各有一份，光按文字找会先捡到
@@ -5371,6 +5518,9 @@ mod tests {
         }
         let mut hits = Vec::new();
         for c in &out.shapes {
+            if !clipped_in(c, area) {
+                continue;
+            }
             walk(&c.shape, needle, area, &mut hits);
         }
         hits
@@ -5399,6 +5549,9 @@ mod tests {
         }
         let mut hits = Vec::new();
         for c in &out.shapes {
+            if !clipped_in(c, area) {
+                continue;
+            }
             walk(&c.shape, area, &mut hits);
         }
         hits
@@ -5810,12 +5963,23 @@ mod tests {
                 && window.expand2(Vec2::splat(1.0)).contains(clear.max),
             "「清除覆盖」跑到窗口外了：{clear:?}，窗口 {window:?}"
         );
-        // 说明文字在按钮上面：终端分区改完即时生效，不再摆一个「完成」
+        // 「新增自定义 shell」排在整张表单下面：它是给列表添新条目的，不属于当前这条
+        let add = find_text(&out, "+ 新增自定义 shell").expect("没画出「+ 新增自定义 shell」");
+        assert!(
+            window.expand2(Vec2::splat(1.0)).contains(add.min)
+                && window.expand2(Vec2::splat(1.0)).contains(add.max),
+            "「新增自定义 shell」跑到窗口外了：{add:?}，窗口 {window:?}"
+        );
+        assert!(
+            add.min.y > clear.min.y,
+            "新增按钮排到了表单字段中间：新增 {add:?}，清除覆盖 {clear:?}"
+        );
         let footer = text_rect_where(&out, |t| t.starts_with("改动即时生效"))
             .expect("没画出「改动即时生效…」这行");
         assert!(
-            footer.max.y <= clear.min.y + 1.0,
-            "按钮排到了说明文字上面：按钮 {clear:?}，说明 {footer:?}"
+            window.expand2(Vec2::splat(1.0)).contains(footer.min)
+                && window.expand2(Vec2::splat(1.0)).contains(footer.max),
+            "「改动即时生效…」这行跑到窗口外了：{footer:?}，窗口 {window:?}"
         );
 
         let title = text_rects_in(&out, window, "设置")
@@ -6471,6 +6635,8 @@ mod tests {
         let (ctx, mut app, _dir) = app_in_folder("easy-editor-app-toolbar", "a\n");
         // 那个按钮写「深色」还是「浅色」跟着 self.dark 走，钉死免得跟着用户配置漂
         app.dark = false;
+        // 「1400 宽必须排成一排」同样是字号的函数：不钉死，用户把界面字号调大一点就判失败
+        app.set_ui_font_size(theme::UI_FONT_DEFAULT, &ctx);
         let mut want = TOOLBAR_LABELS.to_vec();
         want.sort_unstable();
 
@@ -6595,6 +6761,124 @@ mod tests {
             app.font_size, editor_before,
             "界面字号这一档改掉了编辑器字号"
         );
+    }
+
+    /// 拖动字号滑块时界面不能跟着动，点「应用」才换字号。
+    ///
+    /// 即时生效那一版被反馈「页面快速闪烁」：改界面字号要重铺字体图集并让整页重排，
+    /// 拖动过程中每一帧排一次，连滑块自己都在指针底下挪，看起来就是整片在抖。
+    /// 现在滑块只写 `pending_*`，提交走「应用」这一颗。
+    #[test]
+    fn font_slider_waits_for_the_apply_button() {
+        let (ctx, mut app, _dir) = app_in_folder("easy-editor-app-font-apply", "a\n");
+        let chip = |app: &mut EasyEditorApp| -> Rect {
+            let v = settled_toolbar(app, &ctx, SCREEN);
+            v.iter()
+                .find(|(s, _)| s == "保存")
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| panic!("顶栏里没画出「保存」"))
+        };
+        app.open_settings(SettingsSection::Appearance);
+        for _ in 0..5 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let live_before = app.ui_font;
+        let chip_before = chip(&mut app);
+        let out = frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.pending_ui_font, live_before,
+            "刚打开就该和实际字号一致"
+        );
+
+        // 「拖」滑块：从滑块右端往右挪一段。落点用旁边的「恢复默认」当尺子——
+        // 滑块横向铺在这一排里，往左退一档一定还在滑块上（`find_text` 给的第一个
+        // 「恢复默认」就是界面字号那一排的）。
+        let reset = find_text(&out, "恢复默认").expect("外观分区没画出「恢复默认」");
+        let y = reset.center().y;
+        let from = Pos2::new(reset.min.x - 40.0, y);
+        let to = Pos2::new(reset.min.x + 50.0, y);
+        frame(&mut app, &ctx, pointer(from, egui::PointerButton::Primary, true));
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(to)]);
+        frame(&mut app, &ctx, pointer(to, egui::PointerButton::Primary, false));
+        let out = frame(&mut app, &ctx, vec![]);
+
+        assert_ne!(
+            app.pending_ui_font, live_before,
+            "这一下拖动没改到暂存值，滑块没接到 pending 上"
+        );
+        assert_eq!(
+            app.ui_font, live_before,
+            "拖动滑块就改了实际字号，界面会在指针底下重排"
+        );
+        assert_eq!(
+            chip(&mut app),
+            chip_before,
+            "还没点应用，顶栏就已经跟着重排了"
+        );
+        // 攒着改动时必须看得见「应用」这颗，否则用户不知道下一步点哪
+        let apply = find_text(&out, "应用").expect("有未应用改动时没画出「应用」");
+
+        tap(&mut app, &ctx, apply.center());
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let wanted = app.pending_ui_font;
+        assert_eq!(app.ui_font, wanted, "点了应用还没换字号");
+        assert_ne!(chip(&mut app), chip_before, "换了字号顶栏却没动");
+
+        // 关掉再打开，暂存要回到实际值：不该有「看不见的改动」攒在那儿
+        app.show_settings = false;
+        frame(&mut app, &ctx, vec![]);
+        app.open_settings(SettingsSection::Appearance);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert_eq!(app.pending_ui_font, app.ui_font);
+    }
+
+    /// 设置「终端」里点「新增自定义 shell」：立刻选上、进下拉、落到配置里。
+    ///
+    /// 内置那五种只能改路径，加不出第六种；装在别处的 MSYS2、busybox 之类的
+    /// 得能自己登记一条，登记完和内置的平起平坐。
+    #[test]
+    fn terminal_section_adds_a_custom_shell() {
+        let (ctx, mut app, _dir) = app_in_folder("easy-editor-app-custom-shell", "a\n");
+        app.open_settings(SettingsSection::Terminal);
+        for _ in 0..5 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let out = frame(&mut app, &ctx, vec![]);
+        let add = find_text(&out, "+ 新增自定义 shell").expect("没画出「+ 新增自定义 shell」");
+        tap(&mut app, &ctx, add.center());
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+
+        let picked = app.terminal.shell.id();
+        assert!(
+            picked.starts_with("custom:"),
+            "点完新增没选中新那条：{picked}"
+        );
+        assert!(
+            app.terminal.available.iter().any(|s| s.id() == picked),
+            "新加的没进下拉列表"
+        );
+        // 顶栏那个下拉是同一个值，不用打开设置也看得见加了什么
+        let bar = toolbar_texts(&frame(&mut app, &ctx, vec![]));
+        assert!(
+            bar.iter()
+                .any(|(t, _)| t == "shell: 未命名 shell"),
+            "顶栏没显示新加的自定义 shell：{:?}",
+            names(&bar)
+        );
+        // 表单换成了自定义那三项，其中没有「清除覆盖」——它没有默认值可回
+        let out = frame(&mut app, &ctx, vec![]);
+        assert!(find_text(&out, "显示名称").is_some(), "没切到自定义 shell 的表单");
+        assert!(find_text(&out, "删除这条").is_some(), "自定义 shell 没给删除");
+        // 配置里落下这一条，`terminal_shell` 也指向它
+        app.sync_config();
+        assert_eq!(app.config.data.terminal_custom_shells.len(), 1);
+        assert_eq!(app.config.data.terminal_shell, picked);
     }
 
     /// 输入法组字能不能活过对话框刷新的每一帧。

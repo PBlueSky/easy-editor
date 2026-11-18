@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::db::ConnectionSpec;
+use crate::terminal::CustomShell;
 
 /// 应用数据目录（配置、截图都放这里）。
 pub fn app_data_dir() -> PathBuf {
@@ -49,7 +50,8 @@ pub struct Config {
     /// 用户改过的快捷键：动作 id -> 组合字符串。
     /// 只存改过的项，缺的用内置默认值补齐，这样以后加新动作不会破坏老配置。
     pub keymap: BTreeMap<String, String>,
-    /// 新建终端默认用的 shell 种类 id（`pwsh` / `powershell` / `cmd` / `gitbash` / `wsl`）。
+    /// 新建终端默认用的 shell。内置的是种类 id（`pwsh` / `powershell` / `cmd` /
+    /// `gitbash` / `wsl`），自己加的写成 `custom:<id>`（见 `terminal_custom_shells`）。
     /// 空串 = 自动挑本机第一个可用的。
     pub terminal_shell: String,
     /// 终端程序路径覆盖：种类 id -> 绝对路径。
@@ -57,6 +59,9 @@ pub struct Config {
     pub terminal_programs: BTreeMap<String, String>,
     /// 终端启动参数覆盖：种类 id -> 参数字符串（空格分隔，带空格的用双引号包住）。
     pub terminal_args: BTreeMap<String, String>,
+    /// 用户自己加的 shell，整条存名字/路径/参数。内置那五种改不出第六种，
+    /// 装在别处的 MSYS2、busybox 之类的靠这里进下拉列表。
+    pub terminal_custom_shells: Vec<CustomShell>,
     /// 编辑器自动换行：长行折到面板宽度，而不是横向滚出去。
     pub word_wrap: bool,
     /// 启动时把自己登记进 Windows 的 `.txt`「打开方式」/「默认应用」列表。
@@ -81,6 +86,7 @@ impl Default for Config {
             terminal_shell: String::new(),
             terminal_programs: BTreeMap::new(),
             terminal_args: BTreeMap::new(),
+            terminal_custom_shells: Vec::new(),
             word_wrap: false,
             txt_association: true,
             db_connections: Vec::new(),
@@ -107,7 +113,15 @@ impl Config {
             .ui_font_size
             .clamp(crate::theme::UI_FONT_MIN, crate::theme::UI_FONT_MAX);
         prune_connections(&mut self.db_connections);
+        prune_custom_shells(&mut self.terminal_custom_shells);
     }
+}
+
+/// 自定义 shell 只认 id：没 id 的条目在 `terminal_shell` 里根本引用不到，
+/// 同名的重复条目会让下拉里出现两份一样的。都在这儿收掉。
+fn prune_custom_shells(shells: &mut Vec<CustomShell>) {
+    let mut seen: HashSet<String> = HashSet::new();
+    shells.retain(|c| !c.id.trim().is_empty() && seen.insert(c.id.clone()));
 }
 
 /// 一次读盘的结果：能用的配置，外加「原文件哪儿不对劲」的交代。

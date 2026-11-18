@@ -17,6 +17,7 @@ use alacritty_terminal::term::{Config as TermConfig, Term};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
 use eframe::egui::{self, Color32, FontId, Rect, Sense, Ui, Vec2};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use serde::{Deserialize, Serialize};
 
 use crate::theme;
 
@@ -195,8 +196,13 @@ impl ShellKind {
             .collect()
     }
 
-    fn build(self, cwd: &Path, settings: &TerminalSettings) -> Option<CommandBuilder> {
-        let program = self.program(settings)?;
+    fn build(self, cwd: &Path, settings: &TerminalSettings) -> Result<CommandBuilder, String> {
+        let program = self.program(settings).ok_or_else(|| {
+            format!(
+                "找不到 {} 的可执行文件，可在设置「终端」里指定路径",
+                self.label()
+            )
+        })?;
         let mut cmd = CommandBuilder::new(program);
         // 启动参数：配置优先；配置留空才用下面这套内置参数
         if let Some(args) = settings.args(self) {
@@ -225,11 +231,100 @@ impl ShellKind {
             cmd.cwd(cwd);
         }
         cmd.env("TERM", "xterm-256color");
-        Some(cmd)
+        Ok(cmd)
     }
 }
 
-/// 终端设置：程序路径与启动参数按 shell 种类覆盖，都来自 `config.json`。
+/// 用户自己加的一条 shell：名字、程序路径、启动参数，整条存在 `config.json` 里。
+///
+/// 内置那几种只能在「程序路径」上覆盖，改不了名字也加不出第六种——
+/// 比如装在别处的 MSYS2、busybox、或者想直接进某个项目的 bash。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CustomShell {
+    /// 认这条用的稳定 id（`custom-1` 这样）。改名、改路径都不动它，
+    /// `terminal_shell` 里存的偏好才不会因为改个显示名就失效。
+    pub id: String,
+    /// 下拉与面板标题里显示的名字
+    pub name: String,
+    /// 可执行文件路径
+    pub program: String,
+    /// 启动参数，空格分隔，带空格的用双引号包住
+    pub args: String,
+}
+
+impl CustomShell {
+    /// 显示用的名字。没填给个占位，否则下拉里会出现一项空白，没法点也没法认。
+    pub fn display_name(&self) -> &str {
+        let name = self.name.trim();
+        if name.is_empty() {
+            "未命名 shell"
+        } else {
+            name
+        }
+    }
+}
+
+/// 一块终端实际用哪个 shell：内置那几种，或者用户自己加的那一条。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Shell {
+    Builtin(ShellKind),
+    Custom(CustomShell),
+}
+
+impl Shell {
+    /// 写进 `config.terminal_shell` 的值。自定义带 `custom:` 前缀，和内置的种类 id 撞不上。
+    pub fn id(&self) -> String {
+        match self {
+            Self::Builtin(kind) => kind.id().to_string(),
+            Self::Custom(c) => format!("custom:{}", c.id),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Self::Builtin(kind) => kind.label().to_string(),
+            Self::Custom(c) => c.display_name().to_string(),
+        }
+    }
+
+    /// 可用的 shell：内置探测结果 + 用户自己加的每一条。
+    ///
+    /// 自定义那些**全都**列进来，路径还空着的也列：下拉里看不见就没法接着填，
+    /// 起不来会在启动时把话说清楚。这和「路径写错的内置种类也留在列表里」是同一个取向。
+    pub fn detect(settings: &TerminalSettings) -> Vec<Self> {
+        let mut out: Vec<Self> = ShellKind::detect(settings)
+            .into_iter()
+            .map(Self::Builtin)
+            .collect();
+        out.extend(settings.custom.iter().cloned().map(Self::Custom));
+        out
+    }
+
+    fn build(&self, cwd: &Path, settings: &TerminalSettings) -> Result<CommandBuilder, String> {
+        match self {
+            Self::Builtin(kind) => kind.build(cwd, settings),
+            Self::Custom(c) => {
+                let program = c.program.trim();
+                if program.is_empty() {
+                    return Err(format!(
+                        "自定义 shell「{}」还没填程序路径，到设置「终端」里填一下",
+                        c.display_name()
+                    ));
+                }
+                let mut cmd = CommandBuilder::new(program);
+                for arg in split_args(&c.args) {
+                    cmd.arg(arg);
+                }
+                cmd.cwd(cwd);
+                cmd.env("TERM", "xterm-256color");
+                Ok(cmd)
+            }
+        }
+    }
+}
+
+/// 终端设置：程序路径与启动参数按 shell 种类覆盖，外加用户自己加的 shell，都来自 `config.json`。
 /// 缺省即自动探测 + 内置参数，所以配置文件里只会有用户真正改过的条目。
 #[derive(Clone, Debug, Default)]
 pub struct TerminalSettings {
@@ -237,28 +332,51 @@ pub struct TerminalSettings {
     pub programs: BTreeMap<String, String>,
     /// 种类 id -> 启动参数字符串（空格分隔，双引号包住带空格的参数）
     pub args: BTreeMap<String, String>,
+    /// 用户自己加的 shell，顺序即下拉里的顺序
+    pub custom: Vec<CustomShell>,
 }
 
 impl TerminalSettings {
     pub fn from_config(
         programs: &BTreeMap<String, String>,
         args: &BTreeMap<String, String>,
+        custom: &[CustomShell],
     ) -> Self {
         Self {
             programs: programs.clone(),
             args: args.clone(),
+            custom: custom.to_vec(),
         }
     }
 
     /// 写回配置，顺手丢掉空串，配置文件才不会积累噪音。
-    pub fn to_config(&self) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+    pub fn to_config(&self) -> (BTreeMap<String, String>, BTreeMap<String, String>, Vec<CustomShell>) {
         let clean = |map: &BTreeMap<String, String>| {
             map.iter()
                 .filter(|(_, v)| !v.trim().is_empty())
                 .map(|(k, v)| (k.clone(), v.trim().to_string()))
                 .collect::<BTreeMap<_, _>>()
         };
-        (clean(&self.programs), clean(&self.args))
+        let customs = self
+            .custom
+            .iter()
+            .filter(|c| !c.id.trim().is_empty())
+            .map(|c| CustomShell {
+                id: c.id.trim().to_string(),
+                name: c.name.trim().to_string(),
+                program: c.program.trim().to_string(),
+                args: c.args.trim().to_string(),
+            })
+            .collect();
+        (clean(&self.programs), clean(&self.args), customs)
+    }
+
+    /// 给新加的自定义 shell 取一个没被占用的 id。
+    fn next_custom_id(&self) -> String {
+        (1..)
+            .map(|n| format!("custom-{n}"))
+            .find(|id| !self.custom.iter().any(|c| &c.id == id))
+            .unwrap_or_else(|| "custom".to_string())
     }
 
     fn program(&self, kind: ShellKind) -> Option<PathBuf> {
@@ -387,7 +505,7 @@ pub struct Terminal {
     pub id: u64,
     pub title: String,
     /// 这个终端实际使用的 shell
-    pub shell: ShellKind,
+    pub shell: Shell,
     term: Term<Listener>,
     processor: Processor,
     writer: Box<dyn Write + Send>,
@@ -412,7 +530,7 @@ impl Terminal {
         cwd: &Path,
         cols: usize,
         rows: usize,
-        shell: ShellKind,
+        shell: Shell,
         settings: &TerminalSettings,
     ) -> Result<Self, String> {
         let cols = cols.max(20);
@@ -427,12 +545,7 @@ impl Terminal {
             })
             .map_err(|e| format!("创建伪终端失败：{e}"))?;
 
-        let cmd = shell.build(cwd, settings).ok_or_else(|| {
-            format!(
-                "找不到 {} 的可执行文件，可在终端设置里指定路径",
-                shell.label()
-            )
-        })?;
+        let cmd = shell.build(cwd, settings)?;
 
         let child = pair
             .slave
@@ -472,7 +585,7 @@ impl Terminal {
 
         Ok(Self {
             id,
-            title: shell.label().to_string(),
+            title: shell.label(),
             shell,
             term,
             processor: Processor::new(),
@@ -1212,16 +1325,19 @@ pub struct TerminalPanel {
     next_id: u64,
     pub cwd: PathBuf,
     /// 新建终端时使用的 shell
-    pub shell: ShellKind,
-    pub available: Vec<ShellKind>,
-    /// 程序路径 / 启动参数的覆盖项，来自 config.json
+    pub shell: Shell,
+    pub available: Vec<Shell>,
+    /// 程序路径 / 启动参数的覆盖项 + 自定义 shell，来自 config.json
     pub settings: TerminalSettings,
 }
 
 impl TerminalPanel {
     pub fn new(cwd: PathBuf, settings: TerminalSettings) -> Self {
-        let available = ShellKind::detect(&settings);
-        let shell = available.first().copied().unwrap_or(ShellKind::Cmd);
+        let available = Shell::detect(&settings);
+        let shell = available
+            .first()
+            .cloned()
+            .unwrap_or(Shell::Builtin(ShellKind::Cmd));
         Self {
             terms: Vec::new(),
             next_id: 1,
@@ -1232,21 +1348,68 @@ impl TerminalPanel {
         }
     }
 
-    /// 套用配置里的 shell 偏好；本机没有这个种类就保持自动选择。
+    /// 套用配置里的 shell 偏好；本机没有这一条就保持自动选择。
+    ///
+    /// 自定义的那条认的是 `custom:<id>`：id 稳定，用户改显示名不会把偏好弄丢。
     pub fn apply_pref(&mut self, id: &str) {
+        if let Some(custom_id) = id.strip_prefix("custom:") {
+            if let Some(c) = self.settings.custom.iter().find(|c| c.id == custom_id) {
+                self.shell = Shell::Custom(c.clone());
+            }
+            return;
+        }
         if let Some(kind) = ShellKind::from_id(id) {
-            if self.available.contains(&kind) {
-                self.shell = kind;
+            if self.available.contains(&Shell::Builtin(kind)) {
+                self.shell = Shell::Builtin(kind);
             }
         }
     }
 
-    /// 改了设置后重算可用列表；首选被挪走时退回自动选择。
+    /// 改了设置后重算可用列表。
+    ///
+    /// 按 id 重新认领当前选择：刚改过名字的自定义 shell 内容变了但 id 没变，
+    /// 选择要跟着走过去；整条被删掉了才退回列表里第一个可用的。
     pub fn refresh(&mut self) {
-        self.available = ShellKind::detect(&self.settings);
-        if !self.available.contains(&self.shell) {
-            self.shell = self.available.first().copied().unwrap_or(ShellKind::Cmd);
+        self.available = Shell::detect(&self.settings);
+        let id = self.shell.id();
+        self.shell = self
+            .available
+            .iter()
+            .find(|s| s.id() == id)
+            .cloned()
+            .unwrap_or_else(|| {
+                self.available
+                    .first()
+                    .cloned()
+                    .unwrap_or(Shell::Builtin(ShellKind::Cmd))
+            });
+    }
+
+    /// 新加一条空的自定义 shell 并选中它，界面紧接着就能填名字和路径。
+    pub fn add_custom(&mut self) {
+        let shell = CustomShell {
+            id: self.settings.next_custom_id(),
+            ..Default::default()
+        };
+        self.settings.custom.push(shell.clone());
+        self.shell = Shell::Custom(shell);
+        self.refresh();
+    }
+
+    /// 改一条自定义 shell 的三项内容，顺带重算可用列表。
+    pub fn update_custom(&mut self, id: &str, name: &str, program: &str, args: &str) {
+        if let Some(c) = self.settings.custom.iter_mut().find(|c| c.id == id) {
+            c.name = name.trim().to_string();
+            c.program = program.trim().to_string();
+            c.args = args.trim().to_string();
         }
+        self.refresh();
+    }
+
+    /// 删掉一条自定义 shell。正选着它的话，`refresh` 会把选择退回第一个可用的。
+    pub fn remove_custom(&mut self, id: &str) {
+        self.settings.custom.retain(|c| c.id != id);
+        self.refresh();
     }
 
     pub fn set_cwd(&mut self, cwd: PathBuf) {
@@ -1274,7 +1437,7 @@ impl TerminalPanel {
     pub fn pane_title(&self, id: u64) -> Option<String> {
         let term = self.get(id)?;
         let base = if term.title.trim().is_empty() || looks_like_exe_path(&term.title) {
-            term.shell.label().to_string()
+            term.shell.label()
         } else {
             truncate(&term.title, 24)
         };
@@ -1294,7 +1457,7 @@ impl TerminalPanel {
     pub fn create_at(&mut self, cwd: &Path) -> Result<u64, String> {
         let id = self.next_id;
         self.next_id += 1;
-        let term = Terminal::spawn(id, cwd, 100, 28, self.shell, &self.settings)?;
+        let term = Terminal::spawn(id, cwd, 100, 28, self.shell.clone(), &self.settings)?;
         self.terms.push(term);
         Ok(id)
     }
@@ -1397,13 +1560,27 @@ mod tests {
         s.programs
             .insert("gitbash".into(), r"D:\Git\bin\bash.exe".into());
         s.programs.insert("wsl".into(), "   ".into());
-        let (programs, args) = s.to_config();
+        s.custom.push(CustomShell {
+            id: "  ".into(),
+            name: "没有 id，配置里引用不到".into(),
+            ..Default::default()
+        });
+        s.custom.push(CustomShell {
+            id: "custom-1".into(),
+            name: " bash ".into(),
+            program: " D:\\a\\bash.exe ".into(),
+            args: String::new(),
+        });
+        let (programs, args, customs) = s.to_config();
         assert_eq!(programs.len(), 1);
         assert_eq!(
             programs.get("gitbash").map(String::as_str),
             Some(r"D:\Git\bin\bash.exe")
         );
         assert!(args.is_empty());
+        assert_eq!(customs.len(), 1);
+        assert_eq!(customs[0].name, "bash");
+        assert_eq!(customs[0].program, r"D:\a\bash.exe");
     }
 
     #[test]
@@ -1416,6 +1593,104 @@ mod tests {
         // 路径存在与否交给启动时报错，这里必须认账，否则用户改了配置却静默失效
         assert!(ShellKind::GitBash.program(&s).is_some());
         assert!(ShellKind::detect(&s).contains(&ShellKind::GitBash));
+    }
+
+    /// 一条自定义 shell 的设置，`program` 是它自己的程序路径。
+    fn settings_with_custom(program: &str) -> TerminalSettings {
+        let mut s = TerminalSettings::default();
+        s.custom.push(CustomShell {
+            id: "custom-1".into(),
+            name: "MSYS2 Bash".into(),
+            program: program.into(),
+            args: "--login -i".into(),
+        });
+        s
+    }
+
+    #[test]
+    fn custom_shell_shows_up_in_the_picker() {
+        let ids = |s: &TerminalSettings| -> Vec<String> {
+            Shell::detect(s).iter().map(|sh| sh.id()).collect()
+        };
+        let s = settings_with_custom(r"D:\msys64\usr\bin\bash.exe");
+        assert!(ids(&s).contains(&"custom:custom-1".to_string()), "{:?}", ids(&s));
+        // 路径还空着的那条也要留着：刚点「新增」就找不到它，没地方接着填
+        let empty = settings_with_custom("");
+        assert!(ids(&empty).contains(&"custom:custom-1".to_string()));
+        // 内置的还是按探测结果来，没装的不会凭空冒出来
+        assert!(!ids(&TerminalSettings::default()).iter().any(|i| i.starts_with("custom:")));
+    }
+
+    /// 自定义 shell 起的是它自己那条路径和参数，跟内置那套内置参数没关系。
+    #[test]
+    fn custom_shell_builds_its_own_command() {
+        let s = settings_with_custom(r"D:\msys64\usr\bin\bash.exe");
+        let shell = Shell::detect(&s)
+            .into_iter()
+            .find(|sh| sh.id() == "custom:custom-1")
+            .expect("下拉里没有刚配的那条自定义 shell");
+        let cmd = shell.build(Path::new(r"C:\"), &s).expect("该拼出命令");
+        let argv: Vec<String> = cmd
+            .get_argv()
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(argv, [r"D:\msys64\usr\bin\bash.exe", "--login", "-i"]);
+        assert_eq!(
+            cmd.get_cwd().map(|c| c.to_string_lossy().to_string()).as_deref(),
+            Some(r"C:\")
+        );
+
+        // 没填路径要说清楚是哪儿没填，别丢一句「找不到可执行文件」让人猜
+        let blank = settings_with_custom("   ");
+        let err = Shell::Custom(blank.custom[0].clone())
+            .build(Path::new(r"C:\"), &blank)
+            .expect_err("路径空着不该给出命令");
+        assert!(err.contains("程序路径"), "{err}");
+        assert!(err.contains("MSYS2 Bash"), "{err}");
+    }
+
+    /// 「新增 → 改名 → 删除」这一串走的是 id，中间不能把用户选中的那条弄丢。
+    #[test]
+    fn adding_and_renaming_a_custom_shell_keeps_the_selection() {
+        let mut panel = TerminalPanel::new(std::env::temp_dir(), TerminalSettings::default());
+        panel.add_custom();
+        let first = panel.shell.id();
+        assert!(first.starts_with("custom:"), "新增后没选中新那条：{first}");
+        assert!(
+            panel.available.iter().any(|s| s.id() == first),
+            "新加的没进可用列表"
+        );
+
+        let key = first.strip_prefix("custom:").unwrap().to_string();
+        panel.update_custom(&key, "bash", r"D:\a\bash.exe", "");
+        assert_eq!(panel.shell.id(), first, "改个名字把选择甩掉了");
+        assert_eq!(panel.shell.label(), "bash", "下拉里显示的还是旧名字");
+
+        panel.add_custom();
+        assert_ne!(panel.shell.id(), first, "两条自定义 shell 撞了 id");
+
+        // 删掉正选着的这条，才退回列表里第一个可用的
+        let gone = panel.shell.id();
+        let gone_key = gone.strip_prefix("custom:").unwrap().to_string();
+        panel.remove_custom(&gone_key);
+        assert_ne!(panel.shell.id(), gone, "删掉了还指着它");
+        assert!(!panel.shell.id().starts_with("custom:"), "{:?}", panel.shell.id());
+    }
+
+    #[test]
+    fn pref_can_point_at_a_custom_shell() {
+        let mut panel = TerminalPanel::new(
+            std::env::temp_dir(),
+            settings_with_custom(r"D:\msys64\usr\bin\bash.exe"),
+        );
+        panel.apply_pref("custom:custom-1");
+        assert_eq!(panel.shell.label(), "MSYS2 Bash");
+        // 引用了一条配置里没有的：保持原样，别把已经选好的改成别的
+        panel.apply_pref("custom:没有这条");
+        assert_eq!(panel.shell.id(), "custom:custom-1");
+        panel.apply_pref("cmd");
+        assert_eq!(panel.shell.id(), "cmd");
     }
 
     #[test]
@@ -1586,7 +1861,7 @@ mod tests {
     #[ignore = "要起真实 PTY 进程，手动跑：cargo test -- --ignored --nocapture pty_terminal"]
     fn pty_terminal_publishes_ime_anchor_and_routes_commit() {
         let mut panel = TerminalPanel::new(std::env::temp_dir(), TerminalSettings::default());
-        panel.shell = ShellKind::Cmd;
+        panel.shell = Shell::Builtin(ShellKind::Cmd);
         let term_id = panel.create().unwrap();
         let wait = |ms: u64| std::thread::sleep(std::time::Duration::from_millis(ms));
 
