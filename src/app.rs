@@ -6484,6 +6484,38 @@ mod tests {
         );
     }
 
+    /// Alt 类组合键：egui-winit 除了按键还附带一个该键打出的字符（按住 Ctrl 才不附）。
+    /// 快捷键层以前只摘按键，剩下的 z 顺着焦点就打进正在输入的框——
+    /// 按 Alt+Z 切自动换行，搜索框里同时多出一个 z。
+    #[test]
+    fn shortcut_chord_does_not_type_its_own_character() {
+        let (ctx, mut app, _dir) = app_in_folder("easy-editor-app-chord-leak", "hello\n");
+        frame(
+            &mut app,
+            &ctx,
+            vec![key_press(Key::F, Modifiers::CTRL | Modifiers::SHIFT)],
+        );
+        // `focus_search` 要下一帧才落到搜索框上，多跑两帧确保焦点真的到位
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        // 先证明这个框此刻确实吃键盘，否则下面的断言是空的
+        frame(&mut app, &ctx, vec![egui::Event::Text("h".into())]);
+        assert_eq!(app.search.query, "h", "搜索框没拿到焦点，测不出漏字符");
+        app.search.query.clear();
+
+        let wrap = app.word_wrap;
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                key_press(Key::Z, Modifiers::ALT),
+                egui::Event::Text("z".into()),
+            ],
+        );
+        assert_ne!(app.word_wrap, wrap, "Alt+Z 没切自动换行");
+        assert_eq!(app.search.query, "", "Alt+Z 顺带的字符漏进了输入框");
+    }
+
     /// 搜索框里按过回车以后，焦点回到正文：正文里再按回车只能换行，不该把全局搜索
     /// 又跑一遍。以前判的是 `resp.lost_focus()`，正文那一下换行正好落进这个条件里。
     #[test]

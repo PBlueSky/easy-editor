@@ -485,7 +485,7 @@ impl Keymap {
                     if *k == key && self.owns(action, key, *modifiers))
             })
         });
-        owned && ctx.input_mut(|i| i.consume_key(mods, key))
+        owned && ctx.input_mut(|i| consume_chord(i, mods, key))
     }
 
     /// 一个键上可能挂着多个动作（`Ctrl+W` 关标签 / `Ctrl+Shift+W` 关面板）。
@@ -524,9 +524,136 @@ fn same_physical_key(a: Key, b: Key) -> bool {
     a == b || key_twin(a) == b
 }
 
+/// 摘掉这一下快捷键按键，连它顺带产生的字符一起摘。
+///
+/// egui 的 `consume_key` 只删 `Event::Key`，可 egui-winit 在处理一次按键时会往队列里
+/// 塞两个事件：先是按键本身，紧跟一个 `Event::Text`（那个键在该布局上打出来的字符）。
+/// 只有按住 Ctrl 的那几种它会跳过字符，Alt 类组合键一律照发——于是 `Alt+Shift+D`
+/// 拆完面板，正文里还多出一个 `D`；终端在前时这个 `D` 直接进 PTY，命令行里就多个字母。
+/// 光删按键不够，得把同一只手按出来的那个字符一并删掉。
+///
+/// 按顺序扫：命中按键就丢，它后面紧跟着的那个字符也丢（只认紧邻的下一个，中间隔了
+/// 别的事件就说明那串字符是正常打字，跟这次快捷键无关，留着）。
+fn consume_chord(i: &mut egui::InputState, mods: Modifiers, key: Key) -> bool {
+    let events = std::mem::take(&mut i.events);
+    let mut hit = false;
+    let mut just_chord = false;
+    let mut kept = Vec::with_capacity(events.len());
+    for event in events {
+        let chord = matches!(
+            &event,
+            egui::Event::Key { key: k, pressed: true, modifiers, .. }
+                if *k == key && modifiers.matches_logically(mods)
+        );
+        if chord {
+            hit = true;
+            just_chord = true;
+            continue;
+        }
+        let companion =
+            just_chord && matches!(&event, egui::Event::Text(t) if !t.is_empty());
+        just_chord = false;
+        if !companion {
+            kept.push(event);
+        }
+    }
+    i.events = kept;
+    hit
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn press(key: Key, mods: Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: mods,
+        }
+    }
+
+    fn release(key: Key, mods: Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: mods,
+        }
+    }
+
+    fn typed(ch: &str) -> egui::Event {
+        egui::Event::Text(ch.into())
+    }
+
+    /// egui-winit 一次按键往队列里塞两个事件：先是按键，紧跟一个该键打出的字符。
+    /// 它只在按住 Ctrl 时省略字符，`Alt+Shift+D` 这种照样发。所以只删按键不够——
+    /// 剩下的 `D` 会被随后画出来的编辑框打进正文、被终端写进 PTY。
+    #[test]
+    fn chord_takes_its_companion_character() {
+        let km = Keymap::default();
+        let ctx = egui::Context::default();
+        let alt_shift = Modifiers::ALT | Modifiers::SHIFT;
+        ctx.input_mut(|i| {
+            i.events = vec![press(Key::D, alt_shift), typed("D"), release(Key::D, alt_shift)]
+        });
+
+        assert!(km.consume(&ctx, "split_auto"), "Alt+Shift+D 没触发拆面板");
+        ctx.input(|i| {
+            assert!(
+                i.events.iter().all(|e| !matches!(e, egui::Event::Text(_))),
+                "组合键的字符漏给了编辑区/终端：{:?}",
+                i.events
+            );
+            // 松开键的事件留着：它不打字，egui 自己会用来收尾按键状态
+            assert_eq!(i.events, vec![release(Key::D, alt_shift)]);
+        });
+    }
+
+    /// 同一帧里正常打的字要活下来：只摘紧跟在快捷键后面的那一个字符，
+    /// 排在快捷键前面的、或者中间隔了别的事件的，都属于另一次按键。
+    #[test]
+    fn ordinary_typing_in_the_same_frame_survives() {
+        let km = Keymap::default();
+        let ctx = egui::Context::default();
+        let alt = Modifiers::ALT;
+        ctx.input_mut(|i| {
+            i.events = vec![
+                typed("z"),
+                egui::Event::PointerMoved(egui::pos2(10.0, 10.0)),
+                press(Key::Z, alt),
+                typed("Z"),
+            ]
+        });
+
+        assert!(km.consume(&ctx, "wrap_toggle"));
+        ctx.input(|i| {
+            let texts: Vec<&str> = i
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(texts, vec!["z"], "把用户正常打的字也吞了：{:?}", i.events);
+        });
+    }
+
+    /// 归别人（或谁都不归）的按键一个事件都不许动，否则终端就收不到这条命令了。
+    #[test]
+    fn unclaimed_keystroke_is_untouched() {
+        let km = Keymap::default();
+        let ctx = egui::Context::default();
+        let events = vec![press(Key::K, Modifiers::CTRL), typed("k")];
+        ctx.input_mut(|i| i.events = events.clone());
+
+        assert!(!km.consume(&ctx, "save"));
+        assert_eq!(ctx.input(|i| i.events.clone()), events);
+    }
 
     #[test]
     fn parses_and_formats_roundtrip() {
