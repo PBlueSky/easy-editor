@@ -2931,13 +2931,12 @@ impl EasyEditorApp {
                         } else {
                             ui.add_space(20.0);
                             ui.vertical_centered(|ui| {
-                                ui.label(RichText::new("尚未打开文件夹").weak());
-                                if ui.button("打开文件夹").clicked() {
-                                    self.want_open_folder = true;
-                                }
-                                if ui.button("打开文件").clicked() {
-                                    self.want_open_files = true;
-                                }
+                                // 只说清楚去哪儿开：顶栏那两颗按钮已经是唯一的入口了，
+                                // 侧栏再来一遍会在左边多出一排重复的。
+                                ui.label(
+                                    RichText::new("尚未打开文件夹 · 顶栏有「打开文件夹」和「打开文件」")
+                                        .weak(),
+                                );
                             });
                         }
                     }
