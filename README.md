@@ -4,7 +4,7 @@
 
 A Windows desktop editor written in **Rust + egui**. It does not have many features — it has the ones you use every day: file tree, multiple terminals, recursive split panes, journal blocks inside plain text files, SQL blocks that run against MySQL with the results sitting right under the text, cursor position back/forward, project-wide search, find and replace, syntax highlighting, and every keybinding is yours to change.
 
-**Current version** v0.3.0 | **Platform** Windows 10 / 11 x64 | **License** MIT
+**Current version** v0.4.0 | **Platform** Windows 10 / 11 x64 | **License** MIT
 
 The release package is a **single exe** (about 12 MB, 5.2 MB zipped). No .NET, no Electron, no runtime of any kind.
 
@@ -60,7 +60,7 @@ Grab one of the packages from the [Releases](https://github.com/PBlueSky/easy-ed
 Both packages work: without `rg.exe`, project-wide search silently falls back to the built-in scanner — a bit slower on large repos. Each package ships with a matching `.sha256.txt`; verify it:
 
 ```powershell
-Get-FileHash .\EasyEditor-0.3.0-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\EasyEditor-0.4.0-windows-x64.zip -Algorithm SHA256
 ```
 
 ### Run from source
@@ -551,7 +551,7 @@ cargo test -- --ignored --nocapture     # one end-to-end terminal test that real
 mkdir -p dist/EasyEditor
 cp target/release/easy-editor.exe dist/EasyEditor/EasyEditor.exe   # keep it identical to the window title
 cp README.md README.zh-CN.md LICENSE dist/EasyEditor/
-powershell -NoProfile -Command "Compress-Archive -Path dist\EasyEditor -DestinationPath dist\EasyEditor-0.3.0-windows-x64.zip -Force"
+powershell -NoProfile -Command "Compress-Archive -Path dist\EasyEditor -DestinationPath dist\EasyEditor-0.4.0-windows-x64.zip -Force"
 ```
 
 For the `-with-rg` variant, drop `rg.exe` and `THIRD-PARTY-NOTICES.txt` into `dist\EasyEditor\` and compress again. Each package gets its own `.sha256.txt`.

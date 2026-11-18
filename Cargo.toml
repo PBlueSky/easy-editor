@@ -1,6 +1,6 @@
 [package]
 name = "easy-editor"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "EasyEditor - a small but genuinely useful code editor built with egui"
 
