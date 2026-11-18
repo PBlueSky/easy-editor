@@ -30,7 +30,7 @@ The release package is a **single exe** (about 12 MB, 5.2 MB zipped). No .NET, n
 | Recursive split panes | The tmux / i3 binary pane tree — split as deep as you like, default keys match Windows Terminal | [Split panes](#split-panes) |
 | Journal blocks | Task blocks written directly into ordinary text files, mixed with prose and versioned with git | [Journal blocks](#journal-blocks) |
 | SQL blocks | Jupyter-style: the query lives in a plain text file, `Ctrl+Enter` runs it and the result lands below the editor. `Ctrl+Alt+N` starts a fresh `query-<timestamp>.sql` with the connection already bound | [SQL blocks](#sql-blocks) |
-| Multiple results at once | One tab per statement, so a broken second query does not throw away the first result; up to 10 results, switched by a tab bar; batch headers, pop-out windows, copy as TSV, export as CSV, sideways-scrolling wide tables, whole-row selection, per-row detail window that closes when you click elsewhere | [Results dock](#results-dock) |
+| Multiple results at once | One tab per statement in a horizontal tab bar, so a broken second query does not throw away the first result; up to 10 results, right-click a tab to close a whole side; batch headers, pop-out windows, copy as TSV, export as CSV, sideways-scrolling wide tables, whole-row selection, per-row detail window that closes when you click elsewhere | [Results dock](#results-dock) |
 | Several connections at once | One worker thread per connection, so a slow query on one never blocks another; the auto-run gate is per connection too | [Connections](#connections) |
 | MySQL connections | Named connections in `config.json`, browsed as connection → database → table, passwords via `env:` so no secret sits on disk. Nothing connects at start-up; `✓ 已连接` / `○ 未连接` / `⏳ 正在连接` / `✗ 连不上` show wherever the connection appears, with an explicit connect / disconnect button and idle reaping | [Connections](#connections) |
 | Interaction feedback | A pointing hand over everything clickable, hover highlights that do not shift layout, and a tooltip wherever the meaning is not obvious | [Interaction feedback](#interaction-feedback) |
@@ -207,9 +207,10 @@ Header = `-- sql` + title + `YYYY-MM-DD HH:MM` + `[status]` + tail keys. Two tai
 
 **One statement, one tab**, and up to 10 results stay on the books at once. Per-statement is deliberate: in a block with three `SELECT`s where the second one is broken, the first result is still worth reading, so it is not thrown away with the error. Statements queued behind a failure are marked `未执行` ("not run") instead of spinning forever, and the oldest result is the one evicted.
 
-Ten results in one strip would squeeze the editor out, so only one of them is on screen: a tab bar, one tab per statement, labelled `3·SELECT name FROM u` with a status dot on the left (green done / red failed / blue waiting / grey not run) and its own `✕` on the right. Click a tab to show only that result; the others stay available. Closing the active tab falls back to the first one still on screen, so the dock is never left pointing at nothing.
+Ten results in one strip would squeeze the editor out, so only one of them is on screen: a tab bar laid out **horizontally**, one tab per statement, labelled `3·SELECT name FROM u` with a status dot on the left (green done / red failed / blue waiting / grey not run) and its own `✕` on the right. Click a tab to show only that result; the others stay available. Closing the active tab falls back to the first one still in the row, so the dock is never left pointing at nothing.
 
-- Long labels truncate at 26 characters — hover gives the full statement plus rows and timing; when the batch has more tabs than fit, the tab bar scrolls sideways
+- Long labels truncate at 26 characters — hover gives the full statement plus rows and timing; when the row has more tabs than fit it scrolls sideways, and whichever tab you just switched to rolls itself into view (only on the frame it changes, so your own scrolling is never hijacked)
+- **Right-click a tab to close a whole run of them**: `关闭这个` (this one), `关闭左侧全部` / `关闭右侧全部` (everything left / right of it), `关闭其他` (all the others), `关掉这一批` (this submission's statements) and `关闭全部` (every tab). Each one says how many tabs it would take; an option with nothing to close is greyed out. Left and right mean screen position — a new submission lands at the far left, so "close everything to the right" is also "close everything older"
 - **One header row per submission** stays above the tabs — `14:03:12  demo · 「活跃用户」 · 共 3 条`. When two blocks produce nearly identical statements, the timestamp is the only thing that says which batch is which
 - **`1/3`, `2/3`, `3/3`** in each panel title, so the order within a batch survives switching tabs
 
@@ -700,6 +701,12 @@ So the row is `ui.horizontal` (one line of height) containing a right-to-left sc
 `load()` now hands back `Loaded { config, trouble }`: the bad file is `rename`d to `config.json.broken` first (numbers appended if that name is taken), and only a successful move lets saving continue. If the move failed, or the file could not be read at all, `Trouble::blocks_save()` pins `save_now()` shut — losing this session's tweaks beats overwriting the user's own edits. The parsing lives in `load_from(&Path)` so the tests run against a temporary directory and never touch the real `%APPDATA%`; the dialog itself is covered by one of those headless interface tests built on `frame()`, which checks that it paints and that 「知道了」 dismisses it.
 
 An empty file is treated as "nothing configured yet": sync clients and editors have both left a zero-byte `config.json` behind, and that does not deserve a dialog.
+
+### A horizontal scroll area does not lay its contents out horizontally
+
+The result tab bar sits in a `ScrollArea::horizontal()`, yet ten tabs stacked one per row and the strip grew taller with every run. In egui 0.37 a `ScrollArea` only scrolls — the content `Ui` keeps the layout of whatever contains it, and the bottom panel is a vertical one, so every tab got a row to itself. That also means the horizontal scrollbar never appeared: the content was never wider than the viewport, it was simply longer. The name makes it sound like the direction is part of the deal; it is not, and the row still has to ask for `ui.horizontal(...)` itself. `Layout::left_to_right` does not wrap in 0.37, so the tabs that run past the edge are exactly what that scrollbar is for.
+
+The context menu on a tab stepped on the neighbour of a known trap: the first frame an egui popup opens is a sizing pass, which measures and paints nothing, so a headless test has to run one empty frame after the right-click before the items are on screen. Same reason as 「A freshly opened egui window paints nothing」 above.
 
 ## Contributing and license
 

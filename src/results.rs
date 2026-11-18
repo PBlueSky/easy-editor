@@ -132,7 +132,7 @@ pub struct Export {
 
 /// 底部那一条结果区。
 pub struct ResultsDock {
-    /// 新的在上面：一次执行 splice 到 0，同批内部仍按语句顺序。
+    /// 新的在最左边（页签是横排的）：一次执行 splice 到 0，同批内部仍按语句顺序。
     panels: Vec<Panel>,
     /// 页签栏当前选中哪一份结果（按语句 id）。屏上只铺这一个面板。
     ///
@@ -140,6 +140,8 @@ pub struct ResultsDock {
     /// 下面的等于没有。页签横着排一次就装十条，切换只要一下。
     /// 叫 `active` 不叫 `selected`：面板里那个 `selected` 是选中的结果行，两个撞名迟早看错。
     active: Option<u64>,
+    /// 上一页签栏画的时候亮着哪一份。换了才滚一下，见 `show` 里那条注释。
+    active_shown: Option<u64>,
     next_run: u64,
     /// 已提交、还没收尾的那几批。`settled` 只认这里的，报过就摘掉。
     waiting: Vec<u64>,
@@ -167,6 +169,7 @@ impl ResultsDock {
         Self {
             panels: Vec::new(),
             active: None,
+            active_shown: None,
             next_run: 1,
             waiting: Vec::new(),
             open: false,
@@ -392,7 +395,7 @@ impl ResultsDock {
             };
             ui.label(RichText::new(head).size(11.5).strong());
             ui.label(weak(
-                "点页签换一份 · 双击格子看整格全文 · 点行号选中整行 · 行首 ▸ 在右侧开详情",
+                "点页签换一份 · 右键页签一次关一批 · 双击格子看全文 · 点行号选整行 · 行首 ▸ 开详情",
             ));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if crate::theme::chip(ui, "关闭")
@@ -420,7 +423,15 @@ impl ResultsDock {
         };
         // 页签栏走在滚动区外面：它要是跟着内容一起滚，十条排开时点谁都像点在边缘上。
         if !empty {
-            tab_bar(ui, &self.panels, self.active, &mut act);
+            // 亮着的换了（新交一批、点了别的页签、这一份被关掉）才把它拉到视野里，
+            // 平时不动——用户自己滚到右边看旧结果时，最不该被抢的就是滚动条。
+            let into_view = if self.active != self.active_shown {
+                self.active
+            } else {
+                None
+            };
+            self.active_shown = self.active;
+            tab_bar(ui, &self.panels, self.active, into_view, &mut act);
             ui.separator();
         }
         // 铺满底部面板给的那一格，装不下的走这里的滚动条（面板高度用户能拖）。
@@ -729,6 +740,7 @@ fn draw_cell_peek(panel: &mut Panel, ctx: &egui::Context) {
 struct Clicked {
     /// 按了哪个页签的 ✕，或者哪个页签要上台
     pick: Option<u64>,
+    /// 这一帧该关掉的那些（✕ 一下、或者右键菜单里「关掉右侧全部」那类一次报一串）
     closable: Vec<u64>,
     close_runs: Vec<u64>,
     jump: Option<(PathBuf, usize)>,
@@ -795,15 +807,36 @@ const TAB_LIMIT: usize = 26;
 /// 为什么是页签：一次执行三四条语句、连跑几批就是十几份结果，竖着叠只看得见
 /// 头两三个，剩下的得先拖高结果区再滚动——等于没有。横排一页签一次装十条，
 /// 换一份只要一下，和 DBeaver 那个结果栏一个用法。
-fn tab_bar(ui: &mut Ui, panels: &[Panel], active: Option<u64>, act: &mut Clicked) {
+///
+/// 为什么内容还得自己点名横排：egui 0.37 的 `ScrollArea` 只管滚，不管排布方向，
+/// 内容区沿用外面那一格的竖排。`ScrollArea::horizontal()` 这个名字看着像把方向
+/// 也定了，其实没有——十条页签就这样一屏一行摞起来，跑得越多栏子越高。
+fn tab_bar(
+    ui: &mut Ui,
+    panels: &[Panel],
+    active: Option<u64>,
+    into_view: Option<u64>,
+    act: &mut Clicked,
+) {
     ScrollArea::horizontal()
         .id_salt("db_result_tabs")
         .auto_shrink([false, true])
         .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.x = 3.0;
-            for panel in panels {
-                tab(ui, panel, active == Some(panel.task), act);
-            }
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                for (index, panel) in panels.iter().enumerate() {
+                    let on = active == Some(panel.task);
+                    tab(
+                        ui,
+                        panel,
+                        index,
+                        panels,
+                        on,
+                        into_view == Some(panel.task),
+                        act,
+                    );
+                }
+            });
         });
 }
 
@@ -812,7 +845,15 @@ fn tab_bar(ui: &mut Ui, panels: &[Panel], active: Option<u64>, act: &mut Clicked
 /// 整块矩形自己画、自己命中，为的是「亮着的那一格」和「能点的那一格」严丝合缝。
 /// 用 `selectable_label` 反而不行：它选中的底色和结果表里选中行的底色是同一个，
 /// 测试就分不出屏上那块亮究竟是一页签还是一行。
-fn tab(ui: &mut Ui, panel: &Panel, on: bool, act: &mut Clicked) {
+fn tab(
+    ui: &mut Ui,
+    panel: &Panel,
+    index: usize,
+    panels: &[Panel],
+    on: bool,
+    into_view: bool,
+    act: &mut Clicked,
+) {
     let accent = ui.visuals().hyperlink_color;
     let hovered = ui.visuals().widgets.hovered.weak_bg_fill;
     let text = tab_label(panel);
@@ -870,21 +911,95 @@ fn tab(ui: &mut Ui, panel: &Panel, on: bool, act: &mut Clicked) {
         },
     );
     let hover = format!(
-        "{}\n{}\n点一下只看这一份，点 ✕ 关掉它",
+        "{}\n{}\n点一下只看这一份，点 ✕ 关掉它\n右键：一次关掉一批",
         panel.preview(),
         summary(panel)
     );
     let pos = resp.interact_pointer_pos();
-    let clicked = resp
+    let resp = resp
         .on_hover_cursor(crate::theme::HAND)
-        .on_hover_text(hover)
-        .clicked();
-    if clicked {
+        .on_hover_text(hover);
+    if resp.clicked() {
         if pos.is_some_and(|p| close.contains(p)) {
             act.closable.push(panel.task);
         } else {
             act.pick = Some(panel.task);
         }
+    }
+    if into_view {
+        // 一批十条时栏子放不下，新上台的那一份可能在屏外。
+        // 只在「亮着的换了」那一帧滚，用户自己手滚的时候别抢。
+        resp.scroll_to_me(Some(Align::Min));
+    }
+    resp.context_menu(|ui| tab_menu(ui, panels, index, act));
+}
+
+/// 页签菜单认的是 task，不是面板：按下的那一帧只记账，动列表等这一帧画完再说。
+fn tasks<'a>(list: impl IntoIterator<Item = &'a Panel>) -> Vec<u64> {
+    list.into_iter().map(|p| p.task).collect()
+}
+
+/// 页签上的右键菜单：一次关掉一批。
+///
+/// 为什么在这儿：一批跑完十几份结果，✕ 一个一个按太累，而「这批不要了，只留这一份
+/// 对账」是连着五六下才能做完的事。左边还是右边按屏上位置算，跟新旧无关——
+/// 新的永远插在最左边，所以「关掉右侧全部」正好是「关掉比它更早的那几批」。
+fn tab_menu(ui: &mut Ui, panels: &[Panel], index: usize, act: &mut Clicked) {
+    let me = &panels[index];
+    // 菜单一拉开，标题最长那一条把它撑到底下，宽度跟着抖。先钉住。
+    ui.set_min_width(150.0);
+    close_row(ui, "关闭这个", "", &[me.task], act);
+    close_row(
+        ui,
+        "关闭左侧全部",
+        "这一份左边",
+        &tasks(&panels[..index]),
+        act,
+    );
+    close_row(
+        ui,
+        "关闭右侧全部",
+        "这一份右边",
+        &tasks(&panels[index + 1..]),
+        act,
+    );
+    close_row(
+        ui,
+        "关闭其他",
+        "除了这一份",
+        &tasks(panels.iter().filter(|p| p.task != me.task)),
+        act,
+    );
+    ui.separator();
+    let batch = tasks(panels.iter().filter(|p| p.run == me.run));
+    if batch.len() > 1 {
+        close_row(ui, "关掉这一批", "同一次执行", &batch, act);
+    }
+    close_row(ui, "关闭全部", "屏上所有", &tasks(panels), act);
+}
+
+/// 菜单里的一条：能关几个就写在括号里（「关闭这个」写个（1）是废话，就不写），
+/// 一个都没有就压灰——按下去没反应最招人。
+fn close_row(ui: &mut Ui, text: &str, where_: &str, targets: &[u64], act: &mut Clicked) {
+    let n = targets.len();
+    let label = if n > 1 {
+        format!("{text}（{n}）")
+    } else {
+        text.to_string()
+    };
+    let resp = ui.add_enabled(n > 0, egui::Button::new(label));
+    let resp = if n == 0 {
+        resp.on_disabled_hover_text(if where_.is_empty() {
+            "只剩这一份了".to_string()
+        } else {
+            format!("{where_}已经没有结果")
+        })
+    } else {
+        resp.on_hover_cursor(crate::theme::HAND)
+    };
+    if resp.clicked() {
+        act.closable.extend_from_slice(targets);
+        ui.close();
     }
 }
 
@@ -1651,6 +1766,37 @@ mod tests {
         out
     }
 
+    /// 右键某处，按完多跑一帧。
+    ///
+    /// 多出来那一帧不是保险丝：菜单开出来的第一帧 egui 只拿它量尺寸（`sizing_pass`），
+    /// 一个字都不落笔，当场断言必然看不见菜单项。
+    fn right_click(
+        dock: &mut ResultsDock,
+        ctx: &egui::Context,
+        pos: egui::Pos2,
+        t: f64,
+    ) -> egui::FullOutput {
+        let mut at = |pressed: bool, step: f64| {
+            show_pass(
+                dock,
+                ctx,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Secondary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                step,
+            )
+        };
+        at(true, t);
+        at(false, t + 0.02);
+        show_pass(dock, ctx, vec![], t + 0.04)
+    }
+
     /// 屏上某段文字最靠左的那一格。同一列里行号和格子内容会撞字，靠左的是行号。
     fn spot(out: &egui::FullOutput, needle: &str) -> Option<egui::Pos2> {
         seen(out)
@@ -2167,6 +2313,124 @@ mod tests {
         let third = texts(&show_pass(&mut dock, &ctx, vec![], 2.20));
         let bodies: Vec<&String> = third.iter().filter(|t| t.starts_with("SELECT ")).collect();
         assert_eq!(bodies, vec!["SELECT 3"], "点完只留第三条");
+    }
+
+    fn ids(dock: &ResultsDock) -> Vec<u64> {
+        dock.panels.iter().map(|p| p.task).collect()
+    }
+
+    /// 十条结果排成横的一行，不是一屏一行往下摞。
+    ///
+    /// 这条盯的是 `ScrollArea::horizontal()`：它只管滚，内容区沿用外面那一格的竖排，
+    /// 少了里面那句 `ui.horizontal` 就是「页签越跑越多、栏子越摞越高」那个样子。
+    /// 屏只有 900 宽，十条排到屏外也照排——横排不许换行，溢出交给滚动条。
+    #[test]
+    fn ten_tabs_line_up_in_one_row() {
+        let mut dock = ResultsDock::new();
+        let stmts: Vec<String> = (1..=10).map(|i| format!("SELECT {i}")).collect();
+        let list: Vec<&str> = stmts.iter().map(String::as_str).collect();
+        dock.start_run("本机", "查十条", &parts(&list), None);
+        for id in 1..=10 {
+            dock.on_event(&event(id, Ok(query(id, 1))));
+        }
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let out = show_pass(&mut dock, &ctx, vec![], 1.0);
+
+        let rows: Vec<egui::Rect> = seen(&out)
+            .into_iter()
+            .filter(|(t, _)| (1..=10).any(|i| *t == format!("{i}·SELECT {i}")))
+            .map(|(_, rect)| rect)
+            .collect();
+        assert_eq!(rows.len(), 10, "十条页签没画全：{rows:?}");
+        let y = rows[0].center().y;
+        assert!(
+            rows.iter().all(|r| (r.center().y - y).abs() < 0.5),
+            "页签排成了好几行：{rows:?}"
+        );
+        let mut lefts: Vec<f32> = rows.iter().map(|r| r.min.x).collect();
+        lefts.sort_by(f32::total_cmp);
+        assert!(
+            lefts.windows(2).all(|w| w[1] - w[0] > 1.0),
+            "页签互相压着或者叠在同一格：{lefts:?}"
+        );
+    }
+
+    /// 右键页签：一次关掉一批。左还是右按屏上位置算，不按新旧——
+    /// 新的永远插在最左边，所以「关掉右侧全部」等于「关掉比它更早的那几份」。
+    #[test]
+    fn right_clicking_a_tab_closes_a_whole_side() {
+        let mut dock = dock(); // 一批三条：task 1、2、3
+        for id in 1..=3 {
+            dock.on_event(&event(id, Ok(query(id, 1))));
+        }
+        dock.start_run(
+            "本机",
+            "再查两条",
+            &offset_parts(&["SELECT nine", "SELECT ten"], 3),
+            None,
+        );
+        assert_eq!(ids(&dock), vec![4, 5, 1, 2, 3], "新的该排在最左边");
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let out = show_pass(&mut dock, &ctx, vec![], 1.0);
+        let tab = spot(&out, "1·SELECT 1").expect("第三条那个页签没画出来");
+        let out = right_click(&mut dock, &ctx, tab, 2.0);
+        let shown = texts(&out);
+        for want in [
+            "关闭左侧全部（2）",
+            "关闭右侧全部（2）",
+            "关闭其他（4）",
+            "关掉这一批（3）",
+            "关闭全部（5）",
+        ] {
+            assert!(
+                shown.iter().any(|t| t == want),
+                "右键菜单少了「{want}」：{shown:?}"
+            );
+        }
+
+        let pos = spot(&out, "关闭右侧全部（2）").expect("菜单里点不到「关闭右侧全部」");
+        click(&mut dock, &ctx, pos, 3.0);
+        assert_eq!(ids(&dock), vec![4, 5, 1], "右边那两份没跟着关掉");
+
+        // 最左边那个页签左边没东西了：那一条压灰、括号里也不报数
+        let out = show_pass(&mut dock, &ctx, vec![], 4.0);
+        let first = spot(&out, "1·SELECT nine").expect("第一条页签没画出来");
+        let shown = texts(&right_click(&mut dock, &ctx, first, 5.0));
+        assert!(
+            shown.iter().any(|t| t == "关闭左侧全部"),
+            "没得关的时候这条也该在菜单里，只是压灰：{shown:?}"
+        );
+        assert!(
+            !shown.iter().any(|t| t.starts_with("关闭左侧全部（")),
+            "左边一个都没有还报了数：{shown:?}"
+        );
+    }
+
+    /// 「关闭全部」和 ✕ 一个一个按到底是一样的收场：屏上空了，选中项也一起归零，
+    /// 不留一个指着已关页签的 `active` 在状态里。
+    #[test]
+    fn closing_every_tab_from_the_menu_empties_the_dock() {
+        let mut dock = dock();
+        for id in 1..=3 {
+            dock.on_event(&event(id, Ok(query(id, 1))));
+        }
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let out = show_pass(&mut dock, &ctx, vec![], 1.0);
+        let tab = spot(&out, "2·SELECT 2").expect("第二条那个页签没画出来");
+        let out = right_click(&mut dock, &ctx, tab, 2.0);
+        let pos = spot(&out, "关闭全部（3）").expect("菜单里点不到「关闭全部」");
+        click(&mut dock, &ctx, pos, 3.0);
+        assert!(dock.is_empty(), "说好的全部关闭，还剩 {:?}", ids(&dock));
+        assert_eq!(dock.active, None, "关空了不该还指着一条");
+        let shown = texts(&show_pass(&mut dock, &ctx, vec![], 4.0));
+        assert!(
+            shown.iter().any(|t| t.starts_with("还没有结果")),
+            "关空了得回到空状态：{shown:?}"
+        );
     }
 
     /// 页签选中项被挤掉、被关掉，同一帧就得退到还有结果的那一格，
