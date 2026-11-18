@@ -91,9 +91,9 @@ impl SettingsSection {
 /// 编辑器面板存的是 `tabs` 的下标而不是路径：同一个文件允许同时出现在两块面板里
 /// （对比、边看边写），用下标才表达得出「两块面板共用一份 buffer」。
 ///
-/// `Terminal` 只出现在终端窗口的树里：主窗口那棵树从头到尾只有 `Editor`，
+/// `Terminal` 只出现在终端页签的树里：编辑那棵树从头到尾只有 `Editor`，
 /// 两边共用这一个类型，面板命令（拆分 / 移动 / 关闭 / 聚焦）才能用同一套代码
-/// 按当前 pass 作用在对应的树上，不必为两种载荷各写一遍。
+/// 按当前作用域作用在对应的树上，不必为两种载荷各写一遍。
 #[derive(Clone, Copy, Debug)]
 enum PaneKind {
     Editor(Option<usize>),
@@ -134,40 +134,31 @@ struct QuickOpen {
     sel: usize,
 }
 
-/// 面板命令的作用范围：主窗口那棵编辑树，还是某扇终端窗口的 shell 树。
+/// 面板命令的作用范围：编辑那棵树，还是某个终端页签的 shell 树。
 ///
 /// 两棵树装的是同一个 [`PaneKind`]，所以结构性动作（拆分 / 移动 / 关闭 / 切焦点）
 /// 用同一套命令、同一套网格代码，靠这个作用域决定打到哪棵树上。
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum PaneScope {
     Main,
     Term(u64),
 }
 
-/// 一扇终端窗口：自带一棵只装 shell 的面板树。
+/// 一组终端：页签条上占一格，里面是一棵可以切分的 shell 面板树。
 ///
-/// 像 Windows Terminal / tmux：点一次「新建终端」起一条 shell、开一扇同级窗口，
-/// 窗口里还能再切分（每格一条独立的 PTY）。点系统的 × 只是把窗口收起来——PTY
-/// 继续跑、滚动区留着，按 `Ctrl+`` 或顶栏「终端」能原样唤回；真要结束一条 shell
-/// 按格子里的 ×，最后一格被关掉时这扇窗口跟着消失。
-struct TermWindow {
-    /// 稳定序号，用来派生 viewport id、窗口标题和级联位置
+/// 终端页签和文件页签排在同一条上（浏览器式）：点「+终端」新开一格，一格里面还能
+/// 再上下左右切分，每格一条独立 PTY。格子里的 × 只结束那一条 shell，页签上的 ×
+/// 把这一组全收掉；组里最后一格被关掉，这个页签跟着消失。
+struct TermTab {
+    /// 稳定序号：页签会从中间被关掉，命令按它找页签，不按下标
     id: u64,
     tree: PaneTree<PaneKind>,
-    /// 这一帧算出的面板矩形：方位跳转、移动面板定落点都要用它
+    /// 这一帧算出的面板矩形：方位跳转、移动面板定落点、拖分隔条都要用它
     layout: TreeLayout,
-    /// 系统 × 只把它置 false，窗口不在这趟 pass 里出现，PTY 照旧活着
-    visible: bool,
-    /// 窗口外框左上角 + 内容尺寸（都是 egui 点、监视器坐标）。每帧记下，
-    /// 收起来再打开时放回原处——重建窗口是 eframe 干的，它不记得上次放哪了。
-    last_outer: Option<egui::Pos2>,
-    last_inner: Option<egui::Vec2>,
-    /// 刚出现（或刚唤回）的那几帧要摆一次位置；之后不再管，免得跟用户拖动打架
-    needs_place: bool,
 }
 
-impl TermWindow {
-    /// 新开一扇窗口：里面只有 `term_id` 这一条 shell。
+impl TermTab {
+    /// 新开一组终端：里面只有 `term_id` 这一条 shell。
     fn new(id: u64, term_id: u64) -> Self {
         let mut tree = PaneTree::new();
         tree.set_root(PaneKind::Terminal(term_id));
@@ -175,18 +166,10 @@ impl TermWindow {
             id,
             tree,
             layout: TreeLayout::default(),
-            visible: true,
-            last_outer: None,
-            last_inner: None,
-            needs_place: true,
         }
     }
 
-    fn viewport_id(&self) -> egui::ViewportId {
-        egui::ViewportId::from_hash_of(("ee-term-win", self.id))
-    }
-
-    /// 这扇窗口里的 shell 有哪些（顺序按面板树）。
+    /// 这一组里的 shell 有哪些（顺序按面板树）。
     fn term_ids(&self) -> Vec<u64> {
         self.tree
             .pane_ids()
@@ -195,21 +178,16 @@ impl TermWindow {
             .collect()
     }
 
-    /// 窗口标题：跟着第一条 shell 的名字走，看不出是哪扇就不好了。
-    ///
-    /// 前缀 [`titlebar::CHILD_PREFIX`] 不能动：那是无头之外认出这几扇操作系统窗口、
-    /// 给它们刷主题色的唯一线索。
+    /// 页签上的名字：跟着第一条还活着的 shell 走，一排页签里看不出哪个是哪个就不好了。
     fn title(&self, panel: &TerminalPanel) -> String {
-        let name = self
-            .term_ids()
+        self.term_ids()
             .into_iter()
             .find_map(|t| panel.pane_title(t))
-            .unwrap_or_else(|| "已退出".to_string());
-        format!("{}{name}", titlebar::CHILD_PREFIX)
+            .unwrap_or_else(|| "已退出".to_string())
     }
 
     /// 面板级命令（拆分 / 关闭 / 移动 / 聚焦）作用在 `self.tree` 上。
-    /// 返回要说给用户听的那句（起不了 shell、窗口收掉），没什么要说就 `None`。
+    /// 返回要说给用户听的那句（起不了 shell、关掉了一格），没什么要说就 `None`。
     fn command(&mut self, cmd: PaneCmd, panel: &mut TerminalPanel) -> Option<String> {
         match cmd {
             PaneCmd::Split(id, axis) => {
@@ -220,7 +198,7 @@ impl TermWindow {
                     .payload_of(target)
                     .copied()
                     .and_then(PaneKind::terminal_id)?;
-                // 同窗口再切一格就是再起一条 shell，跟着那格的工作目录走
+                // 同组再切一格就是再起一条 shell，跟着那格的工作目录走
                 let cwd = panel
                     .get(t)
                     .map(|term| term.cwd.clone())
@@ -238,7 +216,7 @@ impl TermWindow {
                     panel.remove(new_id);
                     return Some("没有可拆分的面板".into());
                 }
-                Some("已在此窗口新建一格终端".into())
+                Some("已在本组新建一格终端".into())
             }
             PaneCmd::Move(id, dir) => {
                 let moved = self.tree.move_to_edge(&self.layout, id, dir);
@@ -252,9 +230,9 @@ impl TermWindow {
                 panel.remove(t);
                 self.tree.remove(id);
                 if self.tree.count() == 0 {
-                    // 最后一格关掉 = 这扇窗口没用了，窗口跟着消失（调用方按
-                    // `tree.count()` 把它摘掉）。留一扇没 shell 的空壳不如收掉。
-                    return Some("已关闭终端窗口".into());
+                    // 最后一格关掉 = 这一组没用了，页签跟着收掉（调用方按 `tree.count()`
+                    // 把它摘掉）。留一个没 shell 的空页签不如关掉。
+                    return Some("已关闭终端页签".into());
                 }
                 self.request_focused_term(panel);
                 Some("已关闭面板".into())
@@ -290,11 +268,11 @@ impl TermWindow {
     }
 }
 
-/// 面板级命令。两棵树装的是同一个 `PaneKind`，所以同一份命令既能打在主窗口的
-/// 编辑树上，也能打在终端窗口的 shell 树上——`Split` / `Move` 这些结构性动作
-/// 由 `PaneTree` 自己做，载荷怎么来的由各自的实现管。
+/// 面板级命令。两棵树装的是同一个 `PaneKind`，所以同一份命令既能打在编辑树上，
+/// 也能打在终端页签的 shell 树上——`Split` / `Move` 这些结构性动作由 `PaneTree`
+/// 自己做，载荷怎么来的由各自的实现管。
 enum PaneCmd {
-    /// 在 `id` 这格旁边再切一格（终端窗口里 = 再起一条同目录的 shell）
+    /// 在 `id` 这格旁边再切一格（终端页签里 = 再起一条同目录的 shell）
     Split(PaneId, Axis),
     Move(PaneId, Dir),
     Close(PaneId),
@@ -344,53 +322,6 @@ fn auto_axis(rect: Option<egui::Rect>) -> Axis {
         Some(r) if r.height() > r.width() => Axis::Vertical,
         _ => Axis::Horizontal,
     }
-}
-
-/// 终端窗口的图标：和主窗口同一张，任务栏里认得出是一家的。解一次存着，
-/// 别每扇窗每帧重解一遍 PNG。
-fn term_window_icon() -> std::sync::Arc<egui::IconData> {
-    static ICON: std::sync::OnceLock<std::sync::Arc<egui::IconData>> = std::sync::OnceLock::new();
-    ICON.get_or_init(|| {
-        let png = include_bytes!("../assets/easy-editor-256.png");
-        std::sync::Arc::new(
-            eframe::icon_data::from_png_bytes(png)
-                .expect("assets/easy-editor-256.png 不是能解码的 PNG，重跑 tools/render-icon.ps1"),
-        )
-    })
-    .clone()
-}
-
-/// 终端窗口的建窗属性：标题、图标、尺寸、位置。
-///
-/// 位置只在「建这一扇」那一刻生效，而 eframe 每次唤回都是真的新建一扇（旧的那扇
-/// 已经被它回收），所以得把记下的位置带回来；第一次出现没记过的，照着主窗口往右下
-/// 级联，几扇叠在一起也看得清。建窗那刻 winit 把它当内容区左上角用，差一条边框，
-/// 真正摆正在 [`EasyEditorApp::term_window_pass`] 里补一次 `OuterPosition`。
-fn term_viewport(
-    win_id: u64,
-    title: &str,
-    last_outer: Option<egui::Pos2>,
-    last_inner: Option<egui::Vec2>,
-    ctx: &egui::Context,
-) -> egui::ViewportBuilder {
-    let default_inner = egui::vec2(theme::scale(ctx, 900.0), theme::scale(ctx, 620.0));
-    egui::ViewportBuilder::default()
-        .with_title(title)
-        .with_icon(term_window_icon())
-        .with_inner_size(last_inner.unwrap_or(default_inner))
-        .with_min_inner_size(egui::vec2(
-            theme::scale(ctx, 420.0),
-            theme::scale(ctx, 240.0),
-        ))
-        .with_position(last_outer.unwrap_or_else(|| {
-            let base = ctx
-                .input(|i| i.viewport().outer_rect)
-                .map(|r| r.min)
-                .unwrap_or(egui::pos2(120.0, 120.0));
-            // 级联：每往下一扇挪开一点，别把上一扇整个盖住
-            let step = 34.0 * (win_id % 6) as f32;
-            base + egui::vec2(step, step)
-        }))
 }
 
 pub struct EasyEditorApp {
@@ -448,15 +379,15 @@ pub struct EasyEditorApp {
     /// 正在录制新快捷键的动作 id
     recording: Option<String>,
     /// 中央区域的面板树（tmux 式：一块块面板递归切分）。只装编辑面板——
-    /// 终端从这一版起挪到各自独立的系统窗口里，见 `term_windows`
+    /// shell 全在终端页签的树里，见 `term_tabs`
     panes: PaneTree<PaneKind>,
-    /// 终端窗口：一扇一条 shell（窗口内可再切分）。藏起来的也留在这儿，PTY 不掉
-    term_windows: Vec<TermWindow>,
-    /// 已经用过的终端窗口序号，兼作级联摆放的偏移
+    /// 终端页签：一格一组 shell（组内还能再切分），和文件页签排在同一条页签栏上
+    term_tabs: Vec<TermTab>,
+    /// 已经用过的终端页签序号。页签会从中间被关掉，所以序号只增不复用
     term_seq: u64,
-    /// 上次刷给终端窗口标题栏的（主题，窗口数）。窗口数一变说明有新窗口冒出来，
-    /// 得重扫一遍；一直不变就别每帧去翻系统的窗口表。
-    term_titlebar: Option<(bool, usize)>,
+    /// 中央区当前显示哪一组终端；`None` = 显示编辑区。存的是页签序号而不是下标：
+    /// 关掉一个页签不会让选中状态挪到隔壁那组去
+    term_active: Option<u64>,
     /// 数据库连接：侧栏「数据库」页签 + 连接管理窗口，SQL 块也从这里取连接
     database: DatabasePanel,
     /// 底部结果区：一条语句一个面板，同时展示这次执行拿到的所有结果
@@ -623,9 +554,9 @@ impl EasyEditorApp {
             keymap,
             recording: None,
             panes: PaneTree::new(),
-            term_windows: Vec::new(),
+            term_tabs: Vec::new(),
             term_seq: 0,
-            term_titlebar: None,
+            term_active: None,
             database: DatabasePanel::new(db_connections),
             results: ResultsDock::new(),
             auto_ran: std::collections::HashMap::new(),
@@ -1802,7 +1733,7 @@ impl EasyEditorApp {
             self.new_terminal();
         }
         if self.keymap.consume(ctx, "terminal_toggle") {
-            self.focus_or_new_terminal(ctx);
+            self.focus_or_new_terminal();
         }
         if self.keymap.consume(ctx, "tab_close") {
             self.close_focused();
@@ -1819,9 +1750,10 @@ impl EasyEditorApp {
         if self.keymap.consume(ctx, "screenshot") {
             self.take_screenshot(ctx);
         }
-        // 面板级快捷键统一走 pane_shortcuts：主窗口只管自己那棵编辑树，
-        // 每扇终端窗口在自己的 pass 里再调一次，读的是各自视口的输入
-        self.pane_shortcuts(ctx, PaneScope::Main);
+        // 面板级快捷键统一走 pane_shortcuts，打在「当前在前面的那棵树」上：
+        // 编辑区在前就是编辑树，终端页签在前就是那一组的 shell 树
+        let scope = self.front_scope();
+        self.pane_shortcuts(ctx, scope);
         if self.keymap.consume(ctx, "format") {
             self.format_active();
         }
@@ -1838,7 +1770,7 @@ impl EasyEditorApp {
 
     // ---------- 面板树 ----------
 
-    /// 焦点所在编辑器面板的标签。终端在另外的窗口里，主窗口的焦点永远落在编辑面板上。
+    /// 焦点所在编辑器面板的标签。shell 都在终端页签的树里，编辑树的焦点永远是编辑格。
     fn focused_tab(&self) -> Option<usize> {
         self.panes
             .focus()
@@ -1865,9 +1797,10 @@ impl EasyEditorApp {
             .map(|_| focused)
     }
 
-    /// 把标签交给「当前该显示它的地方」：焦点是编辑器面板就换掉它的内容，
-    /// 焦点是终端则另开一块编辑面板——绝不覆盖正在跑的 shell。
+    /// 把标签交给「当前该显示它的地方」：焦点面板换成这个标签，并且翻回编辑区——
+    /// 从文件树里点开一个文件，不该还对着终端那一格。
     fn show_in_focused_pane(&mut self, idx: usize) {
+        self.term_active = None;
         let write = self.editor_pane_for_write();
         match write {
             Some(p) => {
@@ -1910,17 +1843,22 @@ impl EasyEditorApp {
         Some(id)
     }
 
-    /// 面板命令落到作用域对应的那棵树上：主窗口的编辑树，或某扇终端窗口的 shell 树。
+    /// 面板命令落到作用域对应的那棵树上：编辑树，或某个终端页签的 shell 树。
     ///
     /// 返回值里带一句要报给用户的话（起不了 shell、关掉了一格），没有就不改状态栏。
     fn pane_cmd(&mut self, scope: PaneScope, cmd: PaneCmd) {
         let status = match scope {
             PaneScope::Main => self.main_pane_cmd(cmd),
-            PaneScope::Term(win) => match self.term_windows.iter_mut().find(|w| w.id == win) {
-                Some(w) => w.command(cmd, &mut self.terminal),
+            PaneScope::Term(tab) => match self.term_tabs.iter_mut().find(|t| t.id == tab) {
+                Some(t) => t.command(cmd, &mut self.terminal),
                 None => None,
             },
         };
+        if matches!(scope, PaneScope::Term(_)) {
+            // 格子里的 × 关到最后一格，这个页签就没用了：摘掉它，中央区该显示什么
+            // 也由这里定（还留着别的页签就翻到最后那个，一组都没有就回编辑区）
+            self.prune_term_tabs();
+        }
         if let Some(text) = status {
             self.status = text;
         }
@@ -1964,17 +1902,17 @@ impl EasyEditorApp {
         }
     }
 
-    /// 面板级快捷键（拆分 / 关闭 / 切焦点）。主窗口和每扇终端窗口各调一次：
-    /// `keymap.consume` 读的是当前视口的输入，谁在焦点上就只吃自己那一趟的事件，
-    /// 所以同一份代码不会把两个窗口的按键搅在一起。
+    /// 面板级快捷键（拆分 / 关闭 / 切焦点）。一次只打在一棵树上：谁在中央区前面
+    /// 就归谁（见 [`EasyEditorApp::front_scope`]），所以编辑区和终端页签不会互相
+    /// 抢同一串按键。
     fn pane_shortcuts(&mut self, ctx: &egui::Context, scope: PaneScope) {
         let focused = match scope {
             PaneScope::Main => self.panes.focus(),
             PaneScope::Term(id) => self
-                .term_windows
+                .term_tabs
                 .iter()
-                .find(|w| w.id == id)
-                .and_then(|w| w.tree.focus()),
+                .find(|t| t.id == id)
+                .and_then(|t| t.tree.focus()),
         };
         if self.keymap.consume(ctx, "split_col") {
             if let Some(id) = focused {
@@ -1990,11 +1928,11 @@ impl EasyEditorApp {
             if let Some(id) = focused {
                 let rect = match scope {
                     PaneScope::Main => self.pane_layout.pane_rect(id),
-                    PaneScope::Term(win) => self
-                        .term_windows
+                    PaneScope::Term(tab) => self
+                        .term_tabs
                         .iter()
-                        .find(|w| w.id == win)
-                        .and_then(|w| w.layout.pane_rect(id)),
+                        .find(|t| t.id == tab)
+                        .and_then(|t| t.layout.pane_rect(id)),
                 };
                 self.pane_cmd(scope, PaneCmd::Split(id, auto_axis(rect)));
             }
@@ -2030,11 +1968,12 @@ impl EasyEditorApp {
         }
     }
 
-    /// 新建一扇终端窗口：起一条 shell，配一棵只装它的面板树。
+    /// 新建一个终端页签：起一条 shell，配一棵只装它的面板树，并翻到它前面。
     ///
-    /// 一个 shell 一扇窗，这就是「终端不跟文件编辑挤在一个大窗口里」的落点：
-    /// 主窗口那棵树从头到尾只有编辑面板，shell 全在各自同级窗口的树里。
-    fn new_terminal_window(&mut self, cwd: &Path) {
+    /// 终端页签和文件页签排在同一条页签栏上，中央区一次只显示一格——这就是「终端
+    /// 不跟文件编辑挤在一起」的落点：编辑那棵树从头到尾只有编辑面板，shell 全在
+    /// 页签自己的树里。
+    fn new_terminal_tab(&mut self, cwd: &Path) {
         let term_id = match self.terminal.create_at(cwd) {
             Ok(id) => id,
             Err(e) => {
@@ -2044,16 +1983,57 @@ impl EasyEditorApp {
         };
         let id = self.term_seq;
         self.term_seq += 1;
-        self.term_windows.push(TermWindow::new(id, term_id));
-        // 新窗口里的 shell 直接接手键盘，点完「+终端」就能开始打字
+        self.term_tabs.push(TermTab::new(id, term_id));
+        self.term_active = Some(id);
+        // 新页签里的 shell 直接接手键盘，点完「+终端」就能开始打字
         self.terminal.request_focus(term_id);
-        self.status = "已新建终端窗口".into();
+        self.status = "已新建终端页签".into();
     }
 
-    /// 在当前工作目录下新建一扇终端窗口（顶栏「+终端」、`Ctrl+⇧\``、自检脚本）。
+    /// 在当前工作目录下新建一个终端页签（顶栏「+终端」、`Ctrl+⇧\``、自检脚本）。
     fn new_terminal(&mut self) {
         let cwd = self.terminal.cwd.clone();
-        self.new_terminal_window(&cwd);
+        self.new_terminal_tab(&cwd);
+    }
+
+    /// 中央区这一帧该把面板命令打在哪棵树上：终端页签在前就归它，否则归编辑树。
+    fn front_scope(&self) -> PaneScope {
+        self.term_active
+            .map(PaneScope::Term)
+            .unwrap_or(PaneScope::Main)
+    }
+
+    /// 翻到某个终端页签前面，并把键盘交给它焦点格里的 shell。
+    fn show_term_tab(&mut self, id: u64) {
+        let Some(at) = self.term_tabs.iter().position(|t| t.id == id) else {
+            return;
+        };
+        self.term_tabs[at].request_focused_term(&mut self.terminal);
+        self.term_active = Some(id);
+    }
+
+    /// 格子全被关掉的页签摘掉。眼前那组被摘掉就翻到最后剩下的那组，一组都不剩
+    /// 才回编辑区——页签栏空了还杵在终端视图上会剩一块死白。
+    fn prune_term_tabs(&mut self) {
+        self.term_tabs.retain(|t| t.tree.count() > 0);
+        if let Some(id) = self.term_active {
+            if !self.term_tabs.iter().any(|t| t.id == id) {
+                self.term_active = self.term_tabs.last().map(|t| t.id);
+            }
+        }
+    }
+
+    /// 页签栏上那把 ×：这一组的 shell 全收掉，页签跟着关掉。
+    fn close_term_tab(&mut self, id: u64) {
+        let Some(at) = self.term_tabs.iter().position(|t| t.id == id) else {
+            return;
+        };
+        for t in self.term_tabs[at].term_ids() {
+            self.terminal.remove(t);
+        }
+        self.term_tabs.remove(at);
+        self.prune_term_tabs();
+        self.status = "已关闭终端页签".into();
     }
 
     /// 把一块面板移到最靠某个方向的边缘（右键面板标题）。
@@ -2064,33 +2044,29 @@ impl EasyEditorApp {
         self.sync_active();
     }
 
-    /// `Ctrl+`` / 顶栏「终端」：先把藏起来的窗口唤回原位，没有藏的就到前台点名开着的
-    /// 那一扇，一扇都没有才新建。内嵌终端从这一版起没有了，所以这个键只管窗口。
-    fn focus_or_new_terminal(&mut self, ctx: &egui::Context) {
-        // 藏起来的窗口排最后：按 `Ctrl+`` 多半是想接着用刚才那扇
-        if let Some(win) = self.term_windows.iter_mut().rev().find(|w| !w.visible) {
-            win.visible = true;
-            win.needs_place = true;
-            win.request_focused_term(&mut self.terminal);
-            self.status = "已唤回终端窗口".into();
-            // 这一帧后面才轮到终端窗口的 pass，窗口这就建起来了
-            ctx.request_repaint();
+    /// `Ctrl+`` / 顶栏「终端」：在编辑区和终端之间来回切。终端页签正显示着就收回
+    /// 编辑区；否则翻到最后那组接着用（滚动区、还在跑的命令都原样留着）；一组都
+    /// 没有才新建。
+    fn focus_or_new_terminal(&mut self) {
+        if self.term_active.is_some() {
+            self.term_active = None;
+            self.status = "已切回编辑区 · Ctrl+` 唤回终端".into();
             return;
         }
-        if let Some(id) = self.term_windows.last().map(|w| w.viewport_id()) {
-            // 已经开着：把它提到前面，别再叠一扇一模一样的
-            ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
+        if let Some(id) = self.term_tabs.last().map(|t| t.id) {
+            self.show_term_tab(id);
+            self.status = "已唤回终端页签".into();
             return;
         }
         self.new_terminal();
     }
 
-    /// 第一条还在窗口里的 shell，自检脚本往里敲命令用。藏起来的窗口也算：
+    /// 第一条还活着的 shell，自检脚本往里敲命令用。没在页签上显示的组也算：
     /// PTY 一直活着，脚本要的就是这条链路能写进去。
     fn first_terminal_id(&self) -> Option<u64> {
-        self.term_windows
+        self.term_tabs
             .iter()
-            .find_map(|w| w.term_ids().first().copied())
+            .find_map(|t| t.term_ids().first().copied())
     }
 
     /// 关掉一块面板。只剩一块时不销毁，退回空白编辑面板。
@@ -2109,124 +2085,37 @@ impl EasyEditorApp {
         self.status = "已关闭面板".into();
     }
 
-    /// 关闭焦点面板里的标签。主窗口的格子全是编辑格，所以这里不会碰到 shell；
-    /// 终端窗口里那把 × 走 [`PaneCmd::Close`]（真杀进程），不占这个键。
+    /// 关闭焦点面板里的标签。编辑树的格子全是编辑格，所以这里不会碰到 shell；
+    /// 终端页签上的 × 走 [`EasyEditorApp::close_term_tab`]，格子里的 × 走
+    /// [`PaneCmd::Close`]（真杀进程），都不占这个键。
     fn close_focused(&mut self) {
         if let Some(idx) = self.focused_tab() {
             self.close_tab(idx);
         }
     }
 
-    // ---------- 终端窗口 ----------
+    // ---------- 终端页签 ----------
 
-    /// 每扇看得见的终端窗口跑一趟独立 pass。
-    ///
-    /// 用 `show_viewport_immediate` 而不是 deferred：deferred 的闭包要存进 `Arc`，
-    /// 状态得搬去 `ctx.data`，而这批状态就是 `self` 本身。immediate 的闭包在主线程
-    /// 就地调用，可以直接 `&mut self`；代价是父子窗口互相拉起重绘——反正终端输出
-    /// 本来就按 30fps 催帧，多一趟不算额外空转。
-    ///
-    /// 无头测试里 `embed_viewports` 是默认的 `true`，这一趟会在主窗口内嵌成一个小
-    /// `Window` 画出来，所以测试照样断言得到终端内容。
-    fn term_windows_pass(&mut self, ctx: &egui::Context) {
-        // 先收快照：闭包里要改 self.term_windows，不能一边迭代一边改
-        let open: Vec<(u64, egui::ViewportId, egui::ViewportBuilder)> = self
-            .term_windows
-            .iter()
-            .filter(|w| w.visible && w.tree.count() > 0)
-            .map(|w| {
-                (
-                    w.id,
-                    w.viewport_id(),
-                    term_viewport(w.id, &w.title(&self.terminal), w.last_outer, w.last_inner, ctx),
-                )
-            })
-            .collect();
-        let count = open.len();
-        for (win_id, viewport_id, builder) in open {
-            ctx.show_viewport_immediate(viewport_id, builder, |ui, _class| {
-                self.term_window_pass(ui, win_id)
-            });
-        }
-        // 子窗口的标题栏是 DWM 画的，egui 管不着：主题一变、或者窗口多一扇少一扇，
-        // 就重扫一遍系统里的窗口把它刷对（认人靠 `title` 里的那个前缀）。
-        let key = if count == 0 {
-            None
-        } else {
-            Some((self.dark, count))
-        };
-        if key != self.term_titlebar {
-            if let Some((dark, _)) = key {
-                titlebar::apply_children(self.hwnd, dark);
-            }
-            self.term_titlebar = key;
-        }
-        // 最后一格被 × 掉的窗口摘掉（eframe 见这扇 viewport 不再被用，自己把窗口销毁）；
-        // 系统 × 只置 visible=false，PTY 和滚动区都留着
-        self.term_windows.retain(|w| w.tree.count() > 0);
-    }
-
-    /// 一扇终端窗口自己那一趟 pass：算网格、快捷键、记下窗口位置尺寸，收好系统 ×。
-    fn term_window_pass(&mut self, ui: &mut Ui, win_id: u64) {
-        let ctx = ui.ctx().clone();
-        let Some(at) = self.term_windows.iter().position(|w| w.id == win_id) else {
+    /// 终端页签在前时，中央区画的是这一组的网格：和编辑区走同一套
+    /// [`EasyEditorApp::draw_grid`]，只是命令打到这个页签自己的树上。
+    fn term_grid(&mut self, ui: &mut Ui, tab_id: u64) {
+        let Some(at) = self.term_tabs.iter().position(|t| t.id == tab_id) else {
+            // 页签刚被关掉：回编辑区，别让这一帧画空
+            self.term_active = None;
             return;
         };
-        // 每帧记下位置尺寸：用户把它拖到哪、拉到多大，下次唤回照搬
-        let (outer, inner, close) = ctx.input(|i| {
-            (
-                i.viewport().outer_rect.map(|r| r.min),
-                i.viewport().inner_rect.map(|r| r.size()),
-                i.viewport().close_requested(),
-            )
-        });
-        {
-            let win = &mut self.term_windows[at];
-            win.last_outer = outer.or(win.last_outer);
-            win.last_inner = inner.or(win.last_inner);
-            if win.needs_place {
-                // 刚建出来那一帧的矩形还没报到，报到了才算摆正
-                if outer.is_some() {
-                    if let Some(pos) = win.last_outer {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-                    }
-                    if let Some(size) = win.last_inner {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-                    }
-                    win.needs_place = false;
-                }
-            }
-        }
+        let scope = PaneScope::Term(tab_id);
         let area = ui.available_rect_before_wrap();
-        let layout = self.term_windows[at].tree.layout(area, pane::DIVIDER);
-        self.term_windows[at].layout = layout.clone();
-        let scope = PaneScope::Term(win_id);
+        let layout = self.term_tabs[at].tree.layout(area, pane::DIVIDER);
+        self.term_tabs[at].layout = layout.clone();
         // 点在哪格就聚焦哪格：快捷键能循环切，但鼠标指哪打哪才是大家习惯的
-        if let Some(pos) = pane_click(&ctx, area) {
+        if let Some(pos) = pane_click(ui.ctx(), area) {
             if let Some(id) = layout.pane_at(pos) {
                 self.pane_cmd(scope, PaneCmd::Focus(id));
             }
         }
-        let leaves = pane_leaves(&self.term_windows[at].tree, &layout, self.tabs.len());
+        let leaves = pane_leaves(&self.term_tabs[at].tree, &layout, self.tabs.len());
         self.draw_grid(ui, &layout, &leaves, scope, "");
-        self.pane_shortcuts(&ctx, scope);
-        if close {
-            self.hide_term_window(win_id);
-        }
-    }
-
-    /// 系统 ×：只把这扇窗口收起来，PTY 和滚动区照旧活着。
-    ///
-    /// 无头测试里 `show_viewport_immediate` 走的是内嵌回退，永远收不到
-    /// `ViewportEvent::Close`，所以这件事单独摆出来，测试直接调它。
-    fn hide_term_window(&mut self, win_id: u64) {
-        let Some(win) = self.term_windows.iter_mut().find(|w| w.id == win_id) else {
-            return;
-        };
-        win.visible = false;
-        // 唤回时要重新摆位置：eframe 造的是新窗口，不记得上次拖到哪
-        win.needs_place = true;
-        self.status = "已收起终端窗口 · Ctrl+` 唤回".into();
     }
 
     // ---------- 格式化 ----------
@@ -2562,8 +2451,8 @@ impl EasyEditorApp {
                 }
             }
             "split" => {
-                const STAGES: [u64; 11] = [
-                    400, 1200, 2000, 2800, 3400, 3900, 4500, 5100, 5800, 6400, 7000,
+                const STAGES: [u64; 13] = [
+                    400, 1200, 2000, 2800, 3400, 3900, 4500, 5100, 5800, 6400, 7000, 7600, 8200,
                 ];
                 if self.verify_stage < STAGES.len() && ms >= STAGES[self.verify_stage] {
                     match self.verify_stage {
@@ -2606,18 +2495,18 @@ impl EasyEditorApp {
                             println!("[verify] split 格式化完成 status={}", self.status);
                         }
                         4 => {
-                            // 每扇终端一扇同级窗口：主窗口的格子数一个都不会变
+                            // 每新建一个终端就多一个页签：编辑区的格子数一个都不会变
                             self.new_terminal();
                             self.new_terminal();
                             println!(
-                                "[verify] split 终端窗口数={} shell数={} 主窗口面板数={}",
-                                self.term_windows.len(),
+                                "[verify] split 终端页签数={} shell数={} 编辑面板数={}",
+                                self.term_tabs.len(),
                                 self.terminal.len(),
                                 self.panes.count()
                             );
                         }
                         5 => {
-                            // 往第一扇窗口的 shell 敲一条命令，验证 PTY 写入链路
+                            // 往第一个页签的 shell 敲一条命令，验证 PTY 写入链路
                             match self.first_terminal_id() {
                                 Some(id) => {
                                     self.terminal.send_text(id, "echo EASY_EDITOR_PTY_OK\r");
@@ -2629,6 +2518,8 @@ impl EasyEditorApp {
                         // 下面三步走真实事件队列：按键由 handle_shortcuts 在下一帧消费，
                         // 所以每一步之间要留一帧以上的间隔
                         6 => {
+                            // 新建终端时页签翻到了前面，这里先让回编辑区再试自动拆分
+                            self.term_active = None;
                             ctx.input_mut(|i| {
                                 i.events.push(egui::Event::Key {
                                     key: Key::D,
@@ -2640,45 +2531,58 @@ impl EasyEditorApp {
                             });
                         }
                         7 => println!(
-                            "[verify] split Alt+Shift+D 后主窗口面板数={}（两块编辑格 → 应左右拆，变 3）",
+                            "[verify] split Alt+Shift+D 后编辑面板数={}（两块编辑格 → 应左右拆，变 3）",
                             self.panes.count()
                         ),
-                        // 窗口内再切一格走的是同一套面板命令，和主窗口的拆分互不相干
+                        // 页签内再切一格走的是同一套面板命令，和编辑区的拆分互不相干
                         8 => {
                             let target = self
-                                .term_windows
+                                .term_tabs
                                 .first()
-                                .and_then(|w| w.tree.focus().map(|id| (w.id, id)));
-                            if let Some((win, id)) = target {
-                                self.pane_cmd(
-                                    PaneScope::Term(win),
-                                    PaneCmd::Split(id, Axis::Horizontal),
-                                );
+                                .and_then(|t| t.tree.focus().map(|id| (t.id, id)));
+                            if let Some((tab, id)) = target {
+                                self.pane_cmd(PaneScope::Term(tab), PaneCmd::Split(id, Axis::Horizontal));
                             }
                             println!(
-                                "[verify] split 窗口内拆分后 第一扇格子数={} shell数={} status={}",
-                                self.term_windows
-                                    .first()
-                                    .map_or(0, |w| w.tree.count()),
+                                "[verify] split 页签内拆分后 第一组格子数={} shell数={} status={}",
+                                self.term_tabs.first().map_or(0, |t| t.tree.count()),
                                 self.terminal.len(),
                                 self.status
                             );
                         }
                         9 => println!(
-                            "[verify] split 终端窗口总览={}",
-                            self.term_windows
+                            "[verify] split 终端页签总览={}",
+                            self.term_tabs
                                 .iter()
-                                .map(|w| format!(
-                                    "#{} {}格 {}可见 「{}」",
-                                    w.id,
-                                    w.tree.count(),
-                                    if w.visible { "已开" } else { "已藏" },
-                                    w.title(&self.terminal)
+                                .map(|t| format!(
+                                    "#{} {}格 {}在前 「{}」",
+                                    t.id,
+                                    t.tree.count(),
+                                    if Some(t.id) == self.term_active { "翻" } else { "没" },
+                                    t.title(&self.terminal)
                                 ))
                                 .collect::<Vec<_>>()
                                 .join(" | ")
                         ),
-                        _ => self.take_screenshot(ctx),
+                        10 => self.take_screenshot_as(ctx, "shot-editor.bmp"),
+                        // 截图只拍到「编辑在前」那一面；这里再翻到终端页签，
+                        // 下一拍才是终端网格铺满中央区的那一面
+                        11 => {
+                            if let Some(id) = self.term_tabs.first().map(|t| t.id) {
+                                self.show_term_tab(id);
+                            }
+                        }
+                        _ => {
+                            let cells = self
+                                .term_active
+                                .and_then(|id| self.term_tabs.iter().find(|t| t.id == id))
+                                .map_or(0, |t| t.tree.count());
+                            println!(
+                                "[verify] split 停在终端页签 term_active={:?} 该组格子数={} 编辑面板数={}",
+                                self.term_active, cells, self.panes.count()
+                            );
+                            self.take_screenshot_as(ctx, "shot-term.bmp");
+                        }
                     }
                     self.verify_stage += 1;
                 }
@@ -2769,9 +2673,15 @@ impl EasyEditorApp {
     }
 
     fn take_screenshot(&mut self, ctx: &egui::Context) {
+        self.take_screenshot_as(ctx, "screenshot.bmp");
+    }
+
+    /// 截图存成指定文件名：一个脚本要拍好几面时（编辑在前 / 终端在前），
+    /// 都往 screenshot.bmp 写的话后一张会把前一张盖掉。
+    fn take_screenshot_as(&mut self, ctx: &egui::Context, name: &str) {
         let dir = config::app_data_dir();
         let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("screenshot.bmp");
+        let path = dir.join(name);
         let target = path.clone();
         ctx.request_screenshot(move |image| {
             let _ = save_bmp(&image, &target);
@@ -2947,18 +2857,20 @@ impl EasyEditorApp {
             }
 
             let h_term = format!(
-                "唤回或聚焦终端窗口，一扇都没有就新开  {}",
+                "在编辑区和终端之间来回切，一组终端都没有就新开  {}",
                 hint("terminal_toggle")
             );
             if ui
-                .button(RichText::new("终端").size(crate::theme::md(ui)))
+                .selectable_label(
+                    self.term_active.is_some(),
+                    RichText::new("终端").size(crate::theme::md(ui)),
+                )
                 .on_hover_text(h_term)
                 .clicked()
             {
-                let ctx = ui.ctx().clone();
-                self.focus_or_new_terminal(&ctx);
+                self.focus_or_new_terminal();
             }
-            let h_tnew = format!("新建一扇终端窗口  {}", hint("terminal_new"));
+            let h_tnew = format!("新建一个终端页签  {}", hint("terminal_new"));
             if ui
                 .button(RichText::new("+终端").size(crate::theme::md(ui)))
                 .on_hover_text(h_tnew)
@@ -3316,7 +3228,7 @@ impl EasyEditorApp {
                 self.open_file(path, None);
             }
             Some(TreeAction::Renamed(old, new)) => self.file_renamed(&old, &new),
-            Some(TreeAction::OpenTerminal(dir)) => self.new_terminal_window(&dir),
+            Some(TreeAction::OpenTerminal(dir)) => self.new_terminal_tab(&dir),
             Some(TreeAction::NewQuery(dir)) => self.new_query(Some(dir)),
             None => {}
         }
@@ -3944,6 +3856,12 @@ impl EasyEditorApp {
         egui::CentralPanel::default().show(ui, |ui| {
             self.tab_bar(ui);
             ui.separator();
+            // 终端页签翻在前面：中央区整块换成那一组的网格，编辑树原样退到后面，
+            // 切回文件页签时还是原来那几格、原来那个焦点。
+            if let Some(tab) = self.term_active {
+                self.term_grid(ui, tab);
+                return;
+            }
             let area = ui.available_rect_before_wrap();
             let layout = self.panes.layout(area, pane::DIVIDER);
             // 先存下这一帧的矩形：网格里点的「移动面板 / 拆分」按钮在同一帧末尾执行，
@@ -3964,9 +3882,12 @@ impl EasyEditorApp {
 
     /// 画一格面板的网格：每块面板一个用 `max_rect` 定位的子 `Ui`，最后再叠分隔线。
     ///
-    /// 主窗口的编辑树和每扇终端窗口的 shell 树共用这一套——格子的标题、拆分 / 移动 /
-    /// 关闭三个按钮、焦点描边、分隔条拖拽全都一样，不一样的是格子里放什么（编辑器
-    /// 还是 shell）以及命令打到哪棵树（`scope`）。
+    /// 编辑树和终端页签的 shell 树共用这一套——格子的标题、拆分 / 移动 / 关闭三个
+    /// 按钮、焦点描边、分隔条拖拽全都一样，不一样的是格子里放什么（编辑器还是
+    /// shell）以及命令打到哪棵树（`scope`）。
+    ///
+    /// 两棵树的 `PaneId` / `SplitId` 各数各的，所以 id 一律按作用域加盐：不然切到
+    /// 另一个终端页签会捡到上一个页签的面板状态（焦点、滚动位置串台）。
     ///
     /// 子 `Ui` 一律走 `scope_builder`，这样 egui 会正常收尾（记录 min_rect、推进光标）；
     /// 直接 `Ui::new` 造出来的面板没有父级关联，hover 和键盘焦点都会出问题。
@@ -3996,7 +3917,7 @@ impl EasyEditorApp {
             } else {
                 egui::Stroke::NONE
             };
-            let pane_id = ui.make_persistent_id(("pane", id.0));
+            let pane_id = ui.make_persistent_id(("pane", scope, id.0));
             let builder = egui::UiBuilder::new()
                 .scope_id(pane_id)
                 .max_rect(rect)
@@ -4114,7 +4035,7 @@ impl EasyEditorApp {
         }
 
         for d in &layout.dividers {
-            let did = ui.make_persistent_id(("divider", d.id.0));
+            let did = ui.make_persistent_id(("divider", scope, d.id.0));
             let resp = ui.interact(d.rect, did, egui::Sense::drag());
             if resp.dragged() {
                 if let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos()) {
@@ -4154,8 +4075,8 @@ impl EasyEditorApp {
         }
     }
 
-    /// 拖动分隔条。两棵树的 `SplitId` 各数各的（主窗口从 1 起，每扇终端窗口也从 1 起），
-    /// 所以必须按作用域打回自己那棵树，否则会把主窗口的比例改到别的面板上。
+    /// 拖动分隔条。两棵树的 `SplitId` 各数各的（编辑树从 1 起，每个终端页签也从 1 起），
+    /// 所以必须按作用域打回自己那棵树，否则会把编辑区的比例改到终端的面板上。
     fn drag_divider(
         &mut self,
         scope: PaneScope,
@@ -4167,20 +4088,30 @@ impl EasyEditorApp {
             PaneScope::Main => {
                 self.panes.drag_divider(id, &divider, pointer);
             }
-            PaneScope::Term(win) => {
-                if let Some(w) = self.term_windows.iter_mut().find(|w| w.id == win) {
-                    w.tree.drag_divider(id, &divider, pointer);
+            PaneScope::Term(tab) => {
+                if let Some(t) = self.term_tabs.iter_mut().find(|t| t.id == tab) {
+                    t.tree.drag_divider(id, &divider, pointer);
                 }
             }
         }
     }
 
-    /// 顶部标签栏。标签是全局的：一块面板只是「正在显示某个标签」，
+    /// 顶部标签栏。文件标签是全局的：一块面板只是「正在显示某个标签」，
     /// 关掉面板不会关掉标签，同一个标签也可以同时显示在两块面板里。
+    ///
+    /// 终端页签排在同一排的后面（浏览器式）：一次只显示一格，选中谁中央区就画谁。
+    /// 页签上的 × 收掉这一组的全部 shell；格子里的 × 关掉最后一条时页签自己消失。
     fn tab_bar(&mut self, ui: &mut Ui) {
         let mut activate = None;
         let mut close = None;
-        let shown = self.focused_tab();
+        let mut term_activate = None;
+        let mut term_close = None;
+        // 终端页签翻在前面时，文件页签一个都不该亮着——中央区画的不是它们
+        let shown = if self.term_active.is_some() {
+            None
+        } else {
+            self.focused_tab()
+        };
         // 一次算完整排：每个标签单独算会变成 O(n²) 的字符串拼活
         let paths: Vec<PathBuf> = self.tabs.iter().map(|t| t.path.clone()).collect();
         let titles = filetree::unique_titles(&paths);
@@ -4225,6 +4156,42 @@ impl EasyEditorApp {
                         }
                         ui.add_space(4.0);
                     }
+                    if !self.tabs.is_empty() && !self.term_tabs.is_empty() {
+                        // 一条竖线隔开：后面这几格是终端，不是文件
+                        ui.separator();
+                    }
+                    for tab in self.term_tabs.iter() {
+                        let name = tab.title(&self.terminal);
+                        let cells = tab.tree.count();
+                        let mut label = format!("⌨ {name}");
+                        if cells > 1 {
+                            label.push_str(&format!(" ×{cells}"));
+                        }
+                        if ui
+                            .selectable_label(
+                                Some(tab.id) == self.term_active,
+                                RichText::new(label).size(crate::theme::md(ui)),
+                            )
+                            .on_hover_text(format!(
+                                "{name}：这一组有 {cells} 格终端，格子里还能再左右 / 上下拆分\n\
+                                 点 × 关闭这一组的全部 shell"
+                            ))
+                            .clicked()
+                        {
+                            term_activate = Some(tab.id);
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("×").size(crate::theme::sm(ui)))
+                                    .frame(false),
+                            )
+                            .on_hover_text("关闭这一组终端")
+                            .clicked()
+                        {
+                            term_close = Some(tab.id);
+                        }
+                        ui.add_space(4.0);
+                    }
                 });
             });
 
@@ -4233,6 +4200,12 @@ impl EasyEditorApp {
         }
         if let Some(i) = close {
             self.close_tab(i);
+        }
+        if let Some(id) = term_activate {
+            self.show_term_tab(id);
+        }
+        if let Some(id) = term_close {
+            self.close_term_tab(id);
         }
     }
 
@@ -4246,7 +4219,9 @@ impl EasyEditorApp {
     }
 
     /// 点击标签：已经显示在某块面板里就把焦点切过去，否则送到该显示它的地方。
+    /// 选中文件页签也顺带把中央区从终端让回来——一次只显示一格。
     fn activate_tab(&mut self, idx: usize) {
+        self.term_active = None;
         let hit = self
             .panes
             .pane_ids()
@@ -5182,11 +5157,6 @@ impl EasyEditorApp {
         // 排最后：这是开局的告警，盖在其他浮窗上面才不会被当成普通窗口埋掉
         self.config_trouble_window(&ctx);
 
-        // 每扇终端窗口一趟独立 pass。放在主窗口内容画完之后：这一帧的 shell 列表、
-        // 主题、字号都已经定下来了，子窗口照着同一份状态画，不会和主窗口各说各话。
-        // PTY 的输出在上面每帧的 `pump()` 里就进了屏幕模型，这里只负责画。
-        self.term_windows_pass(&ctx);
-
         // 编辑器在 central() 里才会把最新光标写回 OpenFile，所以放在最后收
         self.poll_caret(&ctx);
         // 自动执行要看的是这一帧最新的文本，判完才知道要不要接着排闹钟
@@ -5744,7 +5714,7 @@ mod tests {
         app.terminal.shell = Shell::Builtin(crate::terminal::ShellKind::Cmd);
     }
 
-    /// 主窗口里现在还有没有终端格子。
+    /// 编辑树里现在还有没有终端格子。
     fn has_terminal_pane(app: &EasyEditorApp) -> bool {
         app.panes
             .pane_ids()
@@ -5753,33 +5723,41 @@ mod tests {
             .any(|kind| kind.terminal_id().is_some())
     }
 
-    /// 右键「在此处打开终端」：在这个目录里单开一扇终端窗口。
+    /// 页签条上那一排「⌨ ××」画了几处：每格页签一处，加上正在显示的那组里每格面板一处。
+    fn painted_term_labels(out: &egui::FullOutput, label: &str) -> usize {
+        all_texts(out)
+            .into_iter()
+            .filter(|(t, _)| t == label)
+            .count()
+    }
+
+    /// 右键「在此处打开终端」：在这个目录里新开一个终端页签。
     ///
-    /// 主窗口的面板树一格都不许多——这一版起终端不再嵌在编辑区里，
-    /// 用户嫌的就是两边挤在同一个大窗口中。
+    /// 编辑那棵树一个格子都不许多——用户嫌的就是终端和文件挤在同一个大窗口里，
+    /// 现在终端走页签，中央区一次只画翻在前面那一组。
     #[cfg(windows)]
     #[test]
-    fn open_terminal_menu_opens_its_own_window() {
+    fn open_terminal_menu_opens_a_terminal_tab() {
         let (ctx, mut app, dir) = app_in_folder("easy-editor-app-open-term-test", "a\n");
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         app.tree.as_mut().unwrap().expanded.insert(dir.join("sub"));
         force_cmd_shell(&mut app);
 
         let shells = app.terminal.len();
-        let windows = app.term_windows.len();
+        let tabs = app.term_tabs.len();
         let out = frame(&mut app, &ctx, vec![]);
         let row = find_text(&out, "sub").expect("文件树里没画出 sub").center();
         click_tree_menu(&mut app, &ctx, row, "在此处打开终端");
-        // 窗口和终端计数都要走完一帧才看得清
+        // 页签和终端计数都要走完一帧才看得清
         frame(&mut app, &ctx, vec![]);
 
-        assert_eq!(app.term_windows.len(), windows + 1, "没有多开一扇终端窗口");
+        assert_eq!(app.term_tabs.len(), tabs + 1, "没有多开一个终端页签");
         assert_eq!(app.terminal.len(), shells + 1, "没有多起一条 shell");
-        assert!(!has_terminal_pane(&app), "终端又混回主窗口的面板树里了");
-
-        let win = app.term_windows.last().unwrap();
-        assert_eq!(win.tree.count(), 1, "新起的一扇窗口里不止一格");
-        let spawned = win.term_ids();
+        assert!(!has_terminal_pane(&app), "终端又混回编辑树里了");
+        let tab = app.term_tabs.last().unwrap();
+        assert_eq!(app.term_active, Some(tab.id), "新页签没翻到前面");
+        assert_eq!(tab.tree.count(), 1, "新起的一个页签里不止一格");
+        let spawned = tab.term_ids();
         assert_eq!(spawned.len(), 1);
         assert_eq!(
             app.terminal.get(spawned[0]).map(|t| t.cwd.as_path()),
@@ -5793,76 +5771,85 @@ mod tests {
         }
     }
 
-    /// 标题栏刷色靠标题前缀在系统窗口里认人，前缀漂了就等于悄悄丢掉这个功能。
+    /// 页签上的名字跟着这组第一条还活着的 shell 走；shell 没了要说清楚，别留个空名字。
     #[test]
-    fn terminal_window_titles_carry_the_theme_prefix() {
+    fn terminal_tab_title_follows_its_first_shell() {
         let (_ctx, app, _dir) = app_in_folder("easy-editor-app-term-title-test", "a\n");
-        let win = TermWindow::new(1, 7);
-        assert!(
-            win.title(&app.terminal).starts_with(titlebar::CHILD_PREFIX),
-            "标题「{}」不带识别前缀",
-            win.title(&app.terminal)
+        let tab = TermTab::new(1, 7);
+        assert_eq!(
+            tab.title(&app.terminal),
+            "已退出",
+            "没起进程的终端页签该说「已退出」"
         );
     }
 
-    /// 点几次「新建终端」就有几扇窗口，每扇装一条 shell，主窗口不受影响。
+    /// 点几次「新建终端」就有几个页签，每个装一条 shell，编辑区不受影响；
+    /// 页签条上两格名字都画得出来，终端正文只画翻在前面那一组。
     #[cfg(windows)]
     #[test]
-    fn each_new_terminal_gets_its_own_window() {
-        let (ctx, mut app, _dir) = app_in_folder("easy-editor-app-term-win-test", "a\n");
+    fn each_new_terminal_gets_its_own_tab() {
+        let (ctx, mut app, _dir) = app_in_folder("easy-editor-app-term-tab-test", "a\n");
         force_cmd_shell(&mut app);
         let main_panes = app.panes.count();
 
         app.new_terminal();
         frame(&mut app, &ctx, vec![]);
         app.new_terminal();
-        frame(&mut app, &ctx, vec![]);
+        let out = frame(&mut app, &ctx, vec![]);
 
-        assert_eq!(app.term_windows.len(), 2, "两条 shell 该有两扇窗口");
+        assert_eq!(app.term_tabs.len(), 2, "两条 shell 该有两个页签");
         assert_eq!(app.terminal.len(), 2, "两条 shell 没各自起进程");
         assert!(
-            app.term_windows.iter().all(|w| w.tree.count() == 1),
-            "新建终端不该顺手把已有窗口拆开"
+            app.term_tabs.iter().all(|t| t.tree.count() == 1),
+            "新建终端不该顺手把已有页签拆开"
         );
-        assert_ne!(
-            app.term_windows[0].viewport_id(),
-            app.term_windows[1].viewport_id(),
-            "两扇窗口共用了一个 viewport id"
-        );
-        let ids: Vec<u64> = app.term_windows.iter().flat_map(|w| w.term_ids()).collect();
-        assert_eq!(ids.len(), 2);
-        assert_ne!(ids[0], ids[1], "两扇窗口里挂的是同一条 shell");
-        assert_eq!(app.panes.count(), main_panes, "主窗口的面板树跟着长了");
+        let ids: Vec<u64> = app.term_tabs.iter().map(|t| t.id).collect();
+        assert_ne!(ids[0], ids[1], "两个页签共用了序号");
+        assert_eq!(app.term_active, Some(ids[1]), "最后新建的页签没翻到前面");
+        let terms: Vec<u64> = app.term_tabs.iter().flat_map(|t| t.term_ids()).collect();
+        assert_eq!(terms.len(), 2);
+        assert_ne!(terms[0], terms[1], "两个页签里挂的是同一条 shell");
+        assert_eq!(app.panes.count(), main_panes, "编辑树跟着长了格子");
 
-        for t in ids {
+        // 「⌨ ××」出现三处 = 两个页签 + 在前那组的一格面板。第四处就说明没在前的
+        // 那组也被画进了中央区
+        let label = format!("⌨ {}", app.term_tabs[1].title(&app.terminal));
+        assert_eq!(
+            painted_term_labels(&out, &label),
+            3,
+            "页签条或终端网格画多了"
+        );
+
+        for t in terms {
             app.terminal.remove(t);
         }
     }
 
-    /// 窗口里再切一格：格子 +1、shell +1、窗口数不变（tmux 那套分屏）。
+    /// 页签里再切一格：格子 +1、shell +1、页签数不变（tmux 那套分屏），
+    /// 页签上还要标出这组有几格。
     #[cfg(windows)]
     #[test]
-    fn splitting_a_terminal_window_adds_a_cell_not_a_window() {
+    fn splitting_a_terminal_tab_adds_a_cell_not_a_tab() {
         let (ctx, mut app, _dir) = app_in_folder("easy-editor-app-term-split-test", "a\n");
         force_cmd_shell(&mut app);
         app.new_terminal();
         frame(&mut app, &ctx, vec![]);
 
-        let win_id = app.term_windows[0].id;
-        let cell = app.term_windows[0].tree.focus().expect("窗口里没有可拆的格子");
-        let first = app.term_windows[0].term_ids()[0];
+        let tab_id = app.term_tabs[0].id;
+        let cell = app.term_tabs[0].tree.focus().expect("页签里没有可拆的格子");
+        let first = app.term_tabs[0].term_ids()[0];
         let first_cwd = app.terminal.get(first).map(|t| t.cwd.clone());
         let shells = app.terminal.len();
 
-        // 拆分按钮和快捷键最后都打到这里，直接喂命令，省得等内嵌窗口的坐标
-        app.pane_cmd(PaneScope::Term(win_id), PaneCmd::Split(cell, Axis::Vertical));
-        frame(&mut app, &ctx, vec![]);
+        // 拆分按钮和快捷键最后都打到这里，直接喂命令，省得等坐标
+        app.pane_cmd(PaneScope::Term(tab_id), PaneCmd::Split(cell, Axis::Vertical));
+        let out = frame(&mut app, &ctx, vec![]);
 
-        assert_eq!(app.term_windows.len(), 1, "拆分不该另开一扇窗口");
-        assert_eq!(app.term_windows[0].tree.count(), 2, "窗口里没多出一格");
+        assert_eq!(app.term_tabs.len(), 1, "拆分不该另开一个页签");
+        assert_eq!(app.term_tabs[0].tree.count(), 2, "页签里没多出一格");
         assert_eq!(app.terminal.len(), shells + 1, "新的一格没起自己的 shell");
-        assert_eq!(app.status, "已在此窗口新建一格终端");
-        let ids = app.term_windows[0].term_ids();
+        assert_eq!(app.status, "已在本组新建一格终端");
+        let ids = app.term_tabs[0].term_ids();
         assert_eq!(ids.len(), 2);
         let new = *ids.iter().find(|t| **t != first).expect("树里找不到新建的那条 shell");
         assert_eq!(
@@ -5870,93 +5857,125 @@ mod tests {
             first_cwd,
             "新的一格没有跟着上一格的目录走"
         );
+        let label = format!("⌨ {} ×2", app.term_tabs[0].title(&app.terminal));
+        assert!(
+            find_text(&out, &label).is_some(),
+            "页签上没标出这组有两格"
+        );
 
         for t in ids {
             app.terminal.remove(t);
         }
     }
 
-    /// 系统 × 只收窗口：shell 照跑、滚动区留着，`Ctrl+`` 唤回还是同一条。
+    /// `Ctrl+``（顶栏「终端」同一条路）在编辑区和终端页签之间来回切：切走时页签还
+    /// 排在页签条上、shell 照跑、正文不再画；切回来还是同一条 shell。
     #[cfg(windows)]
     #[test]
-    fn closing_the_window_hides_it_and_keeps_the_shell() {
-        let (ctx, mut app, _dir) = app_in_folder("easy-editor-app-term-hide-test", "a\n");
+    fn terminal_toggle_switches_between_editor_and_tab() {
+        let (ctx, mut app, _dir) = app_in_folder("easy-editor-app-term-toggle-test", "a\n");
         force_cmd_shell(&mut app);
         app.new_terminal();
         frame(&mut app, &ctx, vec![]);
 
-        let win_id = app.term_windows[0].id;
-        let term_id = app.term_windows[0].term_ids()[0];
-        let header = format!(
-            "⌨ {}",
-            app.terminal.pane_title(term_id).unwrap_or_default()
-        );
-        // 内嵌回退下终端窗口的内容就在主窗口这一趟 pass 里画出来
+        let tab_id = app.term_tabs[0].id;
+        let term_id = app.term_tabs[0].term_ids()[0];
+        let label = format!("⌨ {}", app.terminal.pane_title(term_id).unwrap_or_default());
+
+        // 在前：页签一处 + 格子的标题条一处
         let out = frame(&mut app, &ctx, vec![]);
-        assert!(
-            find_text(&out, &header).is_some(),
-            "终端窗口的格子没画出来"
-        );
+        assert_eq!(painted_term_labels(&out, &label), 2, "终端页签的格子没画出来");
 
-        // 无头测试收不到 ViewportEvent::Close，直接调抽出来的那半
-        app.hide_term_window(win_id);
-        frame(&mut app, &ctx, vec![]);
-        assert!(!app.term_windows[0].visible, "窗口没收起来");
-        assert_eq!(app.term_windows.len(), 1, "收个窗口把整扇会话摘掉了");
-        assert_eq!(app.term_windows[0].term_ids(), vec![term_id]);
-        assert!(app.terminal.get(term_id).is_some(), "系统 × 把 PTY 杀了");
-
+        app.focus_or_new_terminal();
         let out = frame(&mut app, &ctx, vec![]);
-        assert!(
-            find_text(&out, &header).is_none(),
-            "窗口都收起来了还在画它的内容"
+        assert_eq!(app.term_active, None, "终端还占着中央区");
+        assert_eq!(app.term_tabs.len(), 1, "切走时把页签删了");
+        assert_eq!(app.term_tabs[0].term_ids(), vec![term_id]);
+        assert!(app.terminal.get(term_id).is_some(), "切回编辑区把 PTY 杀了");
+        assert_eq!(
+            painted_term_labels(&out, &label),
+            1,
+            "只剩页签那一处才对，中央区还在画终端正文"
         );
 
-        // Ctrl+`（顶栏「终端」同一条路径）：原位唤回，复用同一条 shell
-        app.focus_or_new_terminal(&ctx);
+        app.focus_or_new_terminal();
         frame(&mut app, &ctx, vec![]);
-        assert!(app.term_windows[0].visible, "没有唤回来");
-        assert_eq!(app.term_windows.len(), 1, "唤回时又新建了一扇");
-        assert_eq!(app.term_windows[0].term_ids(), vec![term_id]);
-        assert!(app.term_windows[0].needs_place, "唤回时没要求重新摆位置");
-        assert_eq!(app.status, "已唤回终端窗口");
+        assert_eq!(app.term_active, Some(tab_id), "没有翻回终端页签");
+        assert_eq!(app.term_tabs.len(), 1, "翻回来时又新建了一个");
+        assert_eq!(app.status, "已唤回终端页签");
 
         app.terminal.remove(term_id);
     }
 
-    /// 关掉格子里的 × 是真杀进程；最后一格关掉，窗口跟着消失。
+    /// 格子里的 × 是真杀进程；关掉最后一格，这个页签跟着关掉，中央区回编辑区。
     #[cfg(windows)]
     #[test]
-    fn closing_the_last_cell_disposes_the_window() {
+    fn closing_the_last_cell_closes_the_tab() {
         let (ctx, mut app, _dir) = app_in_folder("easy-editor-app-term-close-test", "a\n");
         force_cmd_shell(&mut app);
         app.new_terminal();
         frame(&mut app, &ctx, vec![]);
 
-        let win_id = app.term_windows[0].id;
-        let cell = app.term_windows[0].tree.focus().unwrap();
-        app.pane_cmd(PaneScope::Term(win_id), PaneCmd::Split(cell, Axis::Horizontal));
+        let tab_id = app.term_tabs[0].id;
+        let cell = app.term_tabs[0].tree.focus().unwrap();
+        app.pane_cmd(PaneScope::Term(tab_id), PaneCmd::Split(cell, Axis::Horizontal));
         frame(&mut app, &ctx, vec![]);
-        let ids = app.term_windows[0].term_ids();
+        let ids = app.term_tabs[0].term_ids();
         assert_eq!(ids.len(), 2);
 
-        // 先关一格：还剩一格的窗口留在原地，被关掉那条 shell 立刻没命
+        // 先关一格：还剩一格的页签留在原地，被关掉那条 shell 立刻没命
         app.pane_cmd(
-            PaneScope::Term(win_id),
-            PaneCmd::Close(app.term_windows[0].tree.focus().unwrap()),
+            PaneScope::Term(tab_id),
+            PaneCmd::Close(app.term_tabs[0].tree.focus().unwrap()),
         );
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.term_windows.len(), 1, "还剩一格就把窗口摘了");
-        assert_eq!(app.term_windows[0].tree.count(), 1, "格子没少");
+        assert_eq!(app.term_tabs.len(), 1, "还剩一格就把页签摘了");
+        assert_eq!(app.term_tabs[0].tree.count(), 1, "格子没少");
         assert_eq!(app.terminal.len(), 1, "关掉的那格 shell 还活着");
+        assert_eq!(app.term_active, Some(tab_id), "在前那组被改动了却丢了选中");
 
-        // 再关最后一格：窗口从表里消失，eframe 下一帧自己把 OS 窗口销毁
-        let last = app.term_windows[0].tree.focus().unwrap();
-        app.pane_cmd(PaneScope::Term(win_id), PaneCmd::Close(last));
+        // 再关最后一格：页签从排里消失，中央区该回编辑区
+        let last = app.term_tabs[0].tree.focus().unwrap();
+        app.pane_cmd(PaneScope::Term(tab_id), PaneCmd::Close(last));
         frame(&mut app, &ctx, vec![]);
-        assert!(app.term_windows.is_empty(), "最后一格关掉了窗口还挂着");
+        assert!(app.term_tabs.is_empty(), "最后一格关掉了页签还挂着");
         assert_eq!(app.terminal.len(), 0, "会话没收干净");
-        assert!(!has_terminal_pane(&app), "收掉的终端又冒回主窗口");
+        assert_eq!(app.term_active, None, "页签全关了还没回编辑区");
+        assert!(!has_terminal_pane(&app), "收掉的终端又冒回编辑树");
+    }
+
+    /// 页签上的 × 一次收掉这一组的全部 shell；在前那组被收掉就翻到剩下的那组，
+    /// 全收完了才回编辑区。
+    #[cfg(windows)]
+    #[test]
+    fn closing_a_terminal_tab_kills_its_whole_group() {
+        let (ctx, mut app, _dir) = app_in_folder("easy-editor-app-term-kill-test", "a\n");
+        force_cmd_shell(&mut app);
+        app.new_terminal();
+        frame(&mut app, &ctx, vec![]);
+        app.new_terminal();
+        frame(&mut app, &ctx, vec![]);
+
+        let first = app.term_tabs[0].id;
+        let second = app.term_tabs[1].id;
+        // 给第一组再来一格，这样收掉一个页签要杀两条 shell
+        let cell = app.term_tabs[0].tree.focus().unwrap();
+        app.pane_cmd(PaneScope::Term(first), PaneCmd::Split(cell, Axis::Horizontal));
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.terminal.len(), 3);
+
+        // 收掉正翻在前的那组
+        app.close_term_tab(second);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.term_tabs.len(), 1, "页签没从排里摘掉");
+        assert_eq!(app.term_active, Some(first), "没翻到剩下的那组");
+        assert_eq!(app.terminal.len(), 2, "收掉的页签没把 shell 杀干净");
+
+        app.close_term_tab(first);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.term_tabs.is_empty(), "最后一个页签没关掉");
+        assert_eq!(app.terminal.len(), 0, "整组 shell 没杀干净");
+        assert_eq!(app.term_active, None, "页签全关了还没回编辑区");
     }
 
     /// 右键某一行 → 点菜单里的「新建文件」，把对话框打开。返回输入框位置。

@@ -164,13 +164,13 @@ pub const ACTIONS: &[ActionDef] = &[
     },
     ActionDef {
         id: "terminal_toggle",
-        label: "唤回终端窗口（没有就新建）",
+        label: "在编辑区和终端页签之间切（没有就新建）",
         group: "视图",
         default: "Ctrl+Backtick",
     },
     ActionDef {
         id: "terminal_new",
-        label: "新建终端窗口",
+        label: "新建终端页签",
         group: "视图",
         default: "Ctrl+Shift+Backtick",
     },

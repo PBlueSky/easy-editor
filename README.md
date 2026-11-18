@@ -2,7 +2,7 @@
 
 **English** | [中文](README.zh-CN.md)
 
-A Windows desktop editor written in **Rust + egui**. It does not have many features — it has the ones you use every day: file tree, terminals that each get their own window, recursive split panes, journal blocks inside plain text files, SQL blocks that run against MySQL with the results sitting right under the text, cursor position back/forward, project-wide search, find and replace, syntax highlighting, and every keybinding is yours to change.
+A Windows desktop editor written in **Rust + egui**. It does not have many features — it has the ones you use every day: file tree, terminal tabs that sit in the same strip as your file tabs, recursive split panes, journal blocks inside plain text files, SQL blocks that run against MySQL with the results sitting right under the text, cursor position back/forward, project-wide search, find and replace, syntax highlighting, and every keybinding is yours to change.
 
 **Current version** v0.4.0 | **Platform** Windows 10 / 11 x64 | **License** MIT
 
@@ -26,8 +26,8 @@ The release package is a **single exe** (about 12 MB, 5.2 MB zipped). No .NET, n
 | Feature | In one line | Details |
 |---|---|---|
 | Code editing | Line numbers, current-line highlight, syntect grammar highlighting; long lines either wrap or scroll sideways | [Editing](#editing) |
-| A window per terminal | Real PTYs via `portable-pty`, VT parsing via `alacritty_terminal`; every new terminal gets its own top-level window instead of squeezing in beside the code. Five shells are auto-detected, anything else (MSYS2, busybox) you add yourself | [Terminal](#terminal) |
-| Recursive split panes | The tmux / i3 binary pane tree — one for the editor, another inside every terminal window. Split as deep as you like, default keys match Windows Terminal | [Split panes](#split-panes) |
+| Terminals are tabs | Real PTYs via `portable-pty`, VT parsing via `alacritty_terminal`; every new terminal is one more tab beside your file tabs instead of a pane squeezing in next to the code, and each tab is a grid you can keep splitting — one shell per cell. Five shells are auto-detected, anything else (MSYS2, busybox) you add yourself | [Terminal](#terminal) |
+| Recursive split panes | The tmux / i3 binary pane tree — one for the editor, another inside every terminal tab. Split as deep as you like, default keys match Windows Terminal | [Split panes](#split-panes) |
 | Journal blocks | Task blocks written directly into ordinary text files, mixed with prose and versioned with git | [Journal blocks](#journal-blocks) |
 | SQL blocks | Jupyter-style: the query lives in a plain text file, `Ctrl+Enter` runs it and the result lands below the editor. `Ctrl+Alt+N` starts a fresh `query-<timestamp>.sql` with the connection already bound | [SQL blocks](#sql-blocks) |
 | Multiple results at once | One tab per statement in a horizontal tab bar, so a broken second query does not throw away the first result; up to 10 results, right-click a tab to close a whole side; batch headers, pop-out windows, copy as TSV, export as CSV, sideways-scrolling wide tables, whole-row selection, per-row detail window that closes when you click elsewhere | [Results dock](#results-dock) |
@@ -94,22 +94,18 @@ With no arguments, the startup folder is chosen by: **command-line argument > cu
 
 ```
 ┌──────────────── Top toolbar (wraps to a second row when it runs out of room) ─────────┐
-├──────────┬──────────────────── Centre: pane tree (recursively splittable) ───────────┤
-│ Sidebar  │  Tab strip + editor panes…                                                 │
-│ Files    ├──────────────────── Bottom: results dock (SQL) ────────────────────────────┤
-│ Search   ├──────────────────── Bottom: status bar + find/replace bar ─────────────────┤
-│ Journal  │                                                                            │
+├──────────┬─────── Centre: tab strip + pane tree — whichever tab is up owns it ────────┤
+│ Sidebar  │  main.rs ×  data.json ×  ⌨ cmd ×2  ← click it: a terminal grid             │
+│ Files    │  the tab you pick decides what that whole block draws                      │
+│ Search   ├──────────────────── Bottom: results dock (SQL) ────────────────────────────┤
+│ Journal  ├──────────────────── Bottom: status bar + find/replace bar ─────────────────┤
 │ Database │                                                                            │
 └──────────┴───────────────────────────────────────────────────────────────────────────┘
-
-        ┌─ 终端 · cmd ───────────────────┐   ← every terminal is its own OS window;
-        │  ⌨ cmd             ‖ ═ ×       │     split it inside and each cell gets a shell
-        └────────────────────────────────┘
 ```
 
-There is no terminal pane inside the main window any more. The box above is a sibling window that `+Terminal` opens, and it takes its own slot on the taskbar.
+A terminal does not open another OS window and it does not squeeze in beside the code: `+Terminal` adds one more tab to that same strip, and clicking the `⌨ …` one swaps the whole centre area for that group's grid. Click back to a file tab and the editor comes back exactly as you left it — one of the two is on screen at a time.
 
-- **Top toolbar**, left to right: `Open folder` `Open file` `Save` `←` `→` (cursor history back / forward) `New file` `New folder` `Sidebar` `Wrap` `Terminal` (brings a hidden terminal window back; if none is hidden it focuses the last one, or opens a new one) `+Terminal` (a new terminal window) `‖ Split` `═ Split` `Quick open` `Project search` `Find` `Journal block` `Database`. The `Database` entry is a dropdown (default connection line / `new query` / `insert SQL block` / `run SQL` / `results dock` / `connection manager…` / `sidebar database tree` / `this file is SQL`) — that is the only new button the whole database feature costs. The right-hand group, right to left, is `?` (jumps to the Keybindings section), `Dark` / `Light` (theme), the `shell:` dropdown, `⚙` (the settings window), the editor font size `- 14 +`, and the workspace name.
+- **Top toolbar**, left to right: `Open folder` `Open file` `Save` `←` `→` (cursor history back / forward) `New file` `New folder` `Sidebar` `Wrap` `Terminal` (switches between the editor and the terminal tabs — the last group comes back to the front, or a new tab opens when there is none) `+Terminal` (a new terminal tab) `‖ Split` `═ Split` `Quick open` `Project search` `Find` `Journal block` `Database`. The `Database` entry is a dropdown (default connection line / `new query` / `insert SQL block` / `run SQL` / `results dock` / `connection manager…` / `sidebar database tree` / `this file is SQL`) — that is the only new button the whole database feature costs. The right-hand group, right to left, is `?` (jumps to the Keybindings section), `Dark` / `Light` (theme), the `shell:` dropdown, `⚙` (the settings window), the editor font size `- 14 +`, and the workspace name.
 - **Sidebar** has four tabs: `Files` (the tree), `Search` (project-wide results), `Journal` (blocks in the current file), `Database` (connections → databases → tables → columns). `Ctrl+B` shows or hides it.
 - Narrow the window until one row no longer fits and the remaining buttons wrap onto a second row — they never squash together and text is never overdrawn. The right-hand group still anchors right-to-left after wrapping. The file-tree header does the same trick in one row that cannot wrap: `刷新` / `新文件夹` / `新文件` are laid right-to-left first, then the workspace name is placed in the rectangle that is left over and truncated there — a long folder name used to draw straight through `新文件`. Too little room and the name is dropped rather than overlapped; hover it for the full path.
 
@@ -117,7 +113,7 @@ There is no terminal pane inside the main window any more. The box above is a si
 
 The folder in the sidebar is an **entry point**, not a boundary on what you are allowed to read. `Ctrl+Shift+O` and the toolbar `Open file` button are the same thing: they open the system file picker (multi-select) and put the chosen files into tabs. That is the only place a button for it lives — the welcome page and the empty sidebar offer a line of text instead of a second row of buttons. The other way in is dragging from Explorer, covered below.
 
-Opening a file that lives outside the workspace **leaves the workspace completely alone** — the tree still shows the same folder, the quick-open index is not rescanned, running terminal windows keep their cwd, and not one existing tab is closed. If you want the neighbourhood too, that is a separate `Open folder` (`Ctrl+O`). The picker starts in the current workspace; with no workspace open it specifies nothing, so Windows remembers where it was last.
+Opening a file that lives outside the workspace **leaves the workspace completely alone** — the tree still shows the same folder, the quick-open index is not rescanned, running terminals keep their cwd, and not one existing tab is closed. If you want the neighbourhood too, that is a separate `Open folder` (`Ctrl+O`). The picker starts in the current workspace; with no workspace open it specifies nothing, so Windows remembers where it was last.
 
 Saving writes back to the file's own absolute path. No same-named copy appears inside the workspace.
 
@@ -135,7 +131,7 @@ When the create dialog opens, the input box has keyboard focus immediately — j
 
 The "Rename" box is drawn on the entry's own row, pre-filled with the current name: `Enter` commits, `Esc` cancels, clicking elsewhere commits. Names containing `/ \ : * ? " < > |`, empty names, `.` and `..`, and names that collide with an existing file are rejected with a message at the bottom of the tree — the original file is never touched. **Files already open in a tab follow the new path**, so unsaved changes are written to the new name instead of resurrecting a copy under the old one, and the quick-open index is rescanned. Renaming directories is not supported yet.
 
-"Open terminal here" opens a terminal **window** whose shell starts in the folder you clicked (or the parent folder, for a file). It does not change the default directory chosen in the toolbar, and it never adds a pane to the editor area.
+"Open terminal here" opens a new terminal **tab** whose shell starts in the folder you clicked (or the parent folder, for a file). It does not change the default directory chosen in the toolbar, and it never adds a pane to the editor area.
 
 There is a **search box** at the top of the tree: type part of a name or relative path and it scans the whole workspace (skipping `.git` / `target` / `node_modules` and similar), case-insensitively, listing up to 500 hits. Click a file to open it; click a directory to expand the tree to its location and leave search mode. Results are cached per query string, so typing continuously does not re-walk the tree every frame.
 
@@ -335,12 +331,14 @@ Whatever you can click should look clickable, and this round pushed that through
 
 ### Terminal
 
-Terminals no longer take room away from the editor: `+Terminal` (or ``Ctrl+Shift+` ``) opens **its own top-level window**, one shell per window, each with its own taskbar slot. ``Ctrl+` `` first brings a hidden window back to where it was; if none is hidden it raises the open one, and only opens a new window when there is none at all. Right-clicking a folder in the file tree — or a file inside one — and choosing "Open terminal here" starts that window's shell in that directory.
+A terminal is **one more tab in the strip that already holds your files** — browser style. `+Terminal` (or ``Ctrl+Shift+` ``) opens a new one, and each tab is a *group* of shells. ``Ctrl+` `` flips between the editor and the terminal tabs: a terminal tab in front replaces the whole centre area with that group's grid, and clicking a file tab gives the editor back with its panes and focus untouched. Right-clicking a folder in the file tree — or a file inside one — and choosing "Open terminal here" starts a new tab's shell in that directory.
 
-Inside a window nothing is lost: it has its own pane tree, so splitting, divider dragging and directional focus work exactly as they do in the editor area (each window only ever touches its own tree). Two ways to close, and they mean different things:
+Inside one tab nothing is lost: it has its own pane tree, so splitting, divider dragging and directional focus work exactly as they do in the editor area. The tab is named after the first shell in it that is still alive, and `×2` / `×3` behind the name counts the cells. Two ways to close, and they mean different things:
 
-- **The title bar's `×`** only hides the window — the PTY keeps running, the scrollback keeps every line, and ``Ctrl+` `` or the toolbar `Terminal` puts the window back exactly where you dragged and resized it
-- **A cell's `×`** really ends that shell; closing the last cell makes the window disappear with it
+- **A cell's `×`** ends that one shell and leaves the rest of the group alone; closing the last cell retires the tab with it
+- **A tab's `×`** closes the whole group at once — selection then moves to the group that is still there, or back to the editor when nothing is left
+
+A terminal tab that is not in front keeps running: the PTY stays up, output keeps landing in its scrollback, and flipping back shows everything that arrived in the meantime. A shell only ends when you close its cell or its group.
 
 The `shell:` dropdown in the toolbar picks *which shell the next terminal uses*, auto-detecting PowerShell 7 / Windows PowerShell / cmd / Git Bash / WSL on your machine plus any custom entry you added in settings; already-open terminals are unaffected.
 
@@ -382,7 +380,7 @@ Custom entries are referenced by `id`, so `terminal_shell` stores `custom:<id>` 
 
 ### Split panes
 
-The centre area is **a recursive binary pane tree**, in the tmux / i3 tradition: any pane can be split again left/right or up/down, so "code on the left, notes on the right" is the normal state, not a special case. That tree only ever holds editors now; every terminal window carries its own identical tree. The two share one set of keybindings, one grid and one set of commands, and a command is routed by *which window it came from* — pane numbers are counted per tree.
+What the centre area shows is always **a recursive binary pane tree**, in the tmux / i3 tradition: any pane can be split again left/right or up/down, so "code on the left, notes on the right" is the normal state, not a special case. With a file tab up you see the editor tree, which only ever holds editors; with a terminal tab up you see that tab's own tree, one per tab. All of them share one set of keybindings, one grid and one set of commands, and a command is routed by *which tree is in front* — pane numbers are counted per tree, and the widgets' persistent ids are salted by that scope, so focus and scroll positions cannot leak from one group into the next when you switch tabs.
 
 Default keys **match Windows Terminal**:
 
@@ -394,9 +392,9 @@ Default keys **match Windows Terminal**:
 | `Ctrl+Shift+W` | Close the current pane (the last one is never closed; it falls back to an empty pane) |
 | `Ctrl+Shift+Tab` / `Ctrl+Alt+Shift+Tab` | Cycle focus to the next / previous pane |
 
-The split applies to **the currently focused pane** — and to the tree of whichever window you pressed the key in. Splitting an editor pane shows the same file in both, which is what you want for side-by-side comparison; splitting a cell in a terminal window gives you a fresh shell in the same directory.
+The split applies to **the currently focused pane** — and to whichever tree was in front when you pressed the key. Splitting an editor pane shows the same file in both, which is what you want for side-by-side comparison; splitting a cell in a terminal tab gives you a fresh shell in the same directory.
 
-- Each pane has its own title bar (file name + unsaved marker, or `⌨ shell title` in a terminal window) with three small buttons on the right: split left/right, split up/down, and `×` to close
+- Each pane has its own title bar (file name + unsaved marker, or `⌨ shell title` in a terminal tab) with three small buttons on the right: split left/right, split up/down, and `×` to close
 - Right-click a pane's title bar to move it to the **far right / far left / top / bottom** of the workspace
 - Dividers are draggable; the ratio is computed from live pixel geometry and clamped to 5%–95%
 - Clicking a pane focuses it
@@ -460,8 +458,8 @@ Everything below is the default and everything is rebindable in `F1`.
 | `Ctrl+Enter` | Run the selection, or just the statement the caret is on (split by `;`) — in SQL mode with no block, that reads from the whole file |
 | `Ctrl+Shift+Enter` | Hand the entire block (or the whole file in SQL mode) to the server and write the block status back |
 | `Ctrl+Shift+R` | Show / hide the results dock |
-| `` Ctrl+` `` | Bring back / raise a terminal window, opening one if there is none |
-| `` Ctrl+Shift+` `` | New terminal window |
+| `` Ctrl+` `` | Flip between the editor and the terminal tabs — a terminal tab in front goes back to the editor, otherwise the last group comes forward, and only a new one when there is none |
+| `` Ctrl+Shift+` `` | New terminal tab |
 | `Ctrl+B` | Show / hide the sidebar |
 | `Ctrl+W` | Close tab |
 | `Ctrl+Shift+W` | Close the current pane |
@@ -566,8 +564,8 @@ About 26,600 lines of Rust in a single binary crate, 23 source files:
 | File | Responsibility |
 |---|---|
 | `src/main.rs` | Entry point, `windows_subsystem`, window builder and icon |
-| `src/app.rs` | The application itself: layout, keybindings, open/save, project search, find/replace, journal blocks, spawning and pumping terminal windows, SQL submitting, per-tab SQL mode and new-query files |
-| `src/pane.rs` | tmux-style recursive binary pane tree (`Leaf` / `Split`); layout only, no content. One instance for the editor, one per terminal window |
+| `src/app.rs` | The application itself: layout, keybindings, open/save, project search, find/replace, journal blocks, terminal tabs (opening, splitting, closing, switching), SQL submitting, per-tab SQL mode and new-query files |
+| `src/pane.rs` | tmux-style recursive binary pane tree (`Leaf` / `Split`); layout only, no content. One instance for the editor, one per terminal tab |
 | `src/editor.rs` | The editor widget: line numbers + highlighting + editing + jumping + read-only virtual rendering for large files + overlay painting |
 | `src/terminal.rs` | PTY I/O, VT parsing, keyboard/mouse routing, selection and scrollbar |
 | `src/filetree.rs` | Directory tree, lazy loading, file search, type colours, tab-label disambiguation |
@@ -713,17 +711,15 @@ egui ships `Ctrl+=` / `Ctrl+-` / `Ctrl+0` that change `zoom_factor` (the entire 
 
 ### The system title bar has to be repainted by hand
 
-The minimize / maximize / close row is drawn by the Windows DWM, which egui does not reach. `winit` only flags uxtheme **at window creation** using the theme of that moment, and it uses an attribute the DWM does not consult — so the title bar background and the button glyphs end up following two different palettes: white glyphs on a light background make the buttons invisible, and switching themes does not update them. `src/titlebar.rs` therefore re-sends three `DwmSetWindowAttribute` calls at startup and on every theme switch: `USE_IMMERSIVE_DARK_MODE` (which decides whether button glyphs take the light or dark variant), `CAPTION_COLOR` and `TEXT_COLOR`. The background comes from `theme::panel_fill`, the same value as the toolbar, so there is no visible seam between title bar and toolbar. The last two attributes require Windows 11 22000+; on older systems the calls fail and are ignored, leaving only the dark-mode switch.
+The minimize / maximize / close row is drawn by the Windows DWM, which egui does not reach. `winit` only flags uxtheme **at window creation** using the theme of that moment, and it uses an attribute the DWM does not consult — so the title bar background and the button glyphs end up following two different palettes: white glyphs on a light background make the buttons invisible, and switching themes does not update them. `src/titlebar.rs` therefore re-sends three `DwmSetWindowAttribute` calls at startup and on every theme switch: `USE_IMMERSIVE_DARK_MODE` (which decides whether button glyphs take the light or dark variant), `CAPTION_COLOR` and `TEXT_COLOR`. The background comes from `theme::panel_fill`, the same value as the toolbar, so there is no visible seam between title bar and toolbar. The last two attributes require Windows 11 22000+; on older systems the calls fail and are ignored, leaving only the dark-mode switch. Now that terminals are tabs there is no second OS window to claim, so this runs for the main window alone: once at startup and once per theme switch.
 
-Terminal windows are egui child viewports, and the app never gets their HWND — `eframe` consumes the builder at creation and does not hand back a handle afterwards. So the row is claimed by a different clue: `apply_children` sweeps the process's top-level windows with `EnumWindows` and paints the ones whose title starts with `终端 · `. `TermWindow::title` and `titlebar::CHILD_PREFIX` share that constant, and `terminal_window_titles_carry_the_theme_prefix` fails the moment they drift apart. The sweep is not per frame: the app remembers the last (theme, window count) it painted and re-scans only when the theme changes or a window appears or disappears.
+### Why terminals became tabs — and why closing a tab keeps shells alive
 
-### Why each terminal got its own window — and why closing one keeps it alive
+Cramming terminals next to the code meant every terminal pane was paid for out of the editing area, and glancing at output cost a slice of the screen. The version before this one went the other way — Windows Terminal style, one shell per OS window — and that turned out to be worse in practice: a row of identically-named windows on the taskbar that you tell apart by reading titles, and the trick only pays off if you actually have a second monitor to throw one at. Tabs are the browser answer: a terminal takes one slot in the strip that already holds the files, `` Ctrl+` `` flips the centre area over to it and back, and the group inside a tab splits as much as you like. Only one side is ever on screen, so neither has to give up room.
 
-Cramming terminals next to the code meant every terminal pane was paid for out of the editing area, and glancing at output cost a slice of the screen. Terminals are sibling windows now, Windows Terminal style: one shell per window, `Alt+Tab` between them, and the output window can live on the second monitor.
+Flipping a tab to the back does not stop the shell: PTY, scrollback and selection all live in `TerminalPanel`, and `pump()` drains *every* terminal rather than only the visible one (a background shell whose output piles up in an unbounded channel is both a memory leak and a stale screen when you return). A shell ends only when you close its cell or its whole group.
 
-`show_viewport_immediate` won over the deferred variant because a deferred closure has to live in an `Arc`, which would push this state into `ctx.data` — and that state *is* `self`. The immediate closure runs inline on the main thread and can borrow `&mut self` directly; the price is that parent and child wake each other for repaints, which costs nothing extra since terminal output already pumps at 30fps. A side benefit shows up in the test suite: `embed_viewports` defaults to true headless, so a child viewport is painted into the main pass as an embedded window and the assertions still see it.
-
-The title bar's `×` means *hide*, not *quit*: stop calling `show_viewport_immediate` for that viewport id and egui drops the viewport, eframe garbage-collects the OS window (`ViewportCommand::Close` only re-signals the event and is no use here). The PTY and its scrollback stay in `TerminalPanel`, and re-showing the id **creates a brand-new window** that remembers nothing — so every frame records `outer_rect` / `inner_rect` and the first frames after a reopen replay them through `OuterPosition` + `InnerSize`. Headless tests never receive `ViewportEvent::Close`, which is why that branch lives in its own `hide_term_window` that the tests can call directly.
+Each tab owns one `PaneTree`, so a group's split layout travels with the tab and survives a trip through the file tabs. The one thing that needs care across trees: the editor tree and a terminal tree both number their `PaneId`s from 1, and egui keys widget state to ids — so `draw_grid` mixes the scope (`PaneScope::Main` / `Term(tab id)`) into every persistent id. Without that salt, switching tabs would carry focus and scroll position from one group into another.
 
 ### File tree colours
 

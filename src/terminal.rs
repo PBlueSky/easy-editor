@@ -1452,7 +1452,7 @@ impl TerminalPanel {
         })
     }
 
-    /// 在指定目录里起一块终端（新建终端窗口、同窗口再切一格）。
+    /// 在指定目录里起一块终端（新开一个终端页签、页签内再切一格）。
     pub fn create_at(&mut self, cwd: &Path) -> Result<u64, String> {
         let id = self.next_id;
         self.next_id += 1;
