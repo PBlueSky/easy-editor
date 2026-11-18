@@ -169,6 +169,9 @@ pub struct EasyEditorApp {
     /// 设置窗口这次出现时要不要摆回屏幕正中
     center_settings: bool,
     want_open_folder: bool,
+    /// 「打开文件…」的延迟标记。原生对话框会阻塞当前线程，不能在布局跑到一半时弹，
+    /// 所以点按钮和按快捷键都只置位，等这一帧画完再开。
+    want_open_files: bool,
     focus_search: bool,
     frame_count: u32,
     /// 新日志块使用的标题；留空则自动编号
@@ -342,6 +345,7 @@ impl EasyEditorApp {
             settings_section: SettingsSection::Appearance,
             center_settings: false,
             want_open_folder: false,
+            want_open_files: false,
             focus_search: false,
             frame_count: 0,
             journal_title: String::new(),
@@ -385,11 +389,12 @@ impl EasyEditorApp {
             if path.is_dir() {
                 app.open_workspace(path);
             } else if path.is_file() {
-                let parent = path.parent().map(|p| p.to_path_buf());
-                if let Some(parent) = parent {
-                    app.open_workspace(parent);
-                }
-                app.open_file(path, None);
+                // `.txt` 双击带进来的就是这种。只把这一个文件开在标签里，不拿它的父目录
+                // 当工作区：那等于每双击一个 Downloads 里的笔记就把整个 Downloads 建成索引，
+                // 还会顺手挡掉用户原本想恢复的工作目录。想看这一片就在侧栏点「打开文件夹」。
+                app.open_file(path.clone(), None);
+            } else {
+                app.status = format!("{} 不存在，什么都没打开", path.display());
             }
             app.apply_verify_flags();
             return app;
@@ -569,6 +574,29 @@ impl EasyEditorApp {
         }
         if let Some(dir) = dialog.pick_folder() {
             self.open_workspace(dir);
+        }
+    }
+
+    /// 选一个或几个文件打开，位置不限。侧栏那个文件夹只是一个入口，不是边界：
+    /// 这里不动工作区（树、索引、终端 cwd 全保持原样），也不清已有标签，
+    /// 选中的文件只进标签条。
+    fn open_files_dialog(&mut self) {
+        let mut dialog = rfd::FileDialog::new().set_title("打开文件");
+        // 起点用当前工作区；没有工作区时不指定，让系统回落到它记得的位置。
+        if let Some(root) = &self.root {
+            dialog = dialog.set_directory(root);
+        }
+        let Some(paths) = dialog.pick_files() else {
+            return;
+        };
+        let before = self.tabs.len();
+        for path in paths {
+            self.open_file(path, None);
+        }
+        // 单个文件留用 open_file 自己那句「已打开 …」；一批里 open_file 会逐个覆写状态，
+        // 收尾给个总数，免得只剩最后那一条路径。
+        if self.tabs.len() - before > 1 {
+            self.status = format!("已打开 {} 个文件", self.tabs.len() - before);
         }
     }
 
@@ -1401,6 +1429,9 @@ impl EasyEditorApp {
         if self.keymap.consume(ctx, "open_folder") {
             self.want_open_folder = true;
         }
+        if self.keymap.consume(ctx, "open_file") {
+            self.want_open_files = true;
+        }
         if self.keymap.consume(ctx, "save_all") {
             self.save_all();
         }
@@ -1556,6 +1587,15 @@ impl EasyEditorApp {
         }
         let last = self.last_editor_pane.filter(|p| self.panes.contains(*p))?;
         self.panes.payload_of(last).copied().and_then(PaneKind::tab)
+    }
+
+    /// 标签和面板标题上那份名字。同名文件会带上能区分开的父目录段，见 [`filetree::unique_titles`]。
+    fn tab_title(&self, idx: usize) -> String {
+        let paths: Vec<PathBuf> = self.tabs.iter().map(|t| t.path.clone()).collect();
+        filetree::unique_titles(&paths)
+            .into_iter()
+            .nth(idx)
+            .unwrap_or_default()
     }
 
     /// 本次要写入标签的面板：焦点在编辑器上就是它，否则用最后一次聚焦的编辑面板。
@@ -2461,6 +2501,14 @@ impl EasyEditorApp {
             {
                 self.want_open_folder = true;
             }
+            let h_open_file = hint("open_file");
+            if ui
+                .button(RichText::new("打开文件").size(crate::theme::md(ui)))
+                .on_hover_text(format!("{h_open_file}  任意位置的文件，工作区不变"))
+                .clicked()
+            {
+                self.want_open_files = true;
+            }
             let h_save = hint("save");
             if ui
                 .add_enabled(
@@ -2886,6 +2934,9 @@ impl EasyEditorApp {
                                 ui.label(RichText::new("尚未打开文件夹").weak());
                                 if ui.button("打开文件夹").clicked() {
                                     self.want_open_folder = true;
+                                }
+                                if ui.button("打开文件").clicked() {
+                                    self.want_open_files = true;
                                 }
                             });
                         }
@@ -3509,12 +3560,13 @@ impl EasyEditorApp {
         let hints = {
             let k = |a: &str| self.keymap.get(a).to_string();
             format!(
-                "{} 打开文件夹   {} 快速打开   {} 全局搜索\n\
+                "{} 打开文件夹   {} 打开文件   {} 快速打开   {} 全局搜索\n\
                  {} 查找   {} 替换   {} 日志块   {} / {} 块间跳转\n\
                  {} 新建文件   {} 终端   {} 新建终端\n\
                  {} 新建查询   {} 插入 SQL 块   {} 执行 SQL   {} 结果区\n\
                  {} 自动拆分   {} / {} 手动拆分   {} 关闭面板   {} 下一个面板   {} 快捷键",
                 k("open_folder"),
+                k("open_file"),
                 k("quick_open"),
                 k("global_search"),
                 k("find"),
@@ -3615,12 +3667,12 @@ impl EasyEditorApp {
                     .show(ui, |ui| {
                         let title = match kind {
                             PaneKind::Editor(Some(idx)) => {
-                                let file = &self.tabs[idx];
-                                let mut t = file.title();
-                                if file.dirty {
+                                let (dirty, large) = (self.tabs[idx].dirty, self.tabs[idx].large);
+                                let mut t = self.tab_title(idx);
+                                if dirty {
                                     t.push_str(" ●");
                                 }
-                                if file.large {
+                                if large {
                                     t.push_str(" [大]");
                                 }
                                 t
@@ -3701,8 +3753,10 @@ impl EasyEditorApp {
                             }
                             PaneKind::Editor(None) => {
                                 let full = self.tabs.is_empty() && layout.panes.len() == 1;
-                                if pane_welcome(ui, full, hints, &hint) {
-                                    self.want_open_folder = true;
+                                match pane_welcome(ui, full, hints, &hint) {
+                                    Welcome::Nothing => {}
+                                    Welcome::Folder => self.want_open_folder = true,
+                                    Welcome::File => self.want_open_files = true,
                                 }
                             }
                             PaneKind::Terminal(t) => {
@@ -3765,6 +3819,9 @@ impl EasyEditorApp {
         let mut activate = None;
         let mut close = None;
         let shown = self.focused_tab();
+        // 一次算完整排：每个标签单独算会变成 O(n²) 的字符串拼活
+        let paths: Vec<PathBuf> = self.tabs.iter().map(|t| t.path.clone()).collect();
+        let titles = filetree::unique_titles(&paths);
 
         egui::ScrollArea::horizontal()
             .id_salt("tab_bar")
@@ -3772,7 +3829,7 @@ impl EasyEditorApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     for (i, tab) in self.tabs.iter().enumerate() {
-                        let mut title = tab.title();
+                        let mut title = titles[i].clone();
                         if tab.dirty {
                             title.push_str(" ●");
                         }
@@ -4009,7 +4066,10 @@ impl EasyEditorApp {
             self.pending_close = None;
             return;
         }
-        let name = self.tabs[idx].title();
+        let name = self.tab_title(idx);
+        // 这是要落盘还是要丢掉的决定，光给个文件名不够——同名文件在两个目录里时，
+        // 「保存并关闭」写错地方比不保存麻烦得多。
+        let where_ = self.tabs[idx].path.display().to_string();
         let mut action: Option<u8> = None;
 
         egui::Window::new("未保存的修改")
@@ -4018,6 +4078,7 @@ impl EasyEditorApp {
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 ui.label(format!("{name} 有未保存的修改，要保存吗？"));
+                muted_line(ui, where_);
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("保存并关闭").clicked() {
@@ -4695,6 +4756,10 @@ impl EasyEditorApp {
             self.want_open_folder = false;
             self.open_folder_dialog();
         }
+        if self.want_open_files {
+            self.want_open_files = false;
+            self.open_files_dialog();
+        }
 
         egui::Panel::top("toolbar")
             .frame(
@@ -4852,9 +4917,16 @@ fn pane_desc(panes: &PaneTree<PaneKind>, layout: &TreeLayout) -> String {
     format!("PaneId({}) {kind} 左边缘x={x}", id.0)
 }
 
+/// 欢迎页上那两颗按钮各自要点哪个对话框。
+enum Welcome {
+    Nothing,
+    Folder,
+    File,
+}
+
 /// 空白面板的内容。`full` 是「整屏就这一块面板且一个文件都没开」，那种情况才显示欢迎页。
-/// 返回是否请求打开文件夹。
-fn pane_welcome(ui: &mut Ui, full: bool, hints: &str, hint: &dyn Fn(&str) -> String) -> bool {
+/// 返回要点哪个对话框。
+fn pane_welcome(ui: &mut Ui, full: bool, hints: &str, hint: &dyn Fn(&str) -> String) -> Welcome {
     if !full {
         ui.add_space(16.0);
         ui.vertical_centered(|ui| {
@@ -4867,9 +4939,9 @@ fn pane_welcome(ui: &mut Ui, full: bool, hints: &str, hint: &dyn Fn(&str) -> Str
                 .weak(),
             );
         });
-        return false;
+        return Welcome::Nothing;
     }
-    let mut want_open = false;
+    let mut want = Welcome::Nothing;
     ui.vertical_centered(|ui| {
         ui.add_space(ui.available_height() * 0.22);
         ui.label(RichText::new("EasyEditor").size(crate::theme::display(ui)).strong());
@@ -4879,13 +4951,19 @@ fn pane_welcome(ui: &mut Ui, full: bool, hints: &str, hint: &dyn Fn(&str) -> Str
                 .weak(),
         );
         ui.add_space(14.0);
-        if ui.button("打开文件夹").clicked() {
-            want_open = true;
-        }
+        // 一排两颗：文件夹是「把这一片都给我」，文件是「我就要看这一个」。
+        ui.horizontal(|ui| {
+            if ui.button("打开文件夹").clicked() {
+                want = Welcome::Folder;
+            }
+            if ui.button("打开文件").clicked() {
+                want = Welcome::File;
+            }
+        });
         ui.add_space(18.0);
         ui.label(RichText::new(hints).size(crate::theme::sm(ui)).weak());
     });
-    want_open
+    want
 }
 
 /// 一批文案里最宽的那条有多长，照给定字号实量。
@@ -6420,6 +6498,7 @@ mod tests {
     /// 顶栏那些按钮的字。窄窗口下挤不下时宁可让它们换行，也不能叠着画。
     const TOOLBAR_LABELS: &[&str] = &[
         "打开文件夹",
+        "打开文件",
         "保存",
         "←",
         "→",
@@ -6635,13 +6714,15 @@ mod tests {
         let (ctx, mut app, _dir) = app_in_folder("easy-editor-app-toolbar", "a\n");
         // 那个按钮写「深色」还是「浅色」跟着 self.dark 走，钉死免得跟着用户配置漂
         app.dark = false;
-        // 「1400 宽必须排成一排」同样是字号的函数：不钉死，用户把界面字号调大一点就判失败
+        // 「1500 宽必须排成一排」同样是字号的函数：不钉死，用户把界面字号调大一点就判失败
         app.set_ui_font_size(theme::UI_FONT_DEFAULT, &ctx);
         let mut want = TOOLBAR_LABELS.to_vec();
         want.sort_unstable();
 
         // 从窗口最小宽度往上一档一档量：哪一档都不许叠字、不许挤掉按钮、不许画出右边缘
-        for w in [800.0, 900.0, 1000.0, 1100.0, 1200.0, 1300.0, 1400.0] {
+        // 顶栏左端多了「打开文件」，右边那组（字号 / shell / 主题 / 帮助）跟着被挤到第二排，
+        // 量下来一排排得下的界限从 1400 抬到了 1500。
+        for w in [800.0, 900.0, 1000.0, 1100.0, 1200.0, 1300.0, 1400.0, 1500.0, 1600.0] {
             let all = settled_toolbar(&mut app, &ctx, Vec2::new(w, 880.0));
             let buttons: Vec<(String, Rect)> = all
                 .iter()
@@ -6664,11 +6745,11 @@ mod tests {
                 "{w} 宽顶栏画到窗口外面了：{all:?}"
             );
 
-            // 1400 放得下一整排，就别白占高度；900 放不下，必须换排
-            if w >= 1400.0 {
+            // 1500 放得下一整排，就别白占高度；900 放不下，必须换排
+            if w >= 1500.0 {
                 assert!(
                     all.iter().all(|(_, r)| r.top() < 24.0),
-                    "1400 宽顶栏占了不止一排：{all:?}"
+                    "1500 宽顶栏占了不止一排：{all:?}"
                 );
             }
             if w <= 900.0 {
@@ -8094,5 +8175,157 @@ mod tests {
         // 收掉弹窗不等于撤销保护：原文没保住就永远不许写回
         assert!(app.config.trouble.as_ref().is_some_and(|t| t.blocks_save()));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 在临时根下面单独开一个目录，用完由测试自己删。
+    fn temp_dir(dir_name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(dir_name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 侧栏那个文件夹只是入口，不是「能打开哪些文件」的边界。
+    ///
+    /// 打开工作区之外的文件时，工作区、索引、终端 cwd、已经开着的标签都必须原样不动——
+    /// 用户从资源管理器双击一个 Downloads 里的笔记，不该顺手把整个 Downloads 变成工作区。
+    #[test]
+    fn opening_a_file_outside_the_workspace_leaves_the_workspace_alone() {
+        let (_ctx, mut app, dir) = app_in_folder("easy-editor-app-outside-root", "in workspace\n");
+        let outside = temp_dir("easy-editor-app-outside-target");
+        std::fs::write(outside.join("note.txt"), "elsewhere\n").unwrap();
+
+        let root_before = app.root.clone();
+        let index_before = app.index.clone();
+        let cwd_before = app.terminal.cwd.clone();
+
+        app.open_file(dir.join("a.txt"), None);
+        app.open_file(outside.join("note.txt"), None);
+
+        assert_eq!(app.root, root_before, "打开工作区外的文件把工作区换了");
+        assert_eq!(
+            app.index, index_before,
+            "打开工作区外的文件重扫了索引"
+        );
+        assert_eq!(app.terminal.cwd, cwd_before, "打开工作区外的文件动了终端 cwd");
+        assert_eq!(app.tabs.len(), 2, "工作区外的文件没进标签条");
+        assert_eq!(app.tabs[0].path, dir.join("a.txt"), "原有的标签被顶掉了");
+        assert_eq!(app.tabs[1].text, "elsewhere\n");
+
+        // 保存写回的是它自己的绝对路径，而不是工作区里同名的位置
+        app.tabs[1].text = "edited elsewhere\n".into();
+        app.active = Some(1);
+        app.save_active();
+        assert_eq!(
+            std::fs::read_to_string(outside.join("note.txt")).unwrap(),
+            "edited elsewhere\n",
+            "保存写到了别的地方：{}",
+            app.status
+        );
+        assert!(!dir.join("note.txt").exists(), "反倒在工作区里造了个同名文件");
+
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    /// 命令行带一个文件路径（`.txt` 双击就是这条路）只开这一个文件，不设工作区。
+    #[test]
+    fn bootstrap_with_a_file_argument_does_not_set_a_workspace() {
+        let dir = temp_dir("easy-editor-app-cli-file");
+        std::fs::write(dir.join("note.txt"), "double clicked\n").unwrap();
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let app = EasyEditorApp::bootstrap(&ctx, Some(dir.join("note.txt")));
+
+        assert!(app.root.is_none(), "双击一个文件却把它的目录设成了工作区");
+        assert!(app.tree.is_none(), "双击一个文件却建了文件树");
+        assert!(app.index.is_empty(), "双击一个文件却扫了整条目录");
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].path, dir.join("note.txt"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 两个不同目录下的同名文件一起开着，标签条得能认出哪一个是哪一个。
+    #[test]
+    fn tab_bar_distinguishes_same_named_files() {
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-dup-names", "a\n");
+        let other = temp_dir("easy-editor-app-dup-names-other");
+        std::fs::write(dir.join("note.txt"), "in the workspace\n").unwrap();
+        std::fs::write(other.join("note.txt"), "outside\n").unwrap();
+
+        app.open_file(dir.join("note.txt"), None);
+        app.open_file(other.join("note.txt"), None);
+        let out = frame(&mut app, &ctx, vec![]);
+        let shown = texts(&out);
+        for dir_name in [
+            "easy-editor-app-dup-names",
+            "easy-editor-app-dup-names-other",
+        ] {
+            assert!(
+                shown
+                    .iter()
+                    .any(|t| t.ends_with(&format!("…/{dir_name}/note.txt"))),
+                "标签没把 {dir_name} 那份 note.txt 区分出来：{shown:?}"
+            );
+        }
+
+        std::fs::remove_dir_all(&other).unwrap();
+    }
+
+    /// 欢迎页上「打开文件夹」和「打开文件」并排两颗。只留前者，想看单个文件的人
+    /// 就得先挑一个目录当工作区，而这正是「打开文件」要避免的副作用。
+    #[test]
+    fn welcome_page_offers_both_open_entry_points() {
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-welcome-both", "a\n");
+        let count = |out: &egui::FullOutput, needle: &str| {
+            texts(out)
+                .iter()
+                .filter(|t| t.as_str() == needle)
+                .count()
+        };
+
+        // 一个标签都没开：顶栏一颗 + 欢迎页一颗
+        let out = frame(&mut app, &ctx, vec![]);
+        assert_eq!(count(&out, "打开文件"), 2, "欢迎页少了「打开文件」");
+        assert_eq!(count(&out, "打开文件夹"), 2, "欢迎页少了「打开文件夹」");
+
+        // 开了文件，欢迎页退场，只剩顶栏那颗
+        app.open_file(dir.join("a.txt"), None);
+        let out = frame(&mut app, &ctx, vec![]);
+        assert_eq!(count(&out, "打开文件"), 1, "有文件开着还在画欢迎页那颗");
+        assert_eq!(count(&out, "打开文件夹"), 1);
+    }
+
+    /// 关一个没保存的标签时，弹窗光问「note.txt 要保存吗」不够——
+    /// 同名文件分散在两个目录时，写错地方比不保存更麻烦，所以整条路径要摊开。
+    #[test]
+    fn close_confirm_shows_which_file_is_being_saved() {
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-close-confirm-path", "a\n");
+        let other = temp_dir("easy-editor-app-close-confirm-other");
+        std::fs::write(dir.join("note.txt"), "in the workspace\n").unwrap();
+        std::fs::write(other.join("note.txt"), "outside\n").unwrap();
+
+        app.open_file(dir.join("note.txt"), None);
+        app.open_file(other.join("note.txt"), None);
+        app.tabs[1].dirty = true;
+        app.close_tab(1);
+        assert!(app.pending_close.is_some(), "脏标签没弹出确认");
+
+        let out = frame(&mut app, &ctx, vec![]);
+        let shown = texts(&out);
+        let full = other.join("note.txt").display().to_string();
+        assert!(
+            shown.iter().any(|t| t.contains(&full)),
+            "确认弹窗里没有完整路径 {full}：{shown:?}"
+        );
+        assert!(
+            shown
+                .iter()
+                .any(|t| t.starts_with("…/easy-editor-app-close-confirm-other/note.txt")),
+            "确认弹窗的标题行没区分同名文件：{shown:?}"
+        );
+
+        std::fs::remove_dir_all(&other).unwrap();
     }
 }

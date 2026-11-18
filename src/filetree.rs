@@ -835,6 +835,64 @@ pub fn relative(root: &Path, path: &Path) -> String {
         .unwrap_or_else(|_| path.to_string_lossy().to_string())
 }
 
+/// 路径按 `/` 拆成的段，只拿来拼显示名，不还原成 `Path`。
+fn segments(path: &Path) -> Vec<String> {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// 取末尾 `k` 段拼成显示名；前面还有没摊出来的就摆个省略号。
+fn tail(segs: &[String], k: usize) -> String {
+    let shown = k.min(segs.len());
+    let joined = segs[segs.len() - shown..].join("/");
+    if shown < segs.len() {
+        format!("…/{joined}")
+    } else {
+        joined
+    }
+}
+
+/// 给这批路径各取一个「在这一排里认得出是哪一份」的名字。
+///
+/// 只用文件名时，`D:\文档\note.txt` 和 `D:\工作\note.txt` 在标签条上长成同一个东西，
+/// 点哪个全凭猜——而能打开任意位置的文件之后，这种撞名是常态而不是边角。做法和 VS Code
+/// 一样：只有撞名的那一组才逐个往前补父目录段，补到组内互不相同为止；不撞名的保持光秃秃
+/// 的文件名，不然整排标签都被无谓地拉长。
+pub fn unique_titles(paths: &[PathBuf]) -> Vec<String> {
+    let segs: Vec<Vec<String>> = paths.iter().map(|p| segments(p)).collect();
+    let mut titles: Vec<String> = segs
+        .iter()
+        .map(|s| s.last().cloned().unwrap_or_default())
+        .collect();
+
+    // 每轮把还在撞名的组往前多摊一段；摊到整条路径还同名的那份就没得摊了，
+    // 一组里全员都没得摊才收工（组里只要还有一个能长，这轮就还没到头）。
+    let mut depth = 1usize;
+    loop {
+        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, t) in titles.iter().enumerate() {
+            groups.entry(t.clone()).or_default().push(i);
+        }
+        let mut grew = false;
+        for idx in groups.into_values().filter(|g| g.len() > 1) {
+            for i in &idx {
+                if depth < segs[*i].len() {
+                    titles[*i] = tail(&segs[*i], depth + 1);
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            return titles;
+        }
+        depth += 1;
+    }
+}
+
 #[allow(dead_code)]
 pub fn row_rect(ui: &Ui) -> Rect {
     Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width(), 20.0))
@@ -1273,5 +1331,56 @@ mod tests {
 
         tree.filter = "不存在的文件".into();
         assert!(tree.matching_entries().is_empty());
+    }
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    /// 不撞名就一个文件名都不多给：整排标签不该为无关的目录段变长。
+    #[test]
+    fn unique_titles_keeps_bare_names_when_nothing_collides() {
+        let got = unique_titles(&[p("D:/a/main.rs"), p("D:/b/notes.txt"), p("C:/x/app.rs")]);
+        assert_eq!(got, ["main.rs", "notes.txt", "app.rs"]);
+        assert!(unique_titles(&[]).is_empty());
+    }
+
+    /// 撞名的那一组才往前摊一段，并且带上省略号说明还有没摊出来的前缀。
+    #[test]
+    fn unique_titles_expands_only_the_colliding_group() {
+        let got = unique_titles(&[p("D:/文档/note.txt"), p("D:/工作/note.txt"), p("D:/其他/keep.txt")]);
+        assert_eq!(got, ["…/文档/note.txt", "…/工作/note.txt", "keep.txt"]);
+    }
+
+    /// 父目录段本身也撞名时继续摊，直到组内互不相同。
+    #[test]
+    fn unique_titles_keeps_expanding_until_deep_collisions_differ() {
+        let got = unique_titles(&[p("D:/工作/x/note.txt"), p("C:/备份/x/note.txt")]);
+        assert_eq!(got, ["…/工作/x/note.txt", "…/备份/x/note.txt"]);
+    }
+
+    /// 同一路径重复传进来（open_file 会复用已有页签，正常走不到这一步）：
+    /// 一直摊到整条路径还是同名就停手，不能死循环，也不能崩。
+    #[test]
+    fn unique_titles_stops_when_paths_are_identical() {
+        let got = unique_titles(&[p("D:/a/note.txt"), p("D:/a/note.txt")]);
+        assert_eq!(got, ["D:/a/note.txt", "D:/a/note.txt"]);
+    }
+
+    /// 一层的路径和嵌得深的路径撞名：摊不动的那个停下，还能摊的那个继续摊，
+    /// 不能因为组里有一个到顶了就整组放弃。
+    #[test]
+    fn unique_titles_lets_the_deeper_path_carry_the_disambiguation() {
+        let got = unique_titles(&[p("C:/note.txt"), p("C:/a/note.txt")]);
+        assert_eq!(got[0], "C:/note.txt");
+        assert_eq!(got[1], "…/a/note.txt");
+        assert_ne!(got[0], got[1]);
+    }
+
+    /// `\` 和 `/` 是同一台机器上的同一条路径，分隔符不统一不能算成两个名字。
+    #[test]
+    fn unique_titles_treats_both_separators_alike() {
+        let got = unique_titles(&[p("D:\\a\\note.txt"), p("D:/b/note.txt")]);
+        assert_eq!(got, ["…/a/note.txt", "…/b/note.txt"]);
     }
 }

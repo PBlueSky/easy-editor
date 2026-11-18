@@ -137,13 +137,6 @@ impl OpenFile {
         self.dirty = false;
     }
 
-    pub fn title(&self) -> String {
-        self.path
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| self.path.to_string_lossy().to_string())
-    }
-
     pub fn line_count(&self) -> usize {
         self.line_offsets.len()
     }

@@ -27,6 +27,12 @@ pub const ACTIONS: &[ActionDef] = &[
         default: "Ctrl+O",
     },
     ActionDef {
+        id: "open_file",
+        label: "打开文件",
+        group: "文件",
+        default: "Ctrl+Shift+O",
+    },
+    ActionDef {
         id: "save",
         label: "保存",
         group: "文件",
@@ -599,6 +605,12 @@ mod tests {
         assert!(km.owns("pane_next", Key::Tab, ctrl_shift));
         assert!(km.owns("global_search", Key::F, ctrl_shift));
         assert!(!km.owns("find", Key::F, ctrl_shift));
+
+        // 「打开文件夹」和「打开文件」共用 O 键，靠 Shift 分开
+        assert!(km.owns("open_file", Key::O, ctrl_shift));
+        assert!(!km.owns("open_folder", Key::O, ctrl_shift));
+        assert!(km.owns("open_folder", Key::O, ctrl));
+        assert!(!km.owns("open_file", Key::O, ctrl));
     }
 
     /// `+` 和 `=` 是同一个物理键（打 `+` 要按 Shift），两种写法都得归「放大字号」。
