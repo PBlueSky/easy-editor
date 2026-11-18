@@ -31,8 +31,11 @@ pub fn env_flag(name: &str) -> bool {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct Config {
-    /// 编辑器字号
+    /// 编辑器字号（`Ctrl+=` 调的就是它）
     pub font_size: f32,
+    /// 界面字号：顶栏、侧栏、页签、结果区这些非编辑区文字一起走这个数。
+    /// 档位怎么由它铺开，见 `theme` 模块头「字号只有一处来源」。
+    pub ui_font_size: f32,
     /// 是否深色主题
     pub dark: bool,
     /// 上次打开的工作目录
@@ -67,7 +70,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            font_size: 14.0,
+            font_size: crate::theme::EDITOR_FONT_DEFAULT,
+            ui_font_size: crate::theme::UI_FONT_DEFAULT,
             dark: false,
             last_workspace: None,
             show_side: true,
@@ -95,7 +99,13 @@ impl Config {
 
     /// 挡住手工改坏的值。配置是这个文件同用户都能编辑的 JSON，改坏了不能把应用带崩。
     fn sanitize(&mut self) {
-        self.font_size = self.font_size.clamp(10.0, 28.0);
+        self.font_size = self
+            .font_size
+            .clamp(crate::theme::EDITOR_FONT_MIN, crate::theme::EDITOR_FONT_MAX);
+        // 界面字号越界不只是难看：Body 撑到 30 时顶栏那一排会换行、面板会被字撑破
+        self.ui_font_size = self
+            .ui_font_size
+            .clamp(crate::theme::UI_FONT_MIN, crate::theme::UI_FONT_MAX);
         prune_connections(&mut self.db_connections);
     }
 }

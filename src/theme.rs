@@ -25,6 +25,22 @@
 //! 统一行高后，英文基线与中文基线之差为
 //! `(1.0581 + (L-1.3198)/2) - (0.7427 + (L-1.1709)/2) = 0.2410`，
 //! 所以中文上移 0.2410em 即对齐；符号字体同理为 0.2568em。
+//!
+//! ## 字号只有一处来源
+//!
+//! 界面上的字分两条线，各有一个数说了算：
+//!
+//! - **界面字号**（`config.ui_font_size`，默认值见 [`UI_FONT_DEFAULT`]）：顶栏、侧栏、
+//!   页签、结果区、各个窗口里所有文字。[`apply_style`] 把它铺成样式表五档
+//!   （Body / Button / Small / Monospace / Heading），界面上其余各处不许再写死字号，
+//!   要小字就取 [`sm`]／[`md`]／[`xs`]，要字标就取 [`display`]——它们都照着 Body 算，
+//!   所以跟着同一个数走。
+//! - **编辑器字号**（`config.font_size`）：只管编辑器正文和终端正文，`Ctrl+=` 调的是它。
+//!
+//! 这条线以前是断的：全应用散着一百多处 `.size(11.0)`／`.size(12.5)` 那样的字面量，
+//! 组不成一套档位，也没有任何东西能一起调它们——所以「字号调了，只有编辑器动，
+//! 别处纹丝不动」。现在它们都落到上面那三个函数或样式表的档位上；行高、列宽这类几何
+//! 再由字号量出来（`Ui::text_style_height`、`Fonts::glyph_width`），不写死常数。
 
 use std::sync::Arc;
 
@@ -172,11 +188,12 @@ pub const HAND: egui::CursorIcon = egui::CursorIcon::PointingHand;
 /// 边距却一直留着，所以点下去不会把整行推歪。字号和边距在这一处统一，
 /// 免得各面板各写各的，一排小按钮高矮胖瘦不齐。
 pub fn chip(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let size = sm(ui);
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         ui.spacing_mut().button_padding = egui::vec2(4.0, 2.0);
         ui.add(
-            egui::Button::new(egui::RichText::new(text).size(11.0))
+            egui::Button::new(egui::RichText::new(text).size(size))
                 .frame(true)
                 .frame_when_inactive(false),
         )
@@ -185,8 +202,59 @@ pub fn chip(ui: &mut egui::Ui, text: &str) -> egui::Response {
     .on_hover_cursor(HAND)
 }
 
+/// 界面字号的默认值（点）——样式表里 Body 那一档，也是阶梯的锚。
+pub const UI_FONT_DEFAULT: f32 = 13.5;
+/// 界面字号的边界：滑杆到头和手工改配置都夹在这儿。
+pub const UI_FONT_MIN: f32 = 10.0;
+pub const UI_FONT_MAX: f32 = 20.0;
+
+/// 编辑器字号（`Ctrl+=` 那一档）的默认值与边界。
+/// 设置页的滑杆、快捷键的加减、`config` 的夹取都引用这三个数，不再各写一份。
+pub const EDITOR_FONT_DEFAULT: f32 = 14.0;
+pub const EDITOR_FONT_MIN: f32 = 10.0;
+pub const EDITOR_FONT_MAX: f32 = 28.0;
+
+/// 阶梯的锚：样式表里的 Body。调界面字号只改它，其余各处跟着动。
+fn body(ui: &egui::Ui) -> f32 {
+    ui.style().text_styles[&TextStyle::Body].size
+}
+
+/// 密集小字：页签、树行、状态行。等于样式表的 `Small`。
+pub fn sm(ui: &egui::Ui) -> f32 {
+    body(ui) - 2.0
+}
+
+/// 中间档：列表里的名字、能按的小按钮上的字。
+/// 比小字醒目，又不像正文那样把行撑高。
+pub fn md(ui: &egui::Ui) -> f32 {
+    body(ui) - 1.0
+}
+
+/// 次要说明：比小字再轻一档，只作提示用。
+pub fn xs(ui: &egui::Ui) -> f32 {
+    body(ui) - 3.0
+}
+
+/// 阶梯顶上那一档：空面板的字标。样式表最高只到 `Heading`，字标要比它再大一圈，
+/// 所以照 Body 翻倍——还是跟着界面字号走。
+pub fn display(ui: &egui::Ui) -> f32 {
+    body(ui) * 2.0
+}
+
+/// 把照着默认界面字号量出来的常数（窗口宽、换行阈值、列表高）换算到当前档位。
+///
+/// 取 `Context` 而不是 `Ui`，是因为有些常数要在建窗口那一刻就定下来，那时还没有 `Ui`。
+/// 能从字号直接量的（行高、列宽）别用它——那个量出来是准的，这个是估的。
+pub fn scale(ctx: &egui::Context, at_default: f32) -> f32 {
+    let base = ctx.global_style().text_styles[&TextStyle::Body].size;
+    base * (at_default / UI_FONT_DEFAULT)
+}
+
 /// 应用整体视觉风格。
-pub fn apply_style(ctx: &egui::Context, dark: bool) {
+///
+/// `ui_font` 是界面字号（编辑器和终端正文不归它，走 `config.font_size`）。
+/// 样式表五档全由这一个数铺开，界面上其余各处也一样——见文件头「字号只有一处来源」。
+pub fn apply_style(ctx: &egui::Context, dark: bool, ui_font: f32) {
     ctx.set_theme(if dark {
         egui::ThemePreference::Dark
     } else {
@@ -223,21 +291,22 @@ pub fn apply_style(ctx: &egui::Context, dark: bool) {
     style.spacing.item_spacing = egui::vec2(6.0, 5.0);
     style.spacing.button_padding = egui::vec2(8.0, 3.0);
     style.spacing.menu_margin = egui::Margin::same(6);
+    let base = ui_font.clamp(UI_FONT_MIN, UI_FONT_MAX);
     style
         .text_styles
-        .insert(TextStyle::Body, FontId::proportional(13.5));
+        .insert(TextStyle::Body, FontId::proportional(base));
     style
         .text_styles
-        .insert(TextStyle::Button, FontId::proportional(13.5));
+        .insert(TextStyle::Button, FontId::proportional(base));
     style
         .text_styles
-        .insert(TextStyle::Small, FontId::proportional(11.5));
+        .insert(TextStyle::Small, FontId::proportional(base - 2.0));
     style
         .text_styles
-        .insert(TextStyle::Heading, FontId::proportional(18.0));
+        .insert(TextStyle::Heading, FontId::proportional(base + 4.5));
     style.text_styles.insert(
         TextStyle::Monospace,
-        FontId::new(13.0, FontFamily::Monospace),
+        FontId::new(base - 0.5, FontFamily::Monospace),
     );
     ctx.set_global_style(style);
 }

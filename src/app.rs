@@ -53,6 +53,39 @@ impl SideTab {
     }
 }
 
+/// 设置窗口里的分区。左侧导航照 `ALL` 的顺序排。
+///
+/// 快捷键和终端设置原来是两个各开各的窗口，用户得先知道「哪个设置藏在哪个窗口里」。
+/// 收进这一个窗口，入口只剩一个，`?` 和 `⚙` 只是各自跳到对应分区。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum SettingsSection {
+    Appearance,
+    Keymap,
+    Terminal,
+    System,
+    Database,
+}
+
+impl SettingsSection {
+    const ALL: [Self; 5] = [
+        Self::Appearance,
+        Self::Keymap,
+        Self::Terminal,
+        Self::System,
+        Self::Database,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Appearance => "外观",
+            Self::Keymap => "快捷键",
+            Self::Terminal => "终端",
+            Self::System => "系统",
+            Self::Database => "数据库",
+        }
+    }
+}
+
 /// 中央区域的一块面板：要么在看文件，要么在跑 shell。
 ///
 /// 编辑器面板存的是 `tabs` 的下标而不是路径：同一个文件允许同时出现在两块面板里
@@ -110,6 +143,8 @@ pub struct EasyEditorApp {
     find: FindState,
     hl: Highlighter,
     font_size: f32,
+    /// 界面字号：非编辑区所有文字跟着它走（见 `theme` 模块头）
+    ui_font: f32,
     dark: bool,
     /// 主窗口的原生句柄，用来把系统标题栏刷成当前主题；无头测试里是 `None`
     hwnd: Option<isize>,
@@ -122,7 +157,12 @@ pub struct EasyEditorApp {
     config_trouble_seen: bool,
     quick_open: Option<QuickOpen>,
     pending_close: Option<usize>,
-    show_help: bool,
+    /// 设置窗口是否打开
+    show_settings: bool,
+    /// 设置窗口当前显示哪个分区
+    settings_section: SettingsSection,
+    /// 设置窗口这次出现时要不要摆回屏幕正中
+    center_settings: bool,
     want_open_folder: bool,
     focus_search: bool,
     frame_count: u32,
@@ -136,10 +176,6 @@ pub struct EasyEditorApp {
     keymap: Keymap,
     /// 正在录制新快捷键的动作 id
     recording: Option<String>,
-    /// 「终端设置」窗口是否打开
-    show_terminal_settings: bool,
-    /// 「终端设置」窗口这次出现时要不要摆回屏幕正中
-    center_terminal_settings: bool,
     /// 中央区域的面板树（tmux 式：一块块面板递归切分，编辑器与终端共用一棵树）
     panes: PaneTree<PaneKind>,
     /// 数据库连接：侧栏「数据库」页签 + 连接管理窗口，SQL 块也从这里取连接
@@ -248,6 +284,7 @@ impl EasyEditorApp {
     fn bootstrap(ctx: &egui::Context, target: Option<PathBuf>) -> Self {
         let config = ConfigStore::load();
         let font_size = config.data.font_size;
+        let ui_font = config.data.ui_font_size;
         let dark = config.data.dark;
         let show_side = config.data.show_side;
         let word_wrap = config.data.word_wrap;
@@ -256,7 +293,7 @@ impl EasyEditorApp {
         let db_connections = config.data.db_connections.clone();
 
         theme::install_fonts(ctx);
-        theme::apply_style(ctx, dark);
+        theme::apply_style(ctx, dark, ui_font);
 
         // egui 自带一套「像浏览器那样缩放整个界面」的快捷键（Ctrl+= / Ctrl+- / Ctrl+0），
         // 它改的是 zoom_factor，菜单、侧栏、编辑器会一起变大。本应用的字号快捷键和它撞车，
@@ -284,6 +321,7 @@ impl EasyEditorApp {
             find: FindState::default(),
             hl: Highlighter::new(dark),
             font_size,
+            ui_font,
             dark,
             hwnd: None,
             word_wrap,
@@ -292,7 +330,9 @@ impl EasyEditorApp {
             config_trouble_seen: false,
             quick_open: None,
             pending_close: None,
-            show_help: false,
+            show_settings: false,
+            settings_section: SettingsSection::Appearance,
+            center_settings: false,
             want_open_folder: false,
             focus_search: false,
             frame_count: 0,
@@ -301,8 +341,6 @@ impl EasyEditorApp {
             nav: CaretHistory::new(),
             keymap,
             recording: None,
-            show_terminal_settings: false,
-            center_terminal_settings: false,
             panes: PaneTree::new(),
             database: DatabasePanel::new(db_connections),
             results: ResultsDock::new(),
@@ -378,6 +416,10 @@ impl EasyEditorApp {
         let mut changed = false;
         if self.config.data.font_size != self.font_size {
             self.config.data.font_size = self.font_size;
+            changed = true;
+        }
+        if self.config.data.ui_font_size != self.ui_font {
+            self.config.data.ui_font_size = self.ui_font;
             changed = true;
         }
         if self.config.data.dark != self.dark {
@@ -884,7 +926,7 @@ impl EasyEditorApp {
     fn connection_row(&self, ui: &mut Ui) {
         let Some(name) = self.database.active_conn().map(|s| s.to_string()) else {
             let warn = ui.visuals().warn_fg_color;
-            ui.label(RichText::new("还没有数据库连接").size(11.5).color(warn));
+            ui.label(RichText::new("还没有数据库连接").size(crate::theme::sm(ui)).color(warn));
             return;
         };
         // 说「生效的那份」配置：树上换过当前库，这里就得跟着换，不然它指旧库。
@@ -892,12 +934,12 @@ impl EasyEditorApp {
         let target = eff.as_ref().map(|s| s.target()).unwrap_or_default();
         let accent = ui.visuals().hyperlink_color;
         ui.horizontal(|ui| {
-            ui.label(RichText::new("默认连接").size(11.0).weak());
-            ui.label(RichText::new(&name).size(11.5).strong().color(accent));
+            ui.label(RichText::new("默认连接").size(crate::theme::sm(ui)).weak());
+            ui.label(RichText::new(&name).size(crate::theme::sm(ui)).strong().color(accent));
             let (mark, state, _) = self.database.link_mark(ui, &name);
-            ui.label(RichText::new(mark).size(11.5).strong().color(accent))
+            ui.label(RichText::new(mark).size(crate::theme::sm(ui)).strong().color(accent))
                 .on_hover_text(state);
-            ui.label(RichText::new(target).size(10.5).weak());
+            ui.label(RichText::new(target).size(crate::theme::xs(ui)).weak());
         });
     }
 
@@ -1436,7 +1478,7 @@ impl EasyEditorApp {
             self.set_font_size(self.font_size - 1.0, ctx);
         }
         if self.keymap.consume(ctx, "help") {
-            self.show_help = !self.show_help;
+            self.toggle_settings(SettingsSection::Keymap);
         }
         if self.keymap.consume(ctx, "screenshot") {
             self.take_screenshot(ctx);
@@ -2052,7 +2094,7 @@ impl EasyEditorApp {
                 const STAGES: [u64; 5] = [300, 700, 1100, 1400, 1700];
                 if self.verify_stage < STAGES.len() && ms >= STAGES[self.verify_stage] {
                     match self.verify_stage {
-                        0 => self.show_help = true,
+                        0 => self.open_settings(SettingsSection::Keymap),
                         // 进入录制状态，同时塞一个 Ctrl+F 事件进去
                         1 => {
                             self.recording = Some("nav_back".into());
@@ -2338,8 +2380,30 @@ impl EasyEditorApp {
     }
 
     fn set_font_size(&mut self, size: f32, ctx: &egui::Context) {
-        self.font_size = size.clamp(10.0, 28.0);
+        self.font_size = size.clamp(theme::EDITOR_FONT_MIN, theme::EDITOR_FONT_MAX);
         let _ = ctx;
+    }
+
+    /// 界面字号。样式表是挂在 `Context` 上的全局状态，所以改完必须立刻重铺，
+    /// 否则要等到下次切主题才看得出动静。
+    fn set_ui_font_size(&mut self, size: f32, ctx: &egui::Context) {
+        self.ui_font = size.clamp(theme::UI_FONT_MIN, theme::UI_FONT_MAX);
+        theme::apply_style(ctx, self.dark, self.ui_font);
+    }
+
+    /// 深浅色。样式表、系统标题栏、语法高亮三处都要跟着换，漏一处就有一半界面是旧色。
+    fn set_theme(&mut self, dark: bool, ctx: &egui::Context) {
+        if self.dark == dark {
+            return;
+        }
+        self.dark = dark;
+        theme::apply_style(ctx, self.dark, self.ui_font);
+        titlebar::apply(self.hwnd, self.dark);
+        self.hl.set_theme(if dark {
+            crate::syntax::DARK_THEME
+        } else {
+            crate::syntax::LIGHT_THEME
+        });
     }
 
     /// 切换自动换行。长行要么折进面板，要么横向滚出去，两种都只能看见一种。
@@ -2377,7 +2441,7 @@ impl EasyEditorApp {
             ui.add_space(2.0);
             let h_open = hint("open_folder");
             if ui
-                .button(RichText::new("打开文件夹").size(12.5))
+                .button(RichText::new("打开文件夹").size(crate::theme::md(ui)))
                 .on_hover_text(h_open)
                 .clicked()
             {
@@ -2387,7 +2451,7 @@ impl EasyEditorApp {
             if ui
                 .add_enabled(
                     self.active.is_some(),
-                    egui::Button::new(RichText::new("保存").size(12.5)),
+                    egui::Button::new(RichText::new("保存").size(crate::theme::md(ui))),
                 )
                 .on_hover_text(h_save)
                 .clicked()
@@ -2403,7 +2467,7 @@ impl EasyEditorApp {
             if ui
                 .add_enabled(
                     self.nav.can_back(),
-                    egui::Button::new(RichText::new("←").size(13.0)),
+                    egui::Button::new("←"),
                 )
                 .on_hover_text(h_back)
                 .clicked()
@@ -2413,7 +2477,7 @@ impl EasyEditorApp {
             if ui
                 .add_enabled(
                     self.nav.can_forward(),
-                    egui::Button::new(RichText::new("→").size(13.0)),
+                    egui::Button::new("→"),
                 )
                 .on_hover_text(h_fwd)
                 .clicked()
@@ -2427,7 +2491,7 @@ impl EasyEditorApp {
             if ui
                 .add_enabled(
                     self.tree.is_some(),
-                    egui::Button::new(RichText::new("新文件").size(12.5)),
+                    egui::Button::new(RichText::new("新文件").size(crate::theme::md(ui))),
                 )
                 .on_hover_text(h_new_file)
                 .clicked()
@@ -2440,7 +2504,7 @@ impl EasyEditorApp {
             if ui
                 .add_enabled(
                     self.tree.is_some(),
-                    egui::Button::new(RichText::new("新文件夹").size(12.5)),
+                    egui::Button::new(RichText::new("新文件夹").size(crate::theme::md(ui))),
                 )
                 .on_hover_text(h_new_folder)
                 .clicked()
@@ -2455,7 +2519,7 @@ impl EasyEditorApp {
             let h_side = hint("side_toggle");
             let mut side = self.show_side;
             if ui
-                .selectable_label(side, RichText::new("侧栏").size(12.5))
+                .selectable_label(side, RichText::new("侧栏").size(crate::theme::md(ui)))
                 .on_hover_text(h_side)
                 .clicked()
             {
@@ -2465,7 +2529,7 @@ impl EasyEditorApp {
 
             let h_wrap = format!("长行折进面板 / 横向滚动  {}", hint("wrap_toggle"));
             if ui
-                .selectable_label(self.word_wrap, RichText::new("折行").size(12.5))
+                .selectable_label(self.word_wrap, RichText::new("折行").size(crate::theme::md(ui)))
                 .on_hover_text(h_wrap)
                 .clicked()
             {
@@ -2474,7 +2538,7 @@ impl EasyEditorApp {
 
             let h_term = format!("聚焦终端面板，没有就开一块  {}", hint("terminal_toggle"));
             if ui
-                .button(RichText::new("终端").size(12.5))
+                .button(RichText::new("终端").size(crate::theme::md(ui)))
                 .on_hover_text(h_term)
                 .clicked()
             {
@@ -2482,7 +2546,7 @@ impl EasyEditorApp {
             }
             let h_tnew = hint("terminal_new");
             if ui
-                .button(RichText::new("+终端").size(12.5))
+                .button(RichText::new("+终端").size(crate::theme::md(ui)))
                 .on_hover_text(h_tnew)
                 .clicked()
             {
@@ -2491,7 +2555,7 @@ impl EasyEditorApp {
 
             let h_col = format!("向右拆分当前面板  {}", hint("split_col"));
             if ui
-                .button(RichText::new("‖ 拆分").size(12.5))
+                .button(RichText::new("‖ 拆分").size(crate::theme::md(ui)))
                 .on_hover_text(h_col)
                 .clicked()
             {
@@ -2499,7 +2563,7 @@ impl EasyEditorApp {
             }
             let h_row = format!("向下拆分当前面板  {}", hint("split_row"));
             if ui
-                .button(RichText::new("═ 拆分").size(12.5))
+                .button(RichText::new("═ 拆分").size(crate::theme::md(ui)))
                 .on_hover_text(h_row)
                 .clicked()
             {
@@ -2510,7 +2574,7 @@ impl EasyEditorApp {
 
             let h_quick = hint("quick_open");
             if ui
-                .button(RichText::new("快速打开").size(12.5))
+                .button(RichText::new("快速打开").size(crate::theme::md(ui)))
                 .on_hover_text(h_quick)
                 .clicked()
             {
@@ -2518,7 +2582,7 @@ impl EasyEditorApp {
             }
             let h_search = hint("global_search");
             if ui
-                .button(RichText::new("全局搜索").size(12.5))
+                .button(RichText::new("全局搜索").size(crate::theme::md(ui)))
                 .on_hover_text(h_search)
                 .clicked()
             {
@@ -2530,7 +2594,7 @@ impl EasyEditorApp {
             if ui
                 .add_enabled(
                     self.active.is_some(),
-                    egui::Button::new(RichText::new("查找").size(12.5)),
+                    egui::Button::new(RichText::new("查找").size(crate::theme::md(ui))),
                 )
                 .on_hover_text(h_find)
                 .clicked()
@@ -2542,7 +2606,7 @@ impl EasyEditorApp {
             if ui
                 .add_enabled(
                     self.active.is_some(),
-                    egui::Button::new(RichText::new("日志块").size(12.5)),
+                    egui::Button::new(RichText::new("日志块").size(crate::theme::md(ui))),
                 )
                 .on_hover_text(h_journal)
                 .clicked()
@@ -2551,7 +2615,7 @@ impl EasyEditorApp {
             }
 
             // 顶栏只多这一个入口：连接相关的操作都在这个下拉里，不再摊开一排按钮
-            let menu = ui.menu_button(RichText::new("数据库").size(12.5), |ui| {
+            let menu = ui.menu_button(RichText::new("数据库").size(crate::theme::md(ui)), |ui| {
                 // 先把「这段 SQL 发去哪儿」说清楚，再给动作
                 self.connection_row(ui);
                 ui.separator();
@@ -2668,38 +2732,34 @@ impl EasyEditorApp {
             // 右组是从右往左排的，这一排剩下的地方不够就会一路压过左组的字，
             // 所以先换一排再排它。注意要量「这一排还剩多少」：可换行布局下
             // available_width() 报的是整排的宽度，永远碰不到这个阈值。
-            // 380 = 右组固定那部分（实测约 350）再留一点看工作区名的地方。
+            // 380 = 右组固定那部分（默认界面字号下实测约 350）再留一点看工作区名的地方。
             // 加了「数据库」下拉后左组变宽，这个数再往下压就只剩个位数给工作区名了。
-            if ui.available_rect_before_wrap().width() < 380.0 {
+            // 字号调大时右组本身也变宽，所以阈值跟着档位换算，不能停在 380。
+            if ui.available_rect_before_wrap().width() < theme::scale(ui.ctx(), 380.0) {
                 ui.end_row();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let h_help = format!("快捷键设置  {}", hint("help"));
+                let h_settings = "设置：外观、快捷键、终端、系统、数据库";
                 if ui
-                    .button(RichText::new("?").size(12.5))
+                    .button(RichText::new("?").size(crate::theme::md(ui)))
                     .on_hover_text(h_help)
                     .clicked()
                 {
-                    self.show_help = !self.show_help;
+                    self.toggle_settings(SettingsSection::Keymap);
                 }
                 if ui
-                    .button(RichText::new(if self.dark { "浅色" } else { "深色" }).size(12.5))
+                    .button(RichText::new(if self.dark { "浅色" } else { "深色" }).size(crate::theme::md(ui)))
                     .on_hover_text("切换主题")
                     .clicked()
                 {
-                    self.dark = !self.dark;
-                    theme::apply_style(ui.ctx(), self.dark);
-                    titlebar::apply(self.hwnd, self.dark);
-                    self.hl.set_theme(if self.dark {
-                        crate::syntax::DARK_THEME
-                    } else {
-                        crate::syntax::LIGHT_THEME
-                    });
+                    let dark = !self.dark;
+                    self.set_theme(dark, ui.ctx());
                 }
                 // 新建终端用哪个 shell。原来在终端面板的页签条上，页签条没了就挪到这儿
                 egui::ComboBox::from_id_salt("shell_picker")
                     .selected_text(
-                        RichText::new(format!("shell: {}", self.terminal.shell.label())).size(11.5),
+                        RichText::new(format!("shell: {}", self.terminal.shell.label())).size(crate::theme::sm(ui)),
                     )
                     .width(130.0)
                     .show_ui(ui, |ui| {
@@ -2714,25 +2774,23 @@ impl EasyEditorApp {
                     });
                 if ui
                     .small_button("⚙")
-                    .on_hover_text("配置终端的程序路径与启动参数")
+                    .on_hover_text(h_settings)
                     .clicked()
                 {
-                    self.show_terminal_settings = !self.show_terminal_settings;
-                    // 只在重新打开的那一刻要求居中，之后窗口随用户拖到哪算哪
-                    self.center_terminal_settings = self.show_terminal_settings;
+                    self.toggle_settings(SettingsSection::Appearance);
                 }
                 let h_dec = hint("font_dec");
                 if ui.small_button("-").on_hover_text(h_dec).clicked() {
-                    self.font_size = (self.font_size - 1.0).max(10.0);
+                    self.font_size = (self.font_size - 1.0).max(theme::EDITOR_FONT_MIN);
                 }
                 ui.label(
                     RichText::new(format!("{:.0}", self.font_size))
-                        .size(11.5)
+                        .size(crate::theme::sm(ui))
                         .weak(),
                 );
                 let h_inc = hint("font_inc");
                 if ui.small_button("+").on_hover_text(h_inc).clicked() {
-                    self.font_size = (self.font_size + 1.0).min(28.0);
+                    self.font_size = (self.font_size + 1.0).min(theme::EDITOR_FONT_MAX);
                 }
 
                 if let Some(root) = &self.root {
@@ -2741,7 +2799,7 @@ impl EasyEditorApp {
                     ui.add(
                         egui::Label::new(
                             RichText::new(filetree::relative(parent, root))
-                                .size(11.5)
+                                .size(crate::theme::sm(ui))
                                 .weak(),
                         )
                         .truncate(),
@@ -2782,7 +2840,7 @@ impl EasyEditorApp {
                         (SideTab::Database, "数据库"),
                     ] {
                         if ui
-                            .selectable_label(self.side == tab, RichText::new(label).size(12.5))
+                            .selectable_label(self.side == tab, RichText::new(label).size(crate::theme::md(ui)))
                             .clicked()
                         {
                             self.side = tab;
@@ -2795,7 +2853,7 @@ impl EasyEditorApp {
                                 .and_then(|i| self.tabs.get(i))
                                 .map(|f| journal::scan(&f.text).len())
                                 .unwrap_or(0);
-                            ui.label(RichText::new(format!("{count}")).size(11.0).weak());
+                            ui.label(RichText::new(format!("{count}")).size(crate::theme::sm(ui)).weak());
                         });
                     }
                 });
@@ -2887,13 +2945,13 @@ impl EasyEditorApp {
         }
 
         ui.horizontal(|ui| {
-            if ui.button(RichText::new("搜索").size(12.0)).clicked() {
+            if ui.button(RichText::new("搜索").size(crate::theme::md(ui))).clicked() {
                 self.search_now();
             }
             ui.checkbox(&mut self.search.case_sensitive, "Aa");
             ui.checkbox(&mut self.search.regex, ".*");
             if !self.search.info.is_empty() {
-                ui.label(RichText::new(&self.search.info).size(11.0).weak());
+                ui.label(RichText::new(&self.search.info).size(crate::theme::sm(ui)).weak());
             }
         });
         ui.separator();
@@ -2903,13 +2961,13 @@ impl EasyEditorApp {
             ui.vertical_centered(|ui| {
                 if self.search.busy {
                     ui.spinner();
-                    ui.label(RichText::new("搜索中…").weak().size(12.0));
+                    ui.label(RichText::new("搜索中…").weak().size(crate::theme::md(ui)));
                 } else {
-                    ui.label(RichText::new("输入关键字后回车").weak().size(12.0));
+                    ui.label(RichText::new("输入关键字后回车").weak().size(crate::theme::md(ui)));
                     ui.label(
                         RichText::new(format!("搜索引擎：{}", self.search.engine))
                             .weak()
-                            .size(11.0),
+                            .size(crate::theme::sm(ui)),
                     );
                 }
             });
@@ -2942,14 +3000,14 @@ impl EasyEditorApp {
             .header(18.0, |mut header| {
                 let (_, resp) = header.col(|ui| {
                     let lr = ui.add(
-                        egui::Label::new(RichText::new("位置").size(11.0).strong())
+                        egui::Label::new(RichText::new("位置").size(crate::theme::sm(ui)).strong())
                             .sense(egui::Sense::hover()),
                     );
                     lr.on_hover_text("拖动表头分隔线可以加宽这一列");
                 });
                 resp.on_hover_text("拖动表头分隔线可以加宽这一列");
                 header.col(|ui| {
-                    ui.label(RichText::new("内容").size(11.0).strong());
+                    ui.label(RichText::new("内容").size(crate::theme::sm(ui)).strong());
                 });
             })
             .body(|body| {
@@ -2966,7 +3024,7 @@ impl EasyEditorApp {
                         let lr = ui.add(
                             egui::Label::new(
                                 RichText::new(format!("{}:{}", name, hit.line))
-                                    .size(11.0)
+                                    .size(crate::theme::sm(ui))
                                     .monospace(),
                             )
                             .truncate()
@@ -2990,7 +3048,7 @@ impl EasyEditorApp {
                     let (_, resp) = row.col(|ui| {
                         let lr = ui.add(
                             egui::Label::new(
-                                RichText::new(hit.preview.clone()).size(11.0).monospace(),
+                                RichText::new(hit.preview.clone()).size(crate::theme::sm(ui)).monospace(),
                             )
                             .truncate()
                             .sense(egui::Sense::click()),
@@ -3025,11 +3083,11 @@ impl EasyEditorApp {
         let Some(idx) = self.active else {
             ui.add_space(12.0);
             ui.vertical_centered(|ui| {
-                ui.label(RichText::new("先打开一个文本文件").weak().size(12.0));
+                ui.label(RichText::new("先打开一个文本文件").weak().size(crate::theme::md(ui)));
                 ui.label(
                     RichText::new("日志块是写在文件里的一种格式，\n不是独立数据")
                         .weak()
-                        .size(11.0),
+                        .size(crate::theme::sm(ui)),
                 );
             });
             return None;
@@ -3040,28 +3098,28 @@ impl EasyEditorApp {
 
         ui.horizontal(|ui| {
             if ui
-                .button(RichText::new("插入块").size(11.5))
+                .button(RichText::new("插入块").size(crate::theme::sm(ui)))
                 .on_hover_text("Ctrl+J")
                 .clicked()
             {
                 self.insert_journal_block();
             }
             if ui
-                .button(RichText::new("上一个").size(11.5))
+                .button(RichText::new("上一个").size(crate::theme::sm(ui)))
                 .on_hover_text("Ctrl+Alt+↑")
                 .clicked()
             {
                 self.journal_goto(false);
             }
             if ui
-                .button(RichText::new("下一个").size(11.5))
+                .button(RichText::new("下一个").size(crate::theme::sm(ui)))
                 .on_hover_text("Ctrl+Alt+↓")
                 .clicked()
             {
                 self.journal_goto(true);
             }
             if ui
-                .button(RichText::new("标记完成").size(11.5))
+                .button(RichText::new("标记完成").size(crate::theme::sm(ui)))
                 .on_hover_text("Ctrl+Alt+D")
                 .clicked()
             {
@@ -3071,7 +3129,7 @@ impl EasyEditorApp {
         ui.add_space(2.0);
 
         if blocks.is_empty() {
-            ui.label(RichText::new("这个文件里还没有日志块").weak().size(11.5));
+            ui.label(RichText::new("这个文件里还没有日志块").weak().size(crate::theme::sm(ui)));
             return None;
         }
 
@@ -3089,7 +3147,7 @@ impl EasyEditorApp {
                     };
                     let label = format!("{} {}", mark, block.title);
                     let resp = ui.add(
-                        egui::Label::new(RichText::new(label).size(12.0).color(
+                        egui::Label::new(RichText::new(label).size(crate::theme::md(ui)).color(
                             if block.is_done() {
                                 Color32::from_rgb(120, 150, 120)
                             } else {
@@ -3141,7 +3199,7 @@ impl EasyEditorApp {
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("查找").size(11.5).weak());
+                    ui.label(RichText::new("查找").size(crate::theme::sm(ui)).weak());
 
                     // 关键点：按键必须在 TextEdit 之前摘走。
                     // 单行 TextEdit 收到 Enter 会主动 `surrender_focus`，等 add 返回后再判断
@@ -3189,7 +3247,7 @@ impl EasyEditorApp {
 
                     ui.label(
                         RichText::new(self.find.status_text())
-                            .size(11.5)
+                            .size(crate::theme::sm(ui))
                             .weak()
                             .monospace(),
                     );
@@ -3211,7 +3269,7 @@ impl EasyEditorApp {
                         query_changed = true;
                     }
                     if ui
-                        .selectable_label(self.find.show_replace, RichText::new("替换").size(11.5))
+                        .selectable_label(self.find.show_replace, RichText::new("替换").size(crate::theme::sm(ui)))
                         .on_hover_text("Tab 在查找框和替换框之间切换")
                         .clicked()
                     {
@@ -3224,7 +3282,7 @@ impl EasyEditorApp {
 
                 if self.find.show_replace {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("替换").size(11.5).weak());
+                        ui.label(RichText::new("替换").size(crate::theme::sm(ui)).weak());
 
                         let focused = ui.memory(|m| m.has_focus(replace_id));
                         let mut enter = false;
@@ -3264,14 +3322,14 @@ impl EasyEditorApp {
                         }
 
                         if ui
-                            .button(RichText::new("替换").size(11.5))
+                            .button(RichText::new("替换").size(crate::theme::sm(ui)))
                             .on_hover_text("Enter")
                             .clicked()
                         {
                             do_replace = true;
                         }
                         if ui
-                            .button(RichText::new("全部替换").size(11.5))
+                            .button(RichText::new("全部替换").size(crate::theme::sm(ui)))
                             .on_hover_text("Ctrl+Enter")
                             .clicked()
                         {
@@ -3280,7 +3338,7 @@ impl EasyEditorApp {
                         if self.find.regex {
                             ui.label(
                                 RichText::new("正则模式，替换串支持 $1 $2")
-                                    .size(10.5)
+                                    .size(crate::theme::xs(ui))
                                     .weak(),
                             );
                         }
@@ -3321,7 +3379,7 @@ impl EasyEditorApp {
                         let dirty = if file.dirty { " ●" } else { "" };
                         ui.label(
                             RichText::new(format!("{}{}", file.path.display(), dirty))
-                                .size(11.0)
+                                .size(crate::theme::sm(ui))
                                 .weak(),
                         );
                         ui.separator();
@@ -3332,14 +3390,14 @@ impl EasyEditorApp {
                                     file.line_count(),
                                     editor::human_size(file.bytes_len)
                                 ))
-                                .size(11.0)
+                                .size(crate::theme::sm(ui))
                                 .color(Color32::from_rgb(190, 140, 60)),
                             );
                         } else {
-                            ui.label(RichText::new(editor::cursor_text(file)).size(11.0));
+                            ui.label(RichText::new(editor::cursor_text(file)).size(crate::theme::sm(ui)));
                             ui.separator();
                             let lang = self.hl.language_name(Some(&file.path), &file.text);
-                            ui.label(RichText::new(lang).size(11.0).weak());
+                            ui.label(RichText::new(lang).size(crate::theme::sm(ui)).weak());
                         }
                     }
                     // 光标历史：能后退几步 / 能前进几步
@@ -3351,7 +3409,7 @@ impl EasyEditorApp {
                                 self.nav.back_count(),
                                 self.nav.forward_count()
                             ))
-                            .size(11.0)
+                            .size(crate::theme::sm(ui))
                             .weak(),
                         )
                         .on_hover_text(format!(
@@ -3362,17 +3420,17 @@ impl EasyEditorApp {
                         ));
                     }
                 } else {
-                    ui.label(RichText::new("未打开文件").size(11.0).weak());
+                    ui.label(RichText::new("未打开文件").size(crate::theme::sm(ui)).weak());
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(&self.status).size(11.0).weak());
+                    ui.label(RichText::new(&self.status).size(crate::theme::sm(ui)).weak());
                     if let Some(idx) = self.active {
                         if let Some(file) = self.tabs.get(idx) {
                             let n = journal::scan(&file.text).len();
                             if n > 0 {
                                 ui.separator();
-                                ui.label(RichText::new(format!("{n} 个日志块")).size(11.0).weak());
+                                ui.label(RichText::new(format!("{n} 个日志块")).size(crate::theme::sm(ui)).weak());
                             }
                         }
                     }
@@ -3418,7 +3476,7 @@ impl EasyEditorApp {
         };
         let resp = ui
             .add(
-                egui::Button::new(RichText::new(label).size(11.0).color(accent))
+                egui::Button::new(RichText::new(label).size(crate::theme::sm(ui)).color(accent))
                     .frame(true)
                     .frame_when_inactive(false),
             )
@@ -3564,7 +3622,7 @@ impl EasyEditorApp {
                         };
                         ui.horizontal(|ui| {
                             ui.add(
-                                egui::Label::new(RichText::new(title).size(11.5).weak())
+                                egui::Label::new(RichText::new(title).size(crate::theme::sm(ui)).weak())
                                     .sense(egui::Sense::click()),
                             )
                             .on_hover_text("右键：移动面板")
@@ -3572,7 +3630,7 @@ impl EasyEditorApp {
                             .context_menu(|ui| {
                                 // 终端只能开在下方时用户没法把它挪到右边，
                                 // 这里给每块面板一个「移到边缘」的入口。
-                                ui.label(RichText::new("移动面板").size(11.0).weak());
+                                ui.label(RichText::new("移动面板").size(crate::theme::sm(ui)).weak());
                                 for (label, dir) in [
                                     ("移到最右侧", Dir::Right),
                                     ("移到最左侧", Dir::Left),
@@ -3589,21 +3647,21 @@ impl EasyEditorApp {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     if ui
-                                        .small_button(RichText::new("×").size(11.0))
+                                        .small_button(RichText::new("×").size(crate::theme::sm(ui)))
                                         .on_hover_text(format!("关闭面板 {}", hint("pane_close")))
                                         .clicked()
                                     {
                                         close_id = Some(id);
                                     }
                                     if ui
-                                        .small_button(RichText::new("上下").size(10.5))
+                                        .small_button(RichText::new("上下").size(crate::theme::xs(ui)))
                                         .on_hover_text(format!("向下拆分 {}", hint("split_row")))
                                         .clicked()
                                     {
                                         split_at = Some((id, Axis::Vertical));
                                     }
                                     if ui
-                                        .small_button(RichText::new("左右").size(10.5))
+                                        .small_button(RichText::new("左右").size(crate::theme::xs(ui)))
                                         .on_hover_text(format!("向右拆分 {}", hint("split_col")))
                                         .clicked()
                                     {
@@ -3696,7 +3754,7 @@ impl EasyEditorApp {
 
         egui::ScrollArea::horizontal()
             .id_salt("tab_bar")
-            .max_height(28.0)
+            .max_height(theme::scale(ui.ctx(), 28.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     for (i, tab) in self.tabs.iter().enumerate() {
@@ -3714,7 +3772,7 @@ impl EasyEditorApp {
                         }
 
                         if ui
-                            .selectable_label(Some(i) == shown, RichText::new(title).size(12.5))
+                            .selectable_label(Some(i) == shown, RichText::new(title).size(crate::theme::md(ui)))
                             .on_hover_text(format!(
                                 "{}\n{} 关闭标签 · {} 关闭面板",
                                 tab.path.display(),
@@ -3726,7 +3784,7 @@ impl EasyEditorApp {
                             activate = Some(i);
                         }
                         if ui
-                            .add(egui::Button::new(RichText::new("×").size(11.0)).frame(false))
+                            .add(egui::Button::new(RichText::new("×").size(crate::theme::sm(ui))).frame(false))
                             .on_hover_text("关闭标签")
                             .clicked()
                         {
@@ -3830,7 +3888,7 @@ impl EasyEditorApp {
                             let selected = i == state.sel;
                             let text = format!("{name}    {rel}");
                             if ui
-                                .selectable_label(selected, RichText::new(text).size(12.0))
+                                .selectable_label(selected, RichText::new(text).size(crate::theme::md(ui)))
                                 .clicked()
                             {
                                 choose = Some(path.clone());
@@ -3912,7 +3970,7 @@ impl EasyEditorApp {
                     ui.add_space(4.0);
                     ui.label(
                         RichText::new("在它被改对之前，这次的设置都不会写回这个文件。")
-                            .size(11.5)
+                            .size(crate::theme::sm(ui))
                             .weak(),
                     );
                 }
@@ -3978,261 +4036,467 @@ impl EasyEditorApp {
         }
     }
 
-    /// 「终端设置」：给当前选中的 shell 指定可执行文件路径和启动参数，改动直接进 config.json。
+    /// 打开设置窗口，停在指定分区。已经开着就只换分区。
+    fn open_settings(&mut self, section: SettingsSection) {
+        if !self.show_settings {
+            // 只在重新打开的那一刻要求居中，之后窗口拖到哪算哪
+            self.center_settings = true;
+        }
+        self.settings_section = section;
+        self.show_settings = true;
+    }
+
+    /// 快捷键那种开开合合：同一个动作再按一次就关掉。
+    fn toggle_settings(&mut self, section: SettingsSection) {
+        if self.show_settings && self.settings_section == section {
+            self.recording = None;
+            self.show_settings = false;
+        } else {
+            self.open_settings(section);
+        }
+    }
+
+    /// 设置窗口：左边选分区，右边是当前分区的内容。
     ///
-    /// 装在非标准目录的 Git Bash（`which` 和内置候选都摸不到）靠这个才起得来。
-    fn terminal_settings_window(&mut self, ctx: &egui::Context) {
-        if !self.show_terminal_settings {
+    /// 「快捷键设置」「终端设置」原来各是一个窗口，用户得先记住哪件事藏在哪个窗口里。
+    /// 合成一个窗口后入口只剩这一个，顶栏的 `?` 与 `⚙` 只是各自跳到对应分区。
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.show_settings {
             return;
         }
-        let mut open = true;
-        let mut done = false;
-        let win_id = egui::Id::unique("terminal_settings");
-        let mut window = egui::Window::new("终端设置")
+        // 录制中：把这一帧的按键抓下来当新绑定。抓在窗口壳里而不放在分区里，
+        // 是因为窗口被关掉时同样要把挂着的录制收掉。
+        if self.settings_section == SettingsSection::Keymap {
+            if let Some(action) = self.recording.clone() {
+                if let Some(combo) = keymap::capture(ctx) {
+                    match combo.as_str() {
+                        "Escape" => self.recording = None,
+                        // Backspace / Delete 当作「解绑」
+                        "Backspace" | "Delete" => {
+                            self.keymap.set(&action, "");
+                            self.recording = None;
+                        }
+                        _ => {
+                            self.keymap.set(&action, &combo);
+                            self.recording = None;
+                        }
+                    }
+                } else {
+                    // 等待按键时也要刷新，否则「按下按键…」这个提示不会动
+                    ctx.request_repaint();
+                }
+            }
+        }
+
+        let win_id = egui::Id::unique("ee_settings");
+        let mut open = self.show_settings;
+        let mut window = egui::Window::new("设置")
             .id(win_id)
             .open(&mut open)
             .collapsible(false)
-            // 窗口跟着内容收放：尺寸写死就会在按钮底下空出一大片
-            .auto_sized();
+            .resizable(true)
+            .min_width(theme::scale(ctx, 460.0))
+            .default_size(egui::vec2(
+                theme::scale(ctx, 700.0),
+                theme::scale(ctx, 440.0),
+            ));
         // anchor 每帧都生效，一直挂着就拖不动，所以只在刚打开那几帧居中。
-        // auto_sized 第一帧还在量尺寸（尺寸是无穷大），照那个尺寸算居中会算飞到屏幕外，
+        // 头一帧窗口还在量尺寸（尺寸是无穷大），照那个尺寸算居中会算飞到屏幕外，
         // 因此等 egui 记下真实矩形后再摆正。
-        if self.center_terminal_settings && ctx.memory(|m| m.area_rect(win_id).is_some()) {
+        if self.center_settings && ctx.memory(|m| m.area_rect(win_id).is_some()) {
             window = window.anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO);
-            self.center_terminal_settings = false;
+            self.center_settings = false;
         }
         window.show(ctx, |ui| {
-            // auto_sized 按最宽的子控件撑窗口，路径字符串一塞就撑到屏幕外，所以宽度锁死
-            ui.set_max_width(420.0);
-            ui.set_min_width(420.0);
-
-            let kind = self.terminal.shell;
-            let id = kind.id().to_string();
-            // 先取本地副本：闭包里既要读又要写 self.terminal.settings，直接借会打架
-            let mut program = self
-                .terminal
-                .settings
-                .programs
-                .get(&id)
-                .cloned()
-                .unwrap_or_default();
-            let mut args = self
-                .terminal
-                .settings
-                .args
-                .get(&id)
-                .cloned()
-                .unwrap_or_default();
-
-            ui.label(
-                RichText::new(format!("{}（{}）", kind.label(), kind.id()))
-                    .size(12.5)
-                    .strong(),
-            );
-            ui.separator();
-
-            ui.label(
-                RichText::new("程序路径（留空 = 自动探测）")
-                    .size(11.5)
-                    .weak(),
-            );
-            let p_resp = ui.add(
-                egui::TextEdit::singleline(&mut program)
-                    .hint_text(r"C:\Program Files\Git\bin\bash.exe")
-                    .desired_width(f32::INFINITY),
-            );
-            let found = match kind.detected() {
-                Some(path) => format!("自动探测到：{}", path.display()),
-                None => "本机没探测到，需要手工指定路径".to_string(),
-            };
-            muted_line(ui, found);
-            if !program.trim().is_empty() && !Path::new(program.trim()).is_file() {
-                ui.colored_label(ui.visuals().error_fg_color, "这个路径现在还不存在");
-            }
-
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new("启动参数（留空 = 内置参数）")
-                    .size(11.5)
-                    .weak(),
-            );
-            let a_resp = ui.add(
-                egui::TextEdit::singleline(&mut args)
-                    .hint_text("例如：-NoProfile -NoLogo")
-                    .desired_width(f32::INFINITY),
-            );
-            muted_line(ui, "按空格拆分，带空格的参数用双引号包住。");
-            muted_line(
-                ui,
-                format!("改动即时生效，并写进 {}", config::Config::path().display()),
-            );
-
-            ui.add_space(6.0);
-            let mut cleared = false;
-            ui.horizontal(|ui| {
-                if ui.button("清除覆盖").clicked() {
-                    program.clear();
-                    args.clear();
-                    cleared = true;
-                }
-                // 主操作贴到右缘，别和「清除覆盖」挤在一坨
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("完成").clicked() {
-                        done = true;
+            egui::Panel::left("settings_nav")
+                .resizable(false)
+                .exact_size(theme::scale(ui.ctx(), 112.0))
+                .frame(egui::Frame::side_top_panel(ui.style()))
+                .show(ui, |ui| {
+                    for section in SettingsSection::ALL {
+                        if ui
+                            .selectable_value(&mut self.settings_section, section, section.label())
+                            .on_hover_cursor(theme::HAND)
+                            .clicked()
+                        {
+                            // 录制条只属于快捷键分区，切走就收掉，不然按键会被下一分区吞
+                            self.recording = None;
+                        }
                     }
                 });
-            });
-
-            if p_resp.changed() || a_resp.changed() || cleared {
-                self.terminal
-                    .settings
-                    .programs
-                    .insert(id.clone(), program.trim().to_string());
-                self.terminal
-                    .settings
-                    .args
-                    .insert(id, args.trim().to_string());
-                // 路径可能让某个种类从「没有」变成「可用」，可用列表要跟着重算
-                self.terminal.refresh();
-            }
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::central_panel(ui.style())
+                        .inner_margin(theme::scale(ui.ctx(), 12.0)),
+                )
+                .show(ui, |ui| {
+                    // 先取副本：下面每个分支都要以 &mut self 调进去
+                    let section = self.settings_section;
+                    match section {
+                        SettingsSection::Appearance => self.settings_appearance(ui),
+                        SettingsSection::Keymap => self.settings_keymap(ui),
+                        SettingsSection::Terminal => self.settings_terminal(ui),
+                        SettingsSection::System => self.settings_system(ui),
+                        SettingsSection::Database => self.settings_database(ui),
+                    }
+                });
         });
-        // open 由标题栏的 ✕ 写，done 由「完成」按钮写，两个都得认
-        self.show_terminal_settings = open && !done;
+        // 窗口是被标题栏的 ✕ 关的：录制还挂着的话，下一次按键会改掉最后一个动作
+        if !open {
+            self.recording = None;
+        }
+        self.show_settings = open;
     }
 
-    fn help_window(&mut self, ctx: &egui::Context) {
-        if !self.show_help {
-            return;
+    /// 「外观」分区：界面字号、编辑器字号、主题、自动换行。
+    ///
+    /// 两个字号各管一摊：界面字号管编辑区以外的所有文字（档位怎么由它铺开见 `theme`
+    /// 模块头「字号只有一处来源」），编辑器字号只管编辑器和终端正文。
+    /// 以前只有后面那一个旋钮，所以「字号调了，只有编辑器动，别处纹丝不动」。
+    fn settings_appearance(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        setting_head(ui, "界面字号");
+        muted_line(ui, "顶栏、侧栏、页签、结果区和各个窗口里的字一起跟着这一档走。");
+        ui.horizontal(|ui| {
+            let mut size = self.ui_font;
+            let slider = egui::Slider::new(&mut size, theme::UI_FONT_MIN..=theme::UI_FONT_MAX)
+                .step_by(0.5)
+                .text("点");
+            if ui.add(slider).changed() {
+                self.set_ui_font_size(size, &ctx);
+            }
+            if ui.button("恢复默认").clicked() {
+                self.set_ui_font_size(theme::UI_FONT_DEFAULT, &ctx);
+            }
+        });
+
+        ui.add_space(12.0);
+        setting_head(ui, "编辑器字号");
+        muted_line(ui, "只管编辑器正文和终端正文；Ctrl+= 与 Ctrl+- 调的是这一档。");
+        ui.horizontal(|ui| {
+            let mut size = self.font_size;
+            let slider =
+                egui::Slider::new(&mut size, theme::EDITOR_FONT_MIN..=theme::EDITOR_FONT_MAX)
+                    .step_by(1.0)
+                    .text("点");
+            if ui.add(slider).changed() {
+                self.set_font_size(size, &ctx);
+            }
+            if ui.button("恢复默认").clicked() {
+                self.set_font_size(theme::EDITOR_FONT_DEFAULT, &ctx);
+            }
+        });
+
+        ui.add_space(12.0);
+        setting_head(ui, "主题");
+        ui.horizontal(|ui| {
+            for (dark, label) in [(false, "浅色"), (true, "深色")] {
+                if ui
+                    .selectable_label(self.dark == dark, label)
+                    .on_hover_cursor(theme::HAND)
+                    .clicked()
+                {
+                    self.set_theme(dark, &ctx);
+                }
+            }
+        });
+
+        ui.add_space(12.0);
+        setting_head(ui, "长行");
+        let _ = ui.checkbox(&mut self.word_wrap, "自动换行");
+        muted_line(ui, "开着时长行折进面板，关掉时长行横向滚出去。只改显示，不动文件内容。");
+    }
+
+    /// 「系统」分区：与 Windows 的集成，外加配置文件本身在哪儿。
+    fn settings_system(&mut self, ui: &mut Ui) {
+        setting_head(ui, ".txt 文件关联");
+        let mut on = self.config.data.txt_association;
+        if ui
+            .checkbox(&mut on, "启动时把自己列进 .txt 的「打开方式」")
+            .on_hover_cursor(theme::HAND)
+            .changed()
+        {
+            self.config.data.txt_association = on;
+            self.config.touch();
+            self.status = if on {
+                "下次启动会重新登记进「打开方式」"
+            } else {
+                "下次启动不再登记；已经设好的默认应用不会被改回去"
+            }
+            .to_string();
+        }
+        muted_line(
+            ui,
+            "登记只写当前用户的注册表（HKCU\\Software\\Classes），不动任何文件类型的默认处理器。",
+        );
+        muted_line(
+            ui,
+            "这个开关只管往后还登记不登记；要撤掉已经登记的条目，得跑 assets\\build\\unregister-txt.ps1。",
+        );
+
+        ui.add_space(12.0);
+        setting_head(ui, "配置文件");
+        muted_line(ui, config::Config::path().display().to_string());
+        if ui
+            .button("打开所在文件夹")
+            .on_hover_cursor(theme::HAND)
+            .clicked()
+        {
+            crate::filetree::reveal(&config::Config::path());
+        }
+        muted_line(ui, "界面上的改动即时生效并写回这个文件；手工编辑过的内容要下次启动才读进来。");
+    }
+
+    /// 「数据库」分区：连接管理的入口，外加「哪条语句发到哪条连接」的交代。
+    ///
+    /// 连接本身的新建、编辑、删除还在那个窗口里做——那里的表单比这一栏宽敞。
+    fn settings_database(&mut self, ui: &mut Ui) {
+        setting_head(ui, "连接管理");
+        let n = self.database.connections().len();
+        let active = self
+            .database
+            .active_conn()
+            .unwrap_or("（还没有连接）")
+            .to_string();
+        muted_line(ui, format!("已保存 {n} 条连接，默认走「{active}」。"));
+        if ui
+            .button("打开连接管理")
+            .on_hover_cursor(theme::HAND)
+            .clicked()
+        {
+            self.database.open_manager();
         }
 
-        // 录制中：把这一帧的按键抓下来当新绑定
-        if let Some(action) = self.recording.clone() {
-            if let Some(combo) = keymap::capture(ctx) {
-                match combo.as_str() {
-                    "Escape" => self.recording = None,
-                    // Backspace / Delete 当作「解绑」
-                    "Backspace" | "Delete" => {
-                        self.keymap.set(&action, "");
-                        self.recording = None;
-                    }
-                    _ => {
-                        self.keymap.set(&action, &combo);
-                        self.recording = None;
+        ui.add_space(12.0);
+        setting_head(ui, "查询送到哪条连接");
+        muted_line(ui, "SQL 块头部写 conn=连接名 就送那条连接；没写就走默认连接。");
+        muted_line(ui, "不同连接各跑各的：自动执行闸按连接分开，一条在等回包不挡另一条。");
+    }
+
+    /// 「终端」分区：选 shell、给选中的那种指定程序路径和启动参数，改动直接进 config.json。
+    ///
+    /// 装在非标准目录的 Git Bash（`which` 和内置候选都摸不到）靠这两栏才起得来。
+    fn settings_terminal(&mut self, ui: &mut Ui) {
+        ui.label(
+            RichText::new("新建终端用哪种 shell")
+                .size(crate::theme::sm(ui))
+                .weak(),
+        );
+        // 顶栏那个下拉是同一个值，两处点的都是「下次新建终端用谁」，不会打架
+        egui::ComboBox::from_id_salt("shell_picker_settings")
+            .selected_text(self.terminal.shell.label())
+            .show_ui(ui, |ui| {
+                for kind in self.terminal.available.clone() {
+                    if ui
+                        .selectable_label(self.terminal.shell == kind, kind.label())
+                        .clicked()
+                    {
+                        self.terminal.shell = kind;
                     }
                 }
-            } else {
-                // 等待按键时也要刷新，否则「按下按键…」这个提示不会动
-                ctx.request_repaint();
-            }
+            });
+        ui.separator();
+
+        let kind = self.terminal.shell;
+        let id = kind.id().to_string();
+        // 先取本地副本：闭包里既要读又要写 self.terminal.settings，直接借会打架
+        let mut program = self
+            .terminal
+            .settings
+            .programs
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
+        let mut args = self
+            .terminal
+            .settings
+            .args
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
+
+        ui.label(
+            RichText::new(format!("{}（{}）", kind.label(), kind.id()))
+                .size(crate::theme::md(ui))
+                .strong(),
+        );
+        ui.separator();
+
+        ui.label(
+            RichText::new("程序路径（留空 = 自动探测）")
+                .size(crate::theme::sm(ui))
+                .weak(),
+        );
+        let p_resp = ui.add(
+            egui::TextEdit::singleline(&mut program)
+                .hint_text(r"C:\Program Files\Git\bin\bash.exe")
+                .desired_width(f32::INFINITY),
+        );
+        let found = match kind.detected() {
+            Some(path) => format!("自动探测到：{}", path.display()),
+            None => "本机没探测到，需要手工指定路径".to_string(),
+        };
+        muted_line(ui, found);
+        if !program.trim().is_empty() && !Path::new(program.trim()).is_file() {
+            ui.colored_label(ui.visuals().error_fg_color, "这个路径现在还不存在");
         }
 
-        let mut open = self.show_help;
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("启动参数（留空 = 内置参数）")
+                .size(crate::theme::sm(ui))
+                .weak(),
+        );
+        let a_resp = ui.add(
+            egui::TextEdit::singleline(&mut args)
+                .hint_text("例如：-NoProfile -NoLogo")
+                .desired_width(f32::INFINITY),
+        );
+        muted_line(ui, "按空格拆分，带空格的参数用双引号包住。");
+        muted_line(
+            ui,
+            format!("改动即时生效，并写进 {}", config::Config::path().display()),
+        );
+
+        ui.add_space(6.0);
+        let mut cleared = false;
+        if ui.button("清除覆盖").clicked() {
+            program.clear();
+            args.clear();
+            cleared = true;
+        }
+
+        if p_resp.changed() || a_resp.changed() || cleared {
+            self.terminal
+                .settings
+                .programs
+                .insert(id.clone(), program.trim().to_string());
+            self.terminal
+                .settings
+                .args
+                .insert(id, args.trim().to_string());
+            // 路径可能让某个种类从「没有」变成「可用」，可用列表要跟着重算
+            self.terminal.refresh();
+        }
+    }
+
+    /// 「快捷键」分区：整表都能重录。
+    ///
+    /// 录制中那一帧的按键不在这里抓——关掉窗口时也要把录制收掉，
+    /// 所以抓取放在窗口壳里，这里只画和响应点击。
+    fn settings_keymap(&mut self, ui: &mut Ui) {
         let warn = Color32::from_rgb(200, 62, 62);
-        egui::Window::new("快捷键设置")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(470.0)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button(RichText::new("全部恢复默认").size(12.0)).clicked() {
-                        self.keymap.reset_all();
-                        self.recording = None;
-                    }
-                    ui.label(
-                        RichText::new("点组合键即可重新录制 · Esc 取消 · Backspace 解绑")
-                            .size(10.5)
-                            .weak(),
-                    );
-                });
-                ui.separator();
-
-                egui::ScrollArea::vertical()
-                    .max_height(430.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        let mut group = "";
-                        for def in keymap::ACTIONS {
-                            if def.group != group {
-                                if !group.is_empty() {
-                                    ui.add_space(8.0);
-                                }
-                                ui.label(
-                                    RichText::new(def.group).size(11.0).strong().weak(),
-                                );
-                                group = def.group;
-                            }
-
-                            ui.horizontal(|ui| {
-                                ui.add_sized(
-                                    [132.0, 20.0],
-                                    egui::Label::new(RichText::new(def.label).size(12.0)),
-                                );
-
-                                let recording = self.recording.as_deref() == Some(def.id);
-                                let binding = self.keymap.get(def.id).to_string();
-                                let text = if recording {
-                                    "按下按键…".to_string()
-                                } else if binding.is_empty() {
-                                    "（未绑定）".to_string()
-                                } else {
-                                    binding.clone()
-                                };
-                                let conflict = self.keymap.conflict_of(def.id);
-                                let mut rich = RichText::new(text).size(12.0).monospace();
-                                if conflict.is_some() {
-                                    rich = rich.color(warn);
-                                }
-                                if ui
-                                    .add_sized([148.0, 20.0], egui::Button::new(rich))
-                                    .on_hover_text("点击后按下新的组合键")
-                                    .clicked()
-                                {
-                                    self.recording = if recording {
-                                        None
-                                    } else {
-                                        Some(def.id.to_string())
-                                    };
-                                }
-
-                                if let Some(other) = conflict {
-                                    ui.label(
-                                        RichText::new(format!("与「{other}」冲突"))
-                                            .size(10.5)
-                                            .color(warn),
-                                    );
-                                }
-
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if !self.keymap.is_default(def.id)
-                                            && ui
-                                                .small_button(RichText::new("重置").size(11.0))
-                                                .clicked()
-                                        {
-                                            self.keymap.reset(def.id);
-                                        }
-                                    },
-                                );
-                            });
-                        }
-                    });
-
-                ui.separator();
-                ui.label(
-                    RichText::new(
-                        "查找栏里：Enter 下一个 / Shift+Enter 上一个 / Tab 在查找与替换框间切换 / Esc 关闭。\n\
-                         替换框里：Enter 替换当前 / Ctrl+Enter 全部替换。\n\
-                         鼠标选中一个词，全文相同的词会一并标出（淡蓝底）；双击可直接取整个词。\n\
-                         日志块格式：51 个 = 开头，接标题、日期时间、[状态]，下一行起写正文。",
-                    )
-                    .size(10.5)
+        ui.horizontal(|ui| {
+            if ui.button(RichText::new("全部恢复默认").size(crate::theme::md(ui))).clicked() {
+                self.keymap.reset_all();
+                self.recording = None;
+            }
+            ui.label(
+                RichText::new("点组合键即可重新录制 · Esc 取消 · Backspace 解绑")
+                    .size(crate::theme::xs(ui))
                     .weak(),
-                );
+            );
+        });
+        ui.separator();
+
+        // 列表铺满分区给的高度：分区在窗口正中，窗口能拖大，这里就不该再钉一个 430
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .id_salt("keymap_rows")
+            .show(ui, |ui| {
+                // 两列宽和行高照着字号量。写死 132／148×20 是界面字号 13.5
+                // 那一档量出来的，字号调到 20 就会把长标签和长组合键切掉。
+                let md = crate::theme::md(ui);
+                let name_w = widest_label(
+                    ui,
+                    keymap::ACTIONS.iter().map(|d| d.label),
+                    egui::FontId::proportional(md),
+                ) + 12.0;
+                let key_w = widest_label(
+                    ui,
+                    keymap::ACTIONS.iter().map(|d| d.default),
+                    egui::FontId::monospace(md),
+                ) + 28.0;
+                let row_h = ui.text_style_height(&egui::TextStyle::Body) + 3.0;
+                let mut group = "";
+                for def in keymap::ACTIONS {
+                    if def.group != group {
+                        if !group.is_empty() {
+                            ui.add_space(8.0);
+                        }
+                        ui.label(
+                            RichText::new(def.group).size(crate::theme::sm(ui)).strong().weak(),
+                        );
+                        group = def.group;
+                    }
+
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [name_w, row_h],
+                            egui::Label::new(RichText::new(def.label).size(crate::theme::md(ui))),
+                        );
+
+                        let recording = self.recording.as_deref() == Some(def.id);
+                        let binding = self.keymap.get(def.id).to_string();
+                        let text = if recording {
+                            "按下按键…".to_string()
+                        } else if binding.is_empty() {
+                            "（未绑定）".to_string()
+                        } else {
+                            binding.clone()
+                        };
+                        let conflict = self.keymap.conflict_of(def.id);
+                        let mut rich = RichText::new(text).size(crate::theme::md(ui)).monospace();
+                        if conflict.is_some() {
+                            rich = rich.color(warn);
+                        }
+                        if ui
+                            .add_sized([key_w, row_h], egui::Button::new(rich))
+                            .on_hover_text("点击后按下新的组合键")
+                            .clicked()
+                        {
+                            self.recording = if recording {
+                                None
+                            } else {
+                                Some(def.id.to_string())
+                            };
+                        }
+
+                        if let Some(other) = conflict {
+                            ui.label(
+                                RichText::new(format!("与「{other}」冲突"))
+                                    .size(crate::theme::xs(ui))
+                                    .color(warn),
+                            );
+                        }
+
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if !self.keymap.is_default(def.id)
+                                    && ui
+                                        .small_button(RichText::new("重置").size(crate::theme::sm(ui)))
+                                        .clicked()
+                                {
+                                    self.keymap.reset(def.id);
+                                }
+                            },
+                        );
+                    });
+                }
             });
-        self.show_help = open;
+
+        ui.separator();
+        ui.label(
+            RichText::new(
+                "查找栏里：Enter 下一个 / Shift+Enter 上一个 / Tab 在查找与替换框间切换 / Esc 关闭。\n\
+                 替换框里：Enter 替换当前 / Ctrl+Enter 全部替换。\n\
+                 鼠标选中一个词，全文相同的词会一并标出（淡蓝底）；双击可直接取整个词。\n\
+                 日志块格式：51 个 = 开头，接标题、日期时间、[状态]，下一行起写正文。",
+            )
+            .size(crate::theme::xs(ui))
+            .weak(),
+        );
     }
 }
 
@@ -4323,8 +4587,7 @@ impl EasyEditorApp {
 
         self.quick_open_window(&ctx);
         self.close_confirm(&ctx);
-        self.help_window(&ctx);
-        self.terminal_settings_window(&ctx);
+        self.settings_window(&ctx);
         self.database.manager_window(&ctx);
         self.results.show_popup(&ctx);
         // 排最后：这是开局的告警，盖在其他浮窗上面才不会被当成普通窗口埋掉
@@ -4368,10 +4631,16 @@ impl eframe::App for EasyEditorApp {
 ///
 /// 浮窗宽度是固定的，而 `C:\Users\<很长>\AppData\Roaming\...` 这种串没有可折行的空格，
 /// 直接 label 会横着捅穿窗口边框，盖住底下的内容。
+/// 设置页每条的小标题。
+fn setting_head(ui: &mut Ui, text: &str) {
+    ui.label(RichText::new(text).size(crate::theme::md(ui)).strong());
+}
+
+/// 一行次要说明：字号走小字档，太长就截断，完整内容挂悬浮。
 fn muted_line(ui: &mut Ui, text: impl Into<String>) {
     let text = text.into();
     let resp = ui.add(
-        egui::Label::new(RichText::new(&text).size(11.0).weak())
+        egui::Label::new(RichText::new(&text).size(crate::theme::sm(ui)).weak())
             .truncate()
             .sense(egui::Sense::hover()),
     );
@@ -4458,7 +4727,7 @@ fn pane_welcome(ui: &mut Ui, full: bool, hints: &str, hint: &dyn Fn(&str) -> Str
                     "这块面板还没有文件 · {} 打开，点标签也会送到这里",
                     hint("quick_open")
                 ))
-                .size(12.0)
+                .size(crate::theme::md(ui))
                 .weak(),
             );
         });
@@ -4467,10 +4736,10 @@ fn pane_welcome(ui: &mut Ui, full: bool, hints: &str, hint: &dyn Fn(&str) -> Str
     let mut want_open = false;
     ui.vertical_centered(|ui| {
         ui.add_space(ui.available_height() * 0.22);
-        ui.label(RichText::new("EasyEditor").size(30.0).strong());
+        ui.label(RichText::new("EasyEditor").size(crate::theme::display(ui)).strong());
         ui.label(
             RichText::new("小而好用的编辑器 · Rust + egui")
-                .size(13.0)
+                .size(crate::theme::md(ui))
                 .weak(),
         );
         ui.add_space(14.0);
@@ -4478,9 +4747,29 @@ fn pane_welcome(ui: &mut Ui, full: bool, hints: &str, hint: &dyn Fn(&str) -> Str
             want_open = true;
         }
         ui.add_space(18.0);
-        ui.label(RichText::new(hints).size(11.5).weak());
+        ui.label(RichText::new(hints).size(crate::theme::sm(ui)).weak());
     });
     want_open
+}
+
+/// 一批文案里最宽的那条有多长，照给定字号实量。
+///
+/// 快捷键表的两列用它定宽，列宽才是跟着界面字号长的；写死数字的话，
+/// 字号一调大，长标签和长组合键就会被切掉。
+fn widest_label(
+    ui: &egui::Ui,
+    texts: impl Iterator<Item = &'static str>,
+    font: egui::FontId,
+) -> f32 {
+    let painter = ui.painter();
+    texts
+        .map(|t| {
+            painter
+                .layout_no_wrap(t.to_owned(), font.clone(), egui::Color32::PLACEHOLDER)
+                .size()
+                .x
+        })
+        .fold(0.0f32, f32::max)
 }
 
 /// 把 egui 的截图写成 24 位 BMP（避免引入图片编码依赖）
@@ -5057,6 +5346,64 @@ mod tests {
         out.shapes.iter().find_map(|c| walk(&c.shape, &pred))
     }
 
+    /// 落在 `area` 里的、文字正好等于 `needle` 的那些矩形。
+    ///
+    /// 「终端」「数据库」这类导航项的名字在顶栏和侧栏也各有一份，光按文字找会先捡到
+    /// 界面顶上那一处，所以按矩形框筛。
+    fn text_rects_in(out: &egui::FullOutput, area: Rect, needle: &str) -> Vec<Rect> {
+        fn walk(shape: &egui::Shape, needle: &str, area: Rect, hits: &mut Vec<Rect>) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    if t.galley.job.text == needle {
+                        let r = t.galley.rect.translate(t.pos.to_vec2());
+                        if area.contains(r.min) && area.contains(r.max) {
+                            hits.push(r);
+                        }
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for s in shapes {
+                        walk(s, needle, area, hits);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut hits = Vec::new();
+        for c in &out.shapes {
+            walk(&c.shape, needle, area, &mut hits);
+        }
+        hits
+    }
+
+    /// 落在 `area` 里的所有文字，连它们各自的矩形。
+    fn painted_texts(out: &egui::FullOutput, area: Rect) -> Vec<(String, Rect)> {
+        fn walk(shape: &egui::Shape, area: Rect, hits: &mut Vec<(String, Rect)>) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    let text = t.galley.job.text.as_str();
+                    if !text.trim().is_empty() {
+                        let r = t.galley.rect.translate(t.pos.to_vec2());
+                        if area.contains(r.min) && area.contains(r.max) {
+                            hits.push((text.to_owned(), r));
+                        }
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for s in shapes {
+                        walk(s, area, hits);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut hits = Vec::new();
+        for c in &out.shapes {
+            walk(&c.shape, area, &mut hits);
+        }
+        hits
+    }
+
     /// 结果行里那条路径的矩形。用 starts_with 排除浮窗：浮窗显示的是绝对路径。
     fn hit_row(out: &egui::FullOutput) -> Rect {
         text_rect_where(out, |t| t.starts_with("a_very_long")).expect("搜索结果行没画出来")
@@ -5385,25 +5732,24 @@ mod tests {
         assert_eq!(app.status, "已移动面板");
     }
 
-    /// 「终端设置」浮窗：内容都装得下窗口，而且标题条拖着能动。
+    /// 设置窗口：导航和内容各占一栏、内容装得下窗口，而且标题条拖着能动。
     ///
-    /// 原来窗口尺寸写死 340×420：条目一多就从下边缘捅出去，按钮画到窗口外面的面板上；
-    /// 再加上 anchor 每帧生效，拖到哪都会被弹回屏幕正中。
+    /// 「终端设置」原来尺寸写死 340×420：条目一多就从下边缘捅出去，按钮画到窗口外面；
+    /// 再加上 anchor 每帧生效，拖到哪都会被弹回屏幕正中。合成设置窗口后这两条都要照验。
     #[test]
-    fn terminal_settings_window_fits_content_and_moves() {
+    fn settings_window_fits_content_and_moves() {
         let (ctx, mut app, _dir) = app_in_folder("easy-editor-app-settings-window", "a\n");
-        app.show_terminal_settings = true;
-        app.center_terminal_settings = true;
+        app.open_settings(SettingsSection::Terminal);
         // 头几帧只在量尺寸、摆位置，尺寸落定后 egui 才让窗口参与交互
         for _ in 0..5 {
             frame(&mut app, &ctx, vec![]);
         }
         let out = frame(&mut app, &ctx, vec![]);
 
-        let win = egui::Id::unique("terminal_settings");
+        let win = egui::Id::unique("ee_settings");
         let window = ctx
             .memory(|m| m.area_rect(win))
-            .expect("没有记下「终端设置」窗口的矩形");
+            .expect("没有记下「设置」窗口的矩形");
         assert!(
             (window.center() - Pos2::new(SCREEN.x / 2.0, SCREEN.y / 2.0)).length() < 8.0,
             "打开时没摆到屏幕正中：{window:?}"
@@ -5419,6 +5765,7 @@ mod tests {
             );
         };
         for line in [
+            "新建终端用哪种 shell",
             "程序路径",
             "自动探测到",
             "启动参数",
@@ -5428,30 +5775,53 @@ mod tests {
             check(line);
         }
 
-        // 按钮那一行：两个按钮各占一块，谁也不许压在别的文字上
+        // 左侧导航五项齐全，内容画在导航右边——分区是左右两栏，不是上下堆
+        let content = find_text(&out, "新建终端用哪种 shell").expect("终端分区没画出 shell 选择");
+        // 同一个词在顶栏、侧栏也有一份，只认窗口里最靠左的那一处：导航就是那一栏
+        let nav = |name: &'static str| {
+            text_rects_in(&out, window, name)
+                .into_iter()
+                .min_by(|a, b| a.min.x.partial_cmp(&b.min.x).unwrap())
+                .unwrap_or_else(|| panic!("导航里没有「{name}」"))
+        };
+        let nav_first = nav("外观");
+        for name in ["快捷键", "终端", "系统", "数据库"] {
+            let r = nav(name);
+            assert!(
+                (r.min.x - nav_first.min.x).abs() < 2.0,
+                "导航项「{name}」没和「外观」对齐成一栏：{r:?} {nav_first:?}"
+            );
+            assert!(
+                r.min.y > nav_first.max.y,
+                "导航项「{name}」没排在「外观」下面：{r:?} {nav_first:?}"
+            );
+            assert!(
+                r.max.x < content.min.x,
+                "导航项「{name}」压到了内容那一栏：{r:?}，内容 {content:?}"
+            );
+        }
+        assert!(
+            content.min.x > nav_first.max.x,
+            "内容压到了导航那一栏：内容 {content:?}，导航 {nav_first:?}"
+        );
         let clear = find_text(&out, "清除覆盖").expect("没画出「清除覆盖」");
-        let done = find_text(&out, "完成").expect("没画出「完成」");
         assert!(
-            clear.max.x < done.min.x,
-            "两个按钮叠在一起：{clear:?} {done:?}"
+            window.expand2(Vec2::splat(1.0)).contains(clear.min)
+                && window.expand2(Vec2::splat(1.0)).contains(clear.max),
+            "「清除覆盖」跑到窗口外了：{clear:?}，窗口 {window:?}"
         );
-        assert!(
-            window.expand2(Vec2::splat(1.0)).contains(done.max),
-            "「完成」按钮跑到窗口外了：{done:?}，窗口 {window:?}"
-        );
-        // 按钮是最后一行，底下不许再留一大片空白（用户看到的「按钮压在内容上面」就是顺序 + 空场）
+        // 说明文字在按钮上面：终端分区改完即时生效，不再摆一个「完成」
         let footer = text_rect_where(&out, |t| t.starts_with("改动即时生效"))
             .expect("没画出「改动即时生效…」这行");
         assert!(
             footer.max.y <= clear.min.y + 1.0,
             "按钮排到了说明文字上面：按钮 {clear:?}，说明 {footer:?}"
         );
-        assert!(
-            window.max.y - done.max.y < 24.0,
-            "窗口底下空了一大截：按钮行 {done:?}，窗口 {window:?}"
-        );
 
-        let title = find_text(&out, "终端设置").expect("窗口标题没画出来");
+        let title = text_rects_in(&out, window, "设置")
+            .into_iter()
+            .min_by(|a, b| a.min.y.partial_cmp(&b.min.y).unwrap())
+            .expect("窗口标题没画出来");
         let grab = title.center();
         let before = window.min;
         let drag = Vec2::new(120.0, 60.0);
@@ -5480,6 +5850,103 @@ mod tests {
             (after - before - drag).length() < 2.0,
             "拖标题条没能挪动窗口：从 {before:?} 拖 {drag:?}，结果在 {after:?}"
         );
+    }
+
+    /// 连接管理窗口：列表和表单各成一档，标签压在输入框上面。
+    ///
+    /// 用户说这两块「看着很难区分」：以前一个窗口里摊着同色的两堆控件，中间只有一条
+    /// 分隔线，标签还和输入框横着排——一整片一样轻的灰字，分不清哪里能填。现在列表在
+    /// 上、表单在下，字段一栏一个标签，成对的字段左右各占一栏。
+    #[test]
+    fn manager_window_separates_list_from_form() {
+        let (ctx, mut app, _dir) = app_in_folder("easy-editor-app-db-manager", "a\n");
+        app.database = mock_database();
+        app.database.open_manager();
+        // 头几帧只在量尺寸，尺寸落定后窗口才参与交互
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let win = egui::Id::unique("db_manager");
+        let early = ctx
+            .memory(|m| m.area_rect(win))
+            .expect("没有记下「数据库连接」窗口的矩形");
+
+        // 点列表里那条连接，表单这才有东西可填
+        let out = frame(&mut app, &ctx, vec![]);
+        let row = text_rects_in(&out, early, "本机")
+            .into_iter()
+            .next()
+            .expect("列表里没画出连接名「本机」");
+        frame(
+            &mut app,
+            &ctx,
+            pointer(row.center(), egui::PointerButton::Primary, true),
+        );
+        frame(
+            &mut app,
+            &ctx,
+            pointer(row.center(), egui::PointerButton::Primary, false),
+        );
+        let out = frame(&mut app, &ctx, vec![]);
+        // 窗口是 auto_sized 的，表单展开后长高了一截——矩形要按点完之后的那一帧量
+        let window = ctx.memory(|m| m.area_rect(win)).expect("点完没了窗口矩形");
+
+        // 「本机」在两处都有：列表那一行和表单的名称框。取靠上的那个才是列表
+        let label = |name: &str| {
+            text_rects_in(&out, window, name)
+                .into_iter()
+                .min_by(|a, b| a.min.y.partial_cmp(&b.min.y).unwrap())
+                .unwrap_or_else(|| panic!("连接管理窗口里没画出「{name}」"))
+        };
+
+        let head = label("已保存的连接（1）");
+        let name = label("名称（SQL 块里 conn= 用的就是这个名字）");
+        assert!(
+            name.min.y > head.max.y,
+            "表单排到了列表上面：列表标题 {head:?}，名称标签 {name:?}"
+        );
+
+        // 成对的字段左右各一栏，同一行；标签在这一栏的上面
+        for (left, right) in [("引擎", "端口"), ("主机", "默认库"), ("用户", "密码")] {
+            let a = label(left);
+            let b = label(right);
+            assert!(
+                a.min.y < b.max.y && b.min.y < a.max.y,
+                "「{left}」「{right}」没排在同一行：{a:?} {b:?}"
+            );
+            assert!(
+                a.max.x < b.min.x,
+                "「{left}」压到了「{right}」那一栏：{a:?} {b:?}"
+            );
+        }
+        // 从上往下：引擎/端口 → 主机/默认库 → 用户/密码 → 环境变量勾选
+        let lefts = [label("引擎"), label("主机"), label("用户")];
+        let env = label("密码从环境变量读");
+        for pair in lefts.windows(2) {
+            assert!(
+                pair[0].max.y <= pair[1].min.y + 1.0,
+                "字段行叠在一起了：{:?} 画在 {:?} 上面还不让位",
+                pair[0],
+                pair[1]
+            );
+            assert!(
+                (pair[0].min.x - pair[1].min.x).abs() < 1.0,
+                "每一行的左栏没对齐成一列：{:?} {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert!(
+            lefts[2].max.y <= env.min.y + 1.0,
+            "「密码从环境变量读」和上面的字段挤在一起：{:?} {:?}",
+            lefts[2],
+            env
+        );
+
+
+        // 满窗口不许有两块文字互相压着——卡片、标签、输入框都算在内
+        let bad = overlaps(&painted_texts(&out, window));
+        assert!(bad.is_empty(), "连接管理窗口里有文字叠在一起：{bad:?}");
     }
 
     /// 左右两块面板并排时，各自的内容不许画到隔壁那一格去。
@@ -6089,6 +6556,45 @@ mod tests {
         // egui 的缩放复位键（本应用没绑定）也该被关掉，别留下半放大的界面
         press_key(&mut app, &ctx, Key::Num0, ctrl);
         assert_eq!(ctx.zoom_factor(), 1.0, "Ctrl+0 动了整窗缩放");
+    }
+
+    /// 「界面字号」这一档真的推着界面走：顶栏的字跟着变大，行高也跟着长，不压字。
+    ///
+    /// 从前只有编辑器字号能调，界面其余各处全写死在代码里——字号调大，顶栏、侧栏、结果区
+    /// 一动不动。这里量的是顶栏「保存」那颗按钮：它的高度是照字号量的，字号动了它必须动。
+    /// 只放大字号而不跟着放高，字就会叠在相邻的字上，所以顺手查一遍有没有重叠。
+    #[test]
+    fn ui_font_size_scales_the_chrome() {
+        let (ctx, mut app, _dir) = app_in_folder("easy-editor-app-ui-font-scale", "a\n");
+        let label = |v: &[(String, Rect)], name: &str| -> Rect {
+            v.iter()
+                .find(|(s, _)| s == name)
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| panic!("顶栏里没画出「{name}」"))
+        };
+        let before = settled_toolbar(&mut app, &ctx, SCREEN);
+        let small = label(&before, "保存");
+        let editor_before = app.font_size;
+
+        app.set_ui_font_size(theme::UI_FONT_MAX, &ctx);
+        let after = settled_toolbar(&mut app, &ctx, SCREEN);
+        let large = label(&after, "保存");
+        assert!(
+            large.height() > small.height() * 1.15 && large.width() > small.width() * 1.15,
+            "界面字号拉到顶（{}）后顶栏「保存」没跟着变大：{small:?} → {large:?}",
+            theme::UI_FONT_MAX
+        );
+        assert!(
+            large.bottom() <= SCREEN.y,
+            "字号调大后顶栏「保存」被挤出屏幕：{large:?}"
+        );
+        let bad = overlaps(&after);
+        assert!(bad.is_empty(), "字号调大后顶栏的字叠在一起：{bad:?}");
+        // 两档字号各管各的：调界面不该顺手改掉编辑器的
+        assert_eq!(
+            app.font_size, editor_before,
+            "界面字号这一档改掉了编辑器字号"
+        );
     }
 
     /// 输入法组字能不能活过对话框刷新的每一帧。

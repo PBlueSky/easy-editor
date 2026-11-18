@@ -39,6 +39,16 @@ pub struct Entry {
 }
 
 /// 类似 shell 里 `ls --color` 的配色：目录蓝、可执行绿、普通文件用正文色。
+/// 树里一行的字号和行高。
+///
+/// 行高由字号量出来，不是写死的 20：界面字号调到 16 时，20 那一格会把字挤成半高。
+/// 多给的 5 点是行内上下留白，让选中底色比字稍高一点。
+fn row_metrics(ui: &mut Ui) -> (FontId, f32) {
+    let font = FontId::proportional(crate::theme::md(ui));
+    let row_h = ui.fonts_mut(|f| f.row_height(&font)) + 5.0;
+    (font, row_h)
+}
+
 fn kind_color(kind: EntryKind, dark: bool) -> Color32 {
     match (kind, dark) {
         (EntryKind::Dir, false) => Color32::from_rgb(11, 98, 196),
@@ -280,21 +290,21 @@ impl FileTree {
                 |ui| {
                     ui.add_space(4.0);
                     if ui
-                        .add(egui::Button::new(RichText::new("刷新").size(11.5)).frame(false))
+                        .add(egui::Button::new(RichText::new("刷新").small()).frame(false))
                         .on_hover_text("刷新目录")
                         .clicked()
                     {
                         self.refresh();
                     }
                     if ui
-                        .add(egui::Button::new(RichText::new("新文件夹").size(11.5)).frame(false))
+                        .add(egui::Button::new(RichText::new("新文件夹").small()).frame(false))
                         .on_hover_text("新建文件夹 Ctrl+Shift+N")
                         .clicked()
                     {
                         self.request_new(true);
                     }
                     if ui
-                        .add(egui::Button::new(RichText::new("新文件").size(11.5)).frame(false))
+                        .add(egui::Button::new(RichText::new("新文件").small()).frame(false))
                         .on_hover_text("新建文件 Ctrl+N")
                         .clicked()
                     {
@@ -326,7 +336,9 @@ impl FileTree {
                             .unwrap_or_else(|| "工作区".into());
                         let full = self.root.display().to_string();
                         ui.add(
-                            egui::Label::new(RichText::new(name).strong().size(12.0))
+                            egui::Label::new(
+                                RichText::new(name).strong().size(crate::theme::md(ui)),
+                            )
                                 .truncate()
                                 .selectable(false),
                         )
@@ -462,13 +474,12 @@ impl FileTree {
         let hits = self.matching_entries();
         if hits.is_empty() {
             ui.add_space(8.0);
-            ui.label(RichText::new("没有匹配的文件").weak().size(12.0));
+            ui.label(RichText::new("没有匹配的文件").weak().size(crate::theme::md(ui)));
             return;
         }
-        let font = FontId::proportional(12.5);
-        let sub_font = FontId::proportional(11.0);
+        let (font, row_h) = row_metrics(ui);
+        let sub_font = FontId::proportional(crate::theme::sm(ui));
         for entry in hits {
-            let row_h = 20.0;
             let width = ui.available_width().max(120.0);
             let (rect, response) = ui.allocate_exact_size(Vec2::new(width, row_h), Sense::click());
             let response = response.on_hover_cursor(crate::theme::HAND);
@@ -547,7 +558,7 @@ impl FileTree {
         let items = self.children_of(dir);
         for entry in items {
             let indent = 6.0 + depth as f32 * 13.0;
-            let row_h = 20.0;
+            let (name_font, row_h) = row_metrics(ui);
             let width = ui.available_width().max(120.0);
             let (rect, response) = ui.allocate_exact_size(Vec2::new(width, row_h), Sense::click());
             let response = response.on_hover_cursor(crate::theme::HAND);
@@ -585,7 +596,7 @@ impl FileTree {
                 egui::pos2(rect.left() + indent, rect.center().y),
                 Align2::LEFT_CENTER,
                 arrow,
-                FontId::proportional(10.0),
+                FontId::proportional(crate::theme::xs(ui)),
                 text_color.gamma_multiply(0.8),
             );
 
@@ -597,7 +608,7 @@ impl FileTree {
                     rect.max - Vec2::new(2.0, 0.0),
                 );
                 let edit = egui::TextEdit::singleline(&mut self.rename_buf)
-                    .font(FontId::proportional(12.5))
+                    .font(name_font.clone())
                     .desired_width(edit_rect.width());
                 let resp = ui.put(edit_rect, edit);
                 // 每帧无条件 request_focus 会把输入法组字打断（见 src/ime.rs）
@@ -617,7 +628,7 @@ impl FileTree {
                     egui::pos2(rect.left() + indent + 13.0, rect.center().y),
                     Align2::LEFT_CENTER,
                     &entry.name,
-                    FontId::proportional(12.5),
+                    name_font.clone(),
                     text_color,
                 );
             }
@@ -777,7 +788,7 @@ impl FileTree {
     }
 }
 
-fn reveal(path: &Path) {
+pub(crate) fn reveal(path: &Path) {
     #[cfg(target_os = "windows")]
     {
         let arg = if path.is_dir() {

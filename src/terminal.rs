@@ -996,7 +996,7 @@ impl Terminal {
                 rect.center_bottom() - Vec2::new(0.0, 18.0),
                 egui::Align2::CENTER_BOTTOM,
                 "进程已退出",
-                FontId::proportional(12.0),
+                FontId::proportional(crate::theme::sm(ui)),
                 Color32::from_rgb(200, 120, 120),
             );
         }

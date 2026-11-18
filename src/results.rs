@@ -2448,7 +2448,7 @@ mod tests {
 
         let ctx = egui::Context::default();
         ctx.set_pixels_per_point(1.0);
-        crate::theme::apply_style(&ctx, true);
+        crate::theme::apply_style(&ctx, true, crate::theme::UI_FONT_DEFAULT);
         let out = show_pass(&mut dock, &ctx, vec![], 1.0);
         // 字体的量法得等第一帧跑完才拿得到，样式表里那两档就是这一帧用的
         let style = ctx.global_style();

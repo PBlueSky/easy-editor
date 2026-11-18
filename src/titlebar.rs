@@ -91,9 +91,9 @@ mod tests {
     #[test]
     fn caption_matches_the_panel_fill() {
         let ctx = egui::Context::default();
-        crate::theme::apply_style(&ctx, true);
+        crate::theme::apply_style(&ctx, true, crate::theme::UI_FONT_DEFAULT);
         assert_eq!(palette(true).0, ctx.global_style().visuals.panel_fill);
-        crate::theme::apply_style(&ctx, false);
+        crate::theme::apply_style(&ctx, false, crate::theme::UI_FONT_DEFAULT);
         assert_eq!(palette(false).0, ctx.global_style().visuals.panel_fill);
     }
 }

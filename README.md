@@ -43,8 +43,10 @@ The release package is a **single exe** (about 12 MB, 5.2 MB zipped). No .NET, n
 | East Asian input methods | Pinyin and Japanese work in the new-file dialog, the rename box, the editor body and the terminal | [Input methods](#input-methods) |
 | CJK / Latin alignment | Baselines are corrected, so Chinese glyphs do not sink to the bottom of the line | [CJK baseline](#cjk-baseline) |
 | Light and dark themes | Repaints the Windows system title bar colour and button glyphs along with them | [System title bar](#the-system-title-bar-has-to-be-repainted-by-hand) |
-| Custom keybindings | `F1` opens the settings panel: click, press the new chord, done. Conflicts are flagged in red | [Customizing keybindings](#customizing-keybindings) |
-| Persistent settings | Font size, theme, terminal preferences and your key changes all live in `%APPDATA%\easy-editor\config.json` | [Configuration](#configuration) |
+| Two font-size knobs | *UI font size* moves every piece of text outside the editor — top bar, sidebar, tabs, results dock, every pop-up window; *editor font size* covers only the editor and terminal body, and is what `Ctrl+=` changes. Row heights, column widths and button sizes are measured from the font rather than written down | [Settings window](#settings-window) |
+| One settings window | Left-hand sections: Appearance / Keybindings / Terminal / System / Database. The old keybinding panel, terminal-settings window and the `.txt` switch all moved inside; the top bar's `?` and `⚙` are just shortcuts to a section | [Settings window](#settings-window) |
+| Custom keybindings | `F1` opens the settings window on the Keybindings section: click, press the new chord, done. Conflicts are flagged in red | [Customizing keybindings](#customizing-keybindings) |
+| Persistent settings | Both font sizes, theme, terminal preferences and your key changes all live in `%APPDATA%\easy-editor\config.json` | [Configuration](#configuration) |
 
 ## Quick start
 
@@ -99,7 +101,7 @@ With no arguments, the startup folder is chosen by: **command-line argument > cu
 └──────────┴───────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Top toolbar**, left to right: `Open folder` `Save` `←` `→` (cursor history back / forward) `New file` `New folder` `Sidebar` `Wrap` `Terminal` `+Terminal` `‖ Split` `═ Split` `Quick open` `Project search` `Find` `Journal block` `Database`. The `Database` entry is a dropdown (default connection line / `new query` / `insert SQL block` / `run SQL` / `results dock` / `connection manager…` / `sidebar database tree` / `this file is SQL`) — that is the only new button the whole database feature costs. The right-hand group is `Dark` / `Light` (theme), `?` (keybinding settings), the `shell:` dropdown, `⚙` (terminal settings), font size `- 14 +`, and the workspace name.
+- **Top toolbar**, left to right: `Open folder` `Save` `←` `→` (cursor history back / forward) `New file` `New folder` `Sidebar` `Wrap` `Terminal` `+Terminal` `‖ Split` `═ Split` `Quick open` `Project search` `Find` `Journal block` `Database`. The `Database` entry is a dropdown (default connection line / `new query` / `insert SQL block` / `run SQL` / `results dock` / `connection manager…` / `sidebar database tree` / `this file is SQL`) — that is the only new button the whole database feature costs. The right-hand group, right to left, is `?` (jumps to the Keybindings section), `Dark` / `Light` (theme), the `shell:` dropdown, `⚙` (the settings window), the editor font size `- 14 +`, and the workspace name.
 - **Sidebar** has four tabs: `Files` (the tree), `Search` (project-wide results), `Journal` (blocks in the current file), `Database` (connections → databases → tables → columns). `Ctrl+B` shows or hides it.
 - Narrow the window until one row no longer fits and the remaining buttons wrap onto a second row — they never squash together and text is never overdrawn. The right-hand group still anchors right-to-left after wrapping. The file-tree header does the same trick in one row that cannot wrap: `刷新` / `新文件夹` / `新文件` are laid right-to-left first, then the workspace name is placed in the rectangle that is left over and truncated there — a long folder name used to draw straight through `新文件`. Too little room and the name is dropped rather than overlapped; hover it for the full path.
 
@@ -243,7 +245,7 @@ Writes still need a human `Ctrl+Enter`.
 
 Everything database-related hangs off the single `Database` dropdown in the toolbar — inserting and running blocks, the results dock, the connection manager and the sidebar tree.
 
-**`Database ▸ Connection manager…`** (window title 数据库连接) lists every saved connection: `新建` to add, click a row to edit it, `删除` to drop it, and `测试连接` in the form to really open the server and read back its version. Renaming clears the cached tree and the worker thread of both the old and the new name and keeps the default marker on the renamed connection — but a block still written `conn=旧名` does **not** follow, so edit the header too. A connection is `name` / `kind` / `host` / `port` / `user` / `password` / `database`, and it is stored verbatim in `config.json`:
+**`Database ▸ Connection manager…`** (window title 数据库连接; the settings window's Database section has a button for it too) lists every saved connection in the upper half: `新建` to add, click a row to edit it, `删除` to drop it, and `测试连接` in the form to really open the server and read back its version. Renaming clears the cached tree and the worker thread of both the old and the new name and keeps the default marker on the renamed connection — but a block still written `conn=旧名` does **not** follow, so edit the header too. A connection is `name` / `kind` / `host` / `port` / `user` / `password` / `database`, and it is stored verbatim in `config.json`:
 
 ```json
 {
@@ -262,6 +264,8 @@ Everything database-related hangs off the single `Database` dropdown in the tool
 ```
 
 `password` accepts `env:VAR`, resolved from `VAR` and then from `EASY_EDITOR_VAR` when the connection is actually opened, so the config file does not have to hold the secret. A literal password works too — remember that `config.json` is readable by your Windows account.
+
+**You used to be unable to tell what was clickable in that window.** The list and the form sat on the same background, and the field outline was the widget stroke the style sheet reserves for pale grey button borders — laid on a white window it is invisible, so a text field read as a line of bare text, while the labels carried the same weight as the fields they belonged to. The window is now two bordered cards: the saved-connections list on the faint background, the form on the window's own fill, so at a glance there are two things rather than one wall of text. Inside the form each label sits **above** its field in the small, weak rung, and the fields are laid out in two columns — kind / port, host / database, user / password — whose widths and row heights are computed from the window's locked body width and the current font size. Within that card the field and combo outlines are deliberately darkened one step and turn accent-coloured on hover; on focus egui already draws its ring with `selection.stroke`, so no second focus ring was invented. That darkening is scoped to the card's own `Ui` (`Ui::visuals_mut` goes through `Arc::make_mut`), so nothing outside the card changes and buttons elsewhere keep their original frame.
 
 **Whether a session is up is said out loud.** This used to be "a small grey line next to `测试连接`", which on a screen this busy meant "did nothing". The mark now says what the *session* is doing, not what some test found earlier, and it shows everywhere the connection appears:
 
@@ -324,7 +328,7 @@ Selections are recorded in absolute row coordinates, so they still point at the 
 
 Scrollback: the mouse wheel moves **3 rows per notch** (raw wheel events; trackpads are converted at 14 px per row). Whenever there is scrolled-back output, a floating scrollbar appears on the right edge of the pane — drag the thumb, click the track, or use the wheel. It is painted over the text and takes no layout width. Once you scroll up into history the screen stays pinned to the old content (alacritty's behaviour); pressing any key — even a pasted character — snaps the view back to the newest line.
 
-Auto-detection does not always find things (Git Bash missing from PATH, for example). `⚙` in the toolbar opens Terminal Settings, where you can give each shell its own **program path** and **startup arguments**; leave them empty to go back to auto-detection / built-in args. Changes are written straight into `config.json`:
+Auto-detection does not always find things (Git Bash missing from PATH, for example). The settings window's Terminal section gives each shell its own **program path** and **startup arguments**; leave them empty to go back to auto-detection / built-in args. Changes are written straight into `config.json`:
 
 ```json
 {
@@ -374,6 +378,22 @@ Not every arrow press is recorded — the cursor has to **sit still for 350 ms**
 
 Pinyin and Japanese input work in the **new-file dialog**, the **rename box in the file tree**, the **editor body** and the **terminal**. The dialogs and Quick open request focus only when the input box genuinely does not have it (requesting focus interrupts an in-progress composition). While composing, `Enter` / `Esc` belong to the IME (commit candidate / cancel composition) and are not mistaken for "create the file"; the arrow keys in Quick open likewise yield to candidate paging. The terminal has to publish its cursor cell as the IME anchor and then write the whole committed string into the PTY — without the anchor, the system never associates the IME with this window at all.
 
+### Settings window
+
+Opened by the top bar's `⚙`, by `?`, or by `F1` — a section list on the left, that section's contents on the right:
+
+| Section | What is in it |
+|---|---|
+| Appearance | **UI font size** (10–20, in 0.5 steps), **editor font size** (10–28), light / dark, long-line word wrap |
+| Keybindings | The whole action table: click a row, then type the new chord. Conflicts turn red; each row has `reset`, and there is `restore all defaults` |
+| Terminal | Which shell a new terminal uses, plus that shell's program path and startup arguments |
+| System | The `.txt` association switch, the config file path and a "reveal in folder" button |
+| Database | The button that opens the connection manager, plus "N saved connections, the default is X" and what `conn=` does |
+
+**The two font sizes each own their half.** There used to be one adjustable size, and it only covered the editor and terminal body: every other piece of text in the app had its own literal written at the call site, so "I raised the font size and nothing outside the editor moved" was simply true. The UI slider now drives the style table's five rungs (Body / Button / Small / Heading / Monospace), and everything outside the editor takes its size from those rungs. Geometry has to follow the font or the text ends up drawn on itself, so the keybinding table measures its two columns from the widest label at the current size, row heights come from `Ui::text_style_height`, and window widths and the wrap threshold in the top bar are converted through `theme::scale`.
+
+The window is resizable from its bottom-right corner and stays where you drag it: it only asks to be centred during the first few frames, because an `anchor()` applied every frame pins the window dead centre and it can no longer be moved.
+
 ### Default keybindings
 
 Everything below is the default and everything is rebindable in `F1`.
@@ -412,7 +432,7 @@ Everything below is the default and everything is rebindable in `F1`.
 
 ### Customizing keybindings
 
-`F1` opens the settings panel. Click a chord, then press the new combination.
+`F1` (or the top bar's `?`) opens the settings window on its Keybindings section. Click a chord, then press the new combination.
 
 - `Esc` cancels recording; `Backspace` / `Delete` unbinds the action
 - Conflicts are highlighted in red with "conflicts with 'xxx'"
@@ -438,10 +458,11 @@ Every key it writes is under its own names (`EasyEditor.txt`, `Applications\<exe
 
 ## Configuration
 
-Font size, theme, sidebar visibility, active sidebar tab, hidden-file visibility, word wrap, the `.txt` association switch, last workspace, terminal preferences, database connections and your keybinding changes are stored automatically in `%APPDATA%\easy-editor\config.json` and restored on the next start. Fields that are not written fall back to defaults (`word_wrap: false`, i.e. long lines scroll sideways; `txt_association: true`; `db_connections: []`). Writes are debounced by 600 ms (so dragging the font size does not hammer the disk) and flushed once more on exit.
+Font size (`font_size` is the editor and terminal body, `ui_font_size` is everything else on screen), theme, sidebar visibility, active sidebar tab, hidden-file visibility, word wrap, the `.txt` association switch, last workspace, terminal preferences, database connections and your keybinding changes are stored automatically in `%APPDATA%\easy-editor\config.json` and restored on the next start. Fields that are not written fall back to defaults (`ui_font_size: 13.5`, `font_size: 14.0`, `word_wrap: false` i.e. long lines scroll sideways; `txt_association: true`; `db_connections: []`). Writes are debounced by 600 ms (so dragging the font size does not hammer the disk) and flushed once more on exit.
 
 ```json
 {
+  "ui_font_size": 13.5,
   "font_size": 14.0,
   "dark": false,
   "last_workspace": "D:/Codes/demo",
@@ -581,7 +602,7 @@ The two icons cover different surfaces:
 
 - **Only Windows 10 / 11 x64 has been used day to day.** Windows-specific code (system title bar colours, exe resources, console switches) is wrapped in `#[cfg(windows)]`; other platforms should compile, but nobody has verified them.
 - **`.txt` association is registration, not takeover.** EasyEditor appears in "Open with" and in Settings → Default apps; it does not quietly become your default text editor, and on Win10/11 a program cannot make itself one — `UserChoice` is hash-protected ([why](#txt-file-association)).
-- Terminal shell auto-detection covers PowerShell 7 / Windows PowerShell / cmd / Git Bash / WSL. If it misses one, set the path by hand in Terminal Settings.
+- Terminal shell auto-detection covers PowerShell 7 / Windows PowerShell / cmd / Git Bash / WSL. If it misses one, set the path by hand in the settings window's Terminal section.
 - Large files rendered in read-only virtual mode (> 1 MB or > 20,000 lines) neither wrap nor scroll horizontally — widen the pane to see a long line. These files also refuse formatting.
 - Files over 16 MB are refused outright, with a message in the status bar.
 - CJK glyph widths depend on `unicode-width` plus Microsoft YaHei; switch fonts and the baseline alignment parameters (see [CJK baseline](#cjk-baseline)) probably need recomputing.
@@ -722,6 +743,22 @@ The result grid used a hard-wired 120 pt: however tall you dragged the results s
 Two other numbers had to stop being literals for that to hold: the row pitch was fixed at 18 pt, which fit 11 pt text and would sit on top of the next row at 13, so it is now the measured glyph height plus 5; the columns were 140 / 56 / 46 pt, which was "twenty-three characters at 11 pt" in disguise, so they are 20 / 8 / 6 times the current `0` advance and keep the intent that was actually being expressed.
 
 One note for whoever writes the next headless test here: `Context::default()` ships `Small` at 9 pt, not the app's 11.5, so a test that measures type sizes has to run `theme::apply_style` first or it is measuring a style nobody sees. And `ctx.fonts_mut(...)` panics with "No fonts available" before the first `run_pass`, so glyph heights can only be read after a frame has been painted.
+
+### Making one font-size knob actually move the whole UI
+
+After the results strip was unified, the rest of the app still held a hundred-odd `.size(11.0)` / `.size(12.5)` literals across the top bar, sidebar, tabs and windows. Each one looked fine on its own; together they were the reason "the font size only changes the editor" was true — nothing abstracted them into rungs, and the one number in `config.json` that was adjustable covered only the editor and terminal body.
+
+The new number is `ui_font_size`, spread by `theme::apply_style` over the style table's five rungs; everywhere outside the editor is now only allowed to take a rung (`theme::sm` / `md` / `xs` / `display`, all derived from Body). What made this more than a find-and-replace was **geometry**: raise the font and the row heights, column widths, button sizes and window widths all have to follow, or the text draws on itself. So the keybinding table's two columns are now "measure the widest label in this batch at the current size", list rows take `Ui::text_style_height`, and window widths plus the top bar's wrap threshold go through `theme::scale` — leaving that at a literal 380 pt meant a large UI font pushed the right-hand group straight through the left-hand buttons.
+
+Two traps for the tests. The `保存` button is a usable probe because its height is font-derived, so the assertion is "raise the UI font and that button grows by more than 15%, stays on screen, and no two pieces of top-bar text overlap". And headless tests read the **user's own** `config.json`, where `font_size` happens to be 15 rather than the default 14 — so "changing the UI font must not touch the editor font" has to snapshot the current value instead of comparing against `EDITOR_FONT_DEFAULT`.
+
+### Asking "how much width is left" inside an `auto_sized` window asks for infinity
+
+The connection manager is a `Window::auto_sized()`. Turning its form into two columns produced an immediate assertion failure inside `Ui::allocate`: `max_rect is NaN: [[NaN 666.0] - [NaN 1145.0]]`. An `auto_sized` window measures its contents first, and during that pass the content `Ui` is given **unbounded** width — so `Ui::columns(2)`, and any arithmetic subtracting from `available_width()`, computes infinity minus infinity and hands egui a NaN. Same root cause as the note above about column widths in a horizontal scroll area.
+
+The fix is that this window's body width is a locked constant (460 pt at the default UI font, pushed into both `set_min_width` and `set_max_width`), and every column, card cell and list row is computed downward from that single number through `theme::scale` — never from what the layout claims is left. Locking the width earns its keep twice over: long paths and server error strings used to expand an `auto_sized` window until it ran off the screen.
+
+One more thing the headless test had to learn here: an `auto_sized` window **grows** when the form opens after you click a connection, so assertions about the form have to filter by the `area_rect` read after that click. Using the rect captured before it reports every newly grown row as "not painted".
 
 ## Contributing and license
 

@@ -806,7 +806,7 @@ fn show_large(
                 line_count,
                 human_size(file.bytes_len)
             ))
-            .size(11.5)
+            .size(crate::theme::sm(ui))
             .weak(),
         );
     });

@@ -16,8 +16,6 @@ use crate::db::{ConnectionSpec, DbEvent, DbHub, DbKind, DbOutcome, MAX_ROWS};
 
 /// 子层缩进（库 1 格、表 2 格）。
 const INDENT: f32 = 18.0;
-/// 树里一行的高。整行都能点，行高给足才好命中。
-const ROW_H: f32 = 22.0;
 /// 行首那个 ▸/▾ 占的宽度，图标和名字都排在它后面。
 const ARROW_W: f32 = 14.0;
 /// 层图标占的宽度。
@@ -67,6 +65,12 @@ struct ConnTree {
     tables: HashMap<String, Load>,
 }
 
+/// 树里一行的高。整行都能点，行高得给足才好命中——但「足」是照着字号量的，
+/// 不是写死 22：界面字号调到 16 时，22 那一格会把名字裁掉半截。
+fn tree_row_h(ui: &mut Ui) -> f32 {
+    ui.text_style_height(&egui::TextStyle::Body) + 5.5
+}
+
 /// 树的一行骨架：整行矩形、命中、悬停底色、以及祖先各层的淡竖线。
 ///
 /// 以前每层靠 `add_space` 推空格，父子关系全凭数格子，行与行还高低不齐；
@@ -75,7 +79,8 @@ struct ConnTree {
 /// 返回的 `x` 是这一层箭头列的左边界。
 fn tree_row(ui: &mut Ui, depth: usize) -> (egui::Response, f32) {
     let width = ui.available_width().max(120.0);
-    let (rect, resp) = ui.allocate_exact_size(egui::Vec2::new(width, ROW_H), egui::Sense::click());
+    let row_h = tree_row_h(ui);
+    let (rect, resp) = ui.allocate_exact_size(egui::Vec2::new(width, row_h), egui::Sense::click());
     paint_row_shell(ui, &resp, depth);
     // 整行都能点（箭头展开收起、名字选中），手型光标得跟着整行走
     (
@@ -120,7 +125,7 @@ fn arrow_glyph(ui: &Ui, cy: f32, x: f32, expanded: bool) {
         egui::pos2(x + ARROW_W * 0.5, cy),
         egui::Align2::CENTER_CENTER,
         if expanded { "▾" } else { "▸" },
-        egui::FontId::proportional(9.5),
+        egui::FontId::proportional(crate::theme::xs(ui)),
         ui.visuals().text_color().gamma_multiply(0.7),
     );
 }
@@ -136,7 +141,7 @@ fn tree_icon(ui: &Ui, cy: f32, x: f32, glyph: &str, on: bool, accent: egui::Colo
         egui::pos2(x, cy),
         egui::Align2::LEFT_CENTER,
         glyph,
-        egui::FontId::proportional(10.5),
+        egui::FontId::proportional(crate::theme::xs(ui)),
         color,
     );
 }
@@ -192,7 +197,7 @@ fn trail_label(
 ) -> f32 {
     let galley =
         ui.painter()
-            .layout_no_wrap(text.to_owned(), egui::FontId::proportional(9.5), color);
+            .layout_no_wrap(text.to_owned(), egui::FontId::proportional(crate::theme::xs(ui)), color);
     let w = galley.size().x;
     ui.painter().galley(
         egui::pos2(right - w, resp.rect.center().y - galley.size().y * 0.5),
@@ -205,7 +210,8 @@ fn trail_label(
 /// 读取失败那一行：说清哪儿坏了，旁边留一个真的能点的重试。
 fn failed_row(ui: &mut Ui, depth: usize, err: &str, retry: impl FnOnce()) {
     let width = ui.available_width().max(120.0);
-    let (rect, resp) = ui.allocate_exact_size(egui::Vec2::new(width, ROW_H), egui::Sense::hover());
+    let row_h = tree_row_h(ui);
+    let (rect, resp) = ui.allocate_exact_size(egui::Vec2::new(width, row_h), egui::Sense::hover());
     paint_row_shell(ui, &resp, depth);
     let color = ui.visuals().error_fg_color;
     let btn_w = 44.0;
@@ -215,7 +221,7 @@ fn failed_row(ui: &mut Ui, depth: usize, err: &str, retry: impl FnOnce()) {
             egui::pos2(rect.left() + 4.0 + INDENT * depth as f32, rect.top()),
             egui::pos2(rect.right() - btn_w - 4.0, rect.bottom()),
         ),
-        RichText::new(err.to_owned()).size(11.0).color(color),
+        RichText::new(err.to_owned()).size(crate::theme::sm(ui)).color(color),
     );
     if ui
         .put(
@@ -223,7 +229,7 @@ fn failed_row(ui: &mut Ui, depth: usize, err: &str, retry: impl FnOnce()) {
                 egui::pos2(rect.right() - btn_w - 2.0, rect.center().y - 9.0),
                 egui::vec2(btn_w, 18.0),
             ),
-            egui::Button::new(RichText::new("重试").size(11.0)),
+            egui::Button::new(RichText::new("重试").size(crate::theme::sm(ui))),
         )
         .on_hover_cursor(crate::theme::HAND)
         .clicked()
@@ -831,9 +837,9 @@ impl DatabasePanel {
             .inner_margin(egui::Margin::symmetric(6, 3))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(icon).size(12.0).strong().color(color));
+                    ui.label(RichText::new(icon).size(crate::theme::md(ui)).strong().color(color));
                     // 报错原因往往一大串，给成可选中才能直接抄去查
-                    ui.label(RichText::new(text).size(11.5).strong().color(color));
+                    ui.label(RichText::new(text).size(crate::theme::sm(ui)).strong().color(color));
                 });
             });
     }
@@ -971,7 +977,7 @@ impl DatabasePanel {
                 }
                 let up = self.online().len();
                 ui.label(weak(format!("已连接 {up} / {}", self.connections.len())));
-                ui.label(RichText::new("数据库连接").strong().size(12.0));
+                ui.label(RichText::new("数据库连接").strong().size(crate::theme::md(ui)));
             });
         });
         ui.separator();
@@ -1012,23 +1018,23 @@ impl DatabasePanel {
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("默认连接").size(10.5).weak());
+                            ui.label(RichText::new("默认连接").size(crate::theme::xs(ui)).weak());
                             ui.label(
                                 RichText::new(format!("{active} · {target}"))
-                                    .size(11.0)
+                                    .size(crate::theme::sm(ui))
                                     .strong()
                                     .color(color),
                             );
                         });
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("当前库").size(10.5).weak());
+                            ui.label(RichText::new("当前库").size(crate::theme::xs(ui)).weak());
                             ui.label(
                                 RichText::new(if database.is_empty() {
                                     "（配置里没填库）".to_owned()
                                 } else {
                                     database.clone()
                                 })
-                                .size(11.0)
+                                .size(crate::theme::sm(ui))
                                 .strong()
                                 .color(color),
                             );
@@ -1052,7 +1058,7 @@ impl DatabasePanel {
                             }
                             ui.label(
                                 RichText::new(format!("{mark} {state}"))
-                                    .size(10.5)
+                                    .size(crate::theme::xs(ui))
                                     .strong()
                                     .color(mark_color),
                             );
@@ -1083,12 +1089,14 @@ impl DatabasePanel {
     /// 不然「测试连接」点下去像没反应。
     fn status_row(&self, ui: &mut Ui) {
         ui.separator();
-        ui.label(RichText::new(self.status.clone()).size(10.5).weak());
+        ui.label(RichText::new(self.status.clone()).size(crate::theme::xs(ui)).weak());
     }
 
     /// 一棵连接子树。`queued` 是这条连接此刻排着的语句条数（结果区给的）。
     fn conn_rows(&mut self, ui: &mut Ui, spec: &ConnectionSpec, queued: usize) {
         let name = spec.name.clone();
+        // 名字那一档先量好：put_name 要 &mut ui，字号不能当着它的面现取
+        let md = crate::theme::md(ui);
         let expanded = self.trees.get(&name).is_some_and(|t| t.expanded);
         let selected = self.active_conn() == Some(name.as_str());
         let (mark, state, mark_color) = self.link_view(ui, spec);
@@ -1122,7 +1130,7 @@ impl DatabasePanel {
             if expanded { "收起库列表" } else { "展开库列表" },
             if up { "断开" } else { "连接" },
         );
-        put_name(ui, &resp, x + ARROW_W + ICON_W, right, &name, 12.5, true).on_hover_text(hover);
+        put_name(ui, &resp, x + ARROW_W + ICON_W, right, &name, md, true).on_hover_text(hover);
 
         if resp.clicked() {
             if hit_arrow(&resp, x) {
@@ -1207,6 +1215,7 @@ impl DatabasePanel {
     ) {
         let conn = spec.name.clone();
         let db = database.to_string();
+        let md = crate::theme::md(ui);
 
         let (resp, x) = tree_row(ui, 1);
         let cy = resp.rect.center().y;
@@ -1230,7 +1239,7 @@ impl DatabasePanel {
                 "展开表列表"
             }
         );
-        put_name(ui, &resp, x + ARROW_W + ICON_W, right, &db, 12.0, false).on_hover_text(hover);
+        put_name(ui, &resp, x + ARROW_W + ICON_W, right, &db, md, false).on_hover_text(hover);
 
         if resp.clicked() {
             if hit_arrow(&resp, x) {
@@ -1277,17 +1286,18 @@ impl DatabasePanel {
             .open(&mut open)
             .collapsible(false)
             .auto_sized();
-        // 只在刚打开的那一帧居中，之后窗口归用户摆。理由见 terminal_settings_window。
+        // 只在刚打开的那一帧居中，之后窗口归用户摆：每帧都 anchor 会把它钉死在正中，拖不动。
         if self.center_manager && ctx.memory(|m| m.area_rect(win_id).is_some()) {
             window = window.anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO);
             self.center_manager = false;
         }
         window.show(ctx, |ui| {
             // 路径和错误串都可能很长，不锁死宽度会把 auto_sized 的窗口撑到屏幕外
-            ui.set_max_width(460.0);
-            ui.set_min_width(460.0);
+            let w = crate::theme::scale(ui.ctx(), BODY_W);
+            ui.set_max_width(w);
+            ui.set_min_width(w);
             self.manager_list(ui);
-            ui.separator();
+            ui.add_space(crate::theme::scale(ui.ctx(), 8.0));
             self.manager_form(ui);
         });
         self.show_manager = open;
@@ -1298,7 +1308,7 @@ impl DatabasePanel {
             ui.label(
                 RichText::new(format!("已保存的连接（{}）", self.connections.len()))
                     .strong()
-                    .size(12.0),
+                    .size(crate::theme::md(ui)),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
@@ -1310,13 +1320,28 @@ impl DatabasePanel {
                 }
             });
         });
+        let faint = ui.visuals().faint_bg_color;
+        card(ui, faint, |ui| {
+            self.manager_rows(ui);
+        });
+    }
+
+    /// 卡片里那一列连接：每条一行，名字可点、右边跟着它指向的地址。
+    ///
+    /// 地址以前只挂在悬停提示里——不悬停就不知道哪条是本地的、哪条是生产的，
+    /// 列表和下面那张表单一样都是灰字，分不清谁是谁。
+    fn manager_rows(&mut self, ui: &mut Ui) {
         if self.connections.is_empty() {
-            muted_row(ui, 0, "还没有连接。点「新建」加一条。");
+            ui.label(
+                RichText::new("还没有连接。点右上角「新建」加一条。")
+                    .size(crate::theme::sm(ui))
+                    .weak(),
+            );
             return;
         }
         egui::ScrollArea::vertical()
             .id_salt("db_manager_list")
-            .max_height(150.0)
+            .max_height(crate::theme::scale(ui.ctx(), 150.0))
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let rows: Vec<(usize, String, String)> = self
@@ -1326,14 +1351,21 @@ impl DatabasePanel {
                     .map(|(i, c)| (i, c.name.clone(), c.target()))
                     .collect();
                 let editing = self.draft.as_ref().and_then(|d| d.index);
-                let rows_width = (ui.available_width() - 70.0).max(80.0);
+                // 三栏怎么分都由窗口那个锁死的宽度算，不读 available_width：
+                // `auto_sized` 的窗口有一帧在量内容，那时可用宽度是无穷大，减一下就成 NaN。
+                let inner = inner_w(ui.ctx());
+                let del_w = crate::theme::scale(ui.ctx(), 46.0);
+                // 名字一栏给四成二，剩下的留给地址；挤不下的那截用省略号，完整串在悬停提示里
+                let rows_width = inner * 0.42;
+                let target_w = inner - rows_width - del_w - crate::theme::scale(ui.ctx(), 12.0);
+                let row_h = ui.text_style_height(&egui::TextStyle::Body);
                 for (index, name, target) in rows {
                     ui.horizontal(|ui| {
                         let row = ui
                             .add(
                                 egui::Button::selectable(
                                     editing == Some(index),
-                                    RichText::new(&name).size(12.0),
+                                    RichText::new(&name).size(crate::theme::md(ui)),
                                 )
                                 .min_size(egui::vec2(rows_width, 0.0)),
                             )
@@ -1342,6 +1374,18 @@ impl DatabasePanel {
                         if row.clicked() {
                             self.begin_edit(index);
                         }
+                        let xs = crate::theme::xs(ui);
+                        // 定宽 + truncate：地址长的连接不能把「删除」挤出这一行
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(target_w, row_h),
+                            egui::Layout::top_down_justified(egui::Align::LEFT),
+                            |ui| {
+                                ui.add(
+                                    egui::Label::new(RichText::new(&target).size(xs).weak())
+                                        .truncate(),
+                                );
+                            },
+                        );
                         if ui
                             .small_button("删除")
                             .on_hover_cursor(crate::theme::HAND)
@@ -1355,8 +1399,23 @@ impl DatabasePanel {
     }
 
     fn manager_form(&mut self, ui: &mut Ui) {
+        let fill = ui.visuals().panel_fill;
+        card(ui, fill, |ui| self.manager_fields(ui));
+    }
+
+    /// 表单：标签压在框上面，一栏一个字段。
+    ///
+    /// 从前是「标签 输入框」横着排成三行：标签和输入框一样轻、一样高，一整片平铺的灰字，
+    /// 分不清哪块能填、哪块只是说明。标签挪到框上面，字段各占一格，配合列表那张卡片，
+    /// 「能点的」和「能填的」两件事先由版式分开。
+    fn manager_fields(&mut self, ui: &mut Ui) {
+        stroke_fields(ui);
         let Some(draft) = self.draft.clone() else {
-            muted_row(ui, 0, "选中上面一条连接来编辑，或点「新建」。");
+            ui.label(
+                RichText::new("选中上面一条连接来编辑，或点「新建」。")
+                    .size(crate::theme::sm(ui))
+                    .weak(),
+            );
             return;
         };
         let mut spec = draft.spec;
@@ -1367,91 +1426,92 @@ impl DatabasePanel {
         } else {
             "新建连接"
         };
-        ui.label(RichText::new(title).strong().size(12.0));
+        ui.label(RichText::new(title).strong().size(crate::theme::md(ui)));
 
-        ui.label(weak("名称（SQL 块里 conn= 用的就是这个名字）"));
-        ui.add(
-            egui::TextEdit::singleline(&mut spec.name)
-                .hint_text("本地开发库")
-                .desired_width(f32::INFINITY),
-        );
+        field(ui, "名称（SQL 块里 conn= 用的就是这个名字）", |ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut spec.name)
+                    .hint_text("本地开发库")
+                    .desired_width(f32::INFINITY),
+            );
+        });
 
-        ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.label(weak("引擎"));
-            egui::ComboBox::from_id_salt("db_kind")
-                .selected_text(spec.kind.label())
-                .show_ui(ui, |ui| {
-                    for kind in DbKind::all() {
-                        if ui
-                            .selectable_label(spec.kind == *kind, kind.label())
-                            .on_hover_cursor(crate::theme::HAND)
-                            .clicked()
-                        {
-                            spec.kind = *kind;
-                            spec.port = kind.default_port();
+            cell(ui, "引擎", |ui| {
+                egui::ComboBox::from_id_salt("db_kind")
+                    .selected_text(spec.kind.label())
+                    .show_ui(ui, |ui| {
+                        for kind in DbKind::all() {
+                            if ui
+                                .selectable_label(spec.kind == *kind, kind.label())
+                                .on_hover_cursor(crate::theme::HAND)
+                                .clicked()
+                            {
+                                spec.kind = *kind;
+                                spec.port = kind.default_port();
+                            }
                         }
-                    }
-                });
-            ui.label(weak("主机"));
-            ui.add(
-                egui::TextEdit::singleline(&mut spec.host)
-                    .hint_text("127.0.0.1")
-                    .desired_width(120.0),
-            );
-            ui.label(weak("端口"));
-            ui.add(
-                egui::DragValue::new(&mut spec.port)
-                    .range(1..=65535)
-                    .speed(1),
-            );
+                    });
+            });
+            cell(ui, "端口", |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut spec.port)
+                        .range(1..=65535)
+                        .speed(1),
+                );
+            });
         });
 
-        ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.label(weak("用户"));
-            ui.add(
-                egui::TextEdit::singleline(&mut spec.user)
-                    .hint_text("root")
-                    .desired_width(110.0),
-            );
-            ui.label(weak("密码"));
-            ui.add(
-                egui::TextEdit::singleline(&mut secret.1)
-                    .hint_text(if secret.0 {
-                        "变量名"
-                    } else {
-                        "留空 = 空密码"
-                    })
-                    .password(!secret.0)
-                    .desired_width(150.0),
-            );
+            cell(ui, "主机", |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut spec.host)
+                        .hint_text("127.0.0.1")
+                        .desired_width(f32::INFINITY),
+                );
+            });
+            cell(ui, "默认库", |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut spec.database)
+                        .hint_text("留空 = 看 SHOW DATABASES")
+                        .desired_width(f32::INFINITY),
+                );
+            });
         });
+
         ui.horizontal(|ui| {
-            ui.add_space(4.0);
-            let mut from_env = secret.0;
-            if ui
-                .checkbox(&mut from_env, "密码从环境变量读")
-                .on_hover_text("勾上后配置里只存变量名，明文密码不落盘")
-                .changed()
-            {
-                // 从明文切到变量名：把原来的密码清掉，别让它躺在明文输入框里
-                if from_env {
-                    secret.1.clear();
-                }
-                secret.0 = from_env;
+            cell(ui, "用户", |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut spec.user)
+                        .hint_text("root")
+                        .desired_width(f32::INFINITY),
+                );
+            });
+            cell(ui, "密码", |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut secret.1)
+                        .hint_text(if secret.0 {
+                            "变量名"
+                        } else {
+                            "留空 = 空密码"
+                        })
+                        .password(!secret.0)
+                        .desired_width(f32::INFINITY),
+                );
+            });
+        });
+        let mut from_env = secret.0;
+        if ui
+            .checkbox(&mut from_env, "密码从环境变量读")
+            .on_hover_text("勾上后配置里只存变量名，明文密码不落盘")
+            .changed()
+        {
+            // 从明文切到变量名：把原来的密码清掉，别让它躺在明文输入框里
+            if from_env {
+                secret.1.clear();
             }
-        });
-
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(weak("默认库"));
-            ui.add(
-                egui::TextEdit::singleline(&mut spec.database)
-                    .hint_text("留空 = 连上后看 SHOW DATABASES")
-                    .desired_width(220.0),
-            );
-        });
+            secret.0 = from_env;
+        }
 
         if let Some(field) = spec.missing() {
             ui.colored_label(ui.visuals().error_fg_color, format!("请填写：{field}"));
@@ -1513,10 +1573,10 @@ impl DatabasePanel {
         }
 
         ui.add_space(2.0);
-        muted_row(
-            ui,
-            0,
-            &format!("配置写在 {}", crate::config::Config::path().display()),
+        ui.label(
+            RichText::new(format!("配置写在 {}", crate::config::Config::path().display()))
+                .size(crate::theme::xs(ui))
+                .weak(),
         );
     }
 }
@@ -1525,6 +1585,7 @@ impl DatabasePanel {
 fn table_row(ui: &mut Ui, database: &str, table: &str) {
     let qualified = format!("`{database}`.`{table}`");
     let (resp, x) = tree_row(ui, 2);
+    let md = crate::theme::md(ui);
     let cy = resp.rect.center().y;
     tree_icon(
         ui,
@@ -1540,7 +1601,7 @@ fn table_row(ui: &mut Ui, database: &str, table: &str) {
         x + ARROW_W + ICON_W,
         resp.rect.right() - 8.0,
         table,
-        12.0,
+        md,
         false,
     )
     .on_hover_text(format!("双击复制 {qualified}；右键可复制查询语句"));
@@ -1571,19 +1632,99 @@ fn table_row(ui: &mut Ui, database: &str, table: &str) {
 /// 树里那句不带操作的话：正在读、还没读出来、或者压根没有连接。
 fn muted_row(ui: &mut Ui, depth: usize, text: &str) {
     let width = ui.available_width().max(120.0);
-    let (rect, resp) = ui.allocate_exact_size(egui::Vec2::new(width, ROW_H), egui::Sense::hover());
+    let row_h = tree_row_h(ui);
+    let (rect, resp) = ui.allocate_exact_size(egui::Vec2::new(width, row_h), egui::Sense::hover());
     paint_row_shell(ui, &resp, depth);
     ui.painter().text(
         egui::pos2(rect.left() + 4.0 + INDENT * depth as f32, rect.center().y),
         egui::Align2::LEFT_CENTER,
         text,
-        egui::FontId::proportional(11.0),
+        egui::FontId::proportional(crate::theme::sm(ui)),
         ui.visuals().weak_text_color(),
     );
 }
 
+/// 树里那些次要说明。`.small()` 走样式表的 `Small`，界面字号调大时跟着走。
 fn weak(text: impl Into<String>) -> RichText {
-    RichText::new(text).size(11.0).weak()
+    RichText::new(text).small().weak()
+}
+
+/// 连接管理窗口正文锁死的宽度（默认界面字号下量的）。
+const BODY_W: f32 = 460.0;
+/// 卡片内边距，左右各一份。
+const CARD_PAD: f32 = 10.0;
+
+/// 卡片里一栏实际能用多宽。
+///
+/// 分栏宽度一律从这个数算，不去读 `available_width()`：`auto_sized` 的窗口先要量一次
+/// 内容，那一帧可用宽度是无穷大，两个无穷大相减就成了 NaN，egui 当场断言炸掉。
+fn inner_w(ctx: &egui::Context) -> f32 {
+    crate::theme::scale(ctx, BODY_W - CARD_PAD * 2.0)
+}
+
+/// 一块卡片：一圈边框、一层底色，把内容整个包进去。
+///
+/// 这个窗口原先只有一条分隔线，列表和表单摊在同一层底色上，输入框的描边又只比底色深
+/// 两三档——一眼看过去分不清哪儿能点、哪儿能填。先把两层用底色和边框隔开，剩下的事
+/// 才交给版式。
+fn card(ui: &mut Ui, fill: egui::Color32, body: impl FnOnce(&mut Ui)) {
+    let dark = ui.visuals().dark_mode;
+    let stroke = egui::Stroke::new(
+        1.0,
+        if dark {
+            egui::Color32::from_rgb(58, 63, 71)
+        } else {
+            egui::Color32::from_rgb(214, 217, 223)
+        },
+    );
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(stroke)
+        .corner_radius(6.0)
+        .inner_margin(crate::theme::scale(ui.ctx(), CARD_PAD))
+        .show(ui, |ui| body(ui));
+}
+
+/// 标签在上、控件在下的一栏。
+///
+/// 标签和输入框横着排时两者一样轻、一样高，混成一片灰字；标签挪到框上面，框是框、
+/// 字是字，一眼看得出哪里能填。
+fn field(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui)) {
+    ui.label(RichText::new(label).size(crate::theme::sm(ui)).weak());
+    add(ui);
+}
+
+/// 左右并排的一栏：整栏定宽，标签那一行加控件那一行的高也是照着字号量的。
+fn cell(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui)) {
+    let gap = ui.spacing().item_spacing.x;
+    let width = (inner_w(ui.ctx()) - crate::theme::scale(ui.ctx(), gap)).max(60.0) / 2.0;
+    let height = ui.text_style_height(&egui::TextStyle::Small)
+        + ui.spacing().interact_size.y
+        + ui.spacing().item_spacing.y * 2.0;
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, height),
+        egui::Layout::top_down_justified(egui::Align::LEFT),
+        |ui| field(ui, label, add),
+    );
+}
+
+/// 把这一栏里输入框、下拉框、按钮那圈描边压深一档。
+///
+/// 样式表默认的描边是给浅灰按钮边框用的，铺在白底窗口上几乎看不见，输入框因此看着
+/// 像一行裸文字。`visuals_mut` 改的是本 `Ui` 的样式副本（内部 `Arc::make_mut`），
+/// 出了这块卡片别处还是原来的描边。悬停换成强调色；获得焦点时 egui 本来就用
+/// `selection.stroke` 描一圈，那就是焦点环，不用另画。
+fn stroke_fields(ui: &mut Ui) {
+    let dark = ui.visuals().dark_mode;
+    let accent = ui.visuals().selection.stroke.color;
+    let quiet = if dark {
+        egui::Color32::from_rgb(92, 99, 110)
+    } else {
+        egui::Color32::from_rgb(151, 158, 169)
+    };
+    let v = ui.visuals_mut();
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, quiet);
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent);
 }
 
 /// 密码框拆成「是否 env 间接」+「框里显示的内容」。
