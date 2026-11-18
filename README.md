@@ -556,6 +556,8 @@ powershell -NoProfile -Command "Compress-Archive -Path dist\EasyEditor -Destinat
 
 For the `-with-rg` variant, drop `rg.exe` and `THIRD-PARTY-NOTICES.txt` into `dist\EasyEditor\` and compress again. Each package gets its own `.sha256.txt`.
 
+> Do not run those two in the other order: `Compress-Archive` zips whatever sits in `dist\EasyEditor\`, not a list of file types it recognises. Add `rg.exe` first and the plain package carries 5 MB of it while its name says the opposite.
+
 > Do not use `tar -a -cf xxx.zip`: the `tar` in Git Bash is GNU tar, and its `-a` only understands gzip/bzip2/xz. With a `.zip` suffix it still emits a plain tar archive, which Windows will not open on double-click.
 
 ### App icon

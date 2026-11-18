@@ -554,6 +554,8 @@ powershell -NoProfile -Command "Compress-Archive -Path dist\EasyEditor -Destinat
 
 带 `rg.exe` 的那档把 `rg.exe` 和 `THIRD-PARTY-NOTICES.txt` 也放进 `dist\EasyEditor\` 再压一次，后缀写 `-with-rg`；两个包各配一份 `.sha256.txt`。
 
+> 顺序别倒过来：`Compress-Archive` 压的是整个 `dist\EasyEditor\` 目录，不是它认得的几类文件。先加 `rg.exe` 再出 plain 包，那个「不带 rg」的包里会混进 5 MB 的 `rg.exe`，跟包名说的是两回事。
+
 > 别用 `tar -a -cf xxx.zip`：Git Bash 里那个 `tar` 是 GNU tar，`-a` 只认 gzip/bzip2/xz，后缀写 `.zip` 也只会吐一个纯 tar 包，Windows 双击打不开。
 
 ### 应用图标
