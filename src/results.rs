@@ -6,6 +6,12 @@
 //!
 //! 这一层不碰数据库也不碰文件：结果由 `DatabasePanel::take_stray` 转交过来，
 //! 「回块」只是把 (路径, 字节) 原样递回给 app，真正的跳转归 app 管。
+//!
+//! 字号只有两档，都是问 `theme` 那张样式表要的：数据（格子、列名、详情与全文窗口
+//! 里的值、语句预览）走 `TextStyle::Monospace`，辅助说明（时间戳、行数、提示、行号）
+//! 走 `TextStyle::Small`。以前这一片自己写死 10.5 / 11 / 11.5，比界面其他角落矮一档，
+//! 从编辑器（默认 14）抬眼往下看结果就小得发虚；行高、列宽也照旧钉死在 18 和 140，
+//! 字号一动就全偏，现在这两样都从当下的字体量出来。
 
 use std::path::PathBuf;
 
@@ -393,7 +399,7 @@ impl ResultsDock {
             } else {
                 format!("结果 · {count} 个")
             };
-            ui.label(RichText::new(head).size(11.5).strong());
+            ui.label(RichText::new(head).small().strong());
             ui.label(weak(
                 "点页签换一份 · 右键页签一次关一批 · 双击格子看全文 · 点行号选整行 · 行首 ▸ 开详情",
             ));
@@ -627,10 +633,9 @@ fn draw_row_detail(panel: &mut Panel, ctx: &egui::Context) {
                 .show(ui, |ui| {
                     for (name, value) in &fields {
                         ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new(format!("{name} =")).size(10.5).weak());
+                            ui.label(RichText::new(format!("{name} =")).small().weak());
                             ui.add(
-                                egui::Label::new(RichText::new(value).size(11.0).monospace())
-                                    .selectable(true),
+                                egui::Label::new(RichText::new(value).monospace()).selectable(true),
                             );
                         });
                         ui.add_space(1.0);
@@ -702,8 +707,7 @@ fn draw_cell_peek(panel: &mut Panel, ctx: &egui::Context) {
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     ui.add(
-                        egui::Label::new(RichText::new(shown).size(11.5).monospace())
-                            .selectable(true),
+                        egui::Label::new(RichText::new(shown).monospace()).selectable(true),
                     );
                     if cut {
                         ui.label(weak(format!(
@@ -758,12 +762,7 @@ fn batch_row(ui: &mut Ui, panel: &Panel) {
     ui.add_space(2.0);
     ui.horizontal(|ui| {
         let accent = ui.visuals().hyperlink_color;
-        ui.label(
-            RichText::new(&panel.stamp)
-                .size(10.5)
-                .strong()
-                .color(accent),
-        );
+        ui.label(RichText::new(&panel.stamp).small().strong().color(accent));
         ui.label(weak(format!(
             "{} · 「{}」 · 共 {} 条",
             panel.conn, panel.title, panel.total
@@ -856,10 +855,11 @@ fn tab(
 ) {
     let accent = ui.visuals().hyperlink_color;
     let hovered = ui.visuals().widgets.hovered.weak_bg_fill;
+    let small = egui::TextStyle::Small.resolve(ui.style());
     let text = tab_label(panel);
     let galley = ui.painter().layout_no_wrap(
         text.clone(),
-        egui::FontId::proportional(11.0),
+        small.clone(),
         if on {
             accent
         } else {
@@ -903,7 +903,7 @@ fn tab(
         close.center(),
         egui::Align2::CENTER_CENTER,
         "✕",
-        egui::FontId::proportional(9.5),
+        small,
         if resp.hovered() || on {
             ui.visuals().text_color()
         } else {
@@ -1089,7 +1089,7 @@ fn header(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
                 }
                 let text = panel.preview();
                 ui.add(
-                    egui::Label::new(RichText::new(text).size(11.0).monospace())
+                    egui::Label::new(RichText::new(text).monospace())
                         .truncate()
                         .selectable(false),
                 )
@@ -1119,7 +1119,7 @@ fn body(ui: &mut Ui, panel: &mut Panel) {
         Slot::Skipped => {
             ui.label(
                 RichText::new("排在前面的语句失败了，这条没有执行。")
-                    .size(11.0)
+                    .small()
                     .weak()
                     .italics(),
             );
@@ -1129,7 +1129,6 @@ fn body(ui: &mut Ui, panel: &mut Panel) {
             ui.add(
                 egui::Label::new(
                     RichText::new(err)
-                        .size(11.0)
                         .color(Color32::from_rgb(196, 60, 52))
                         .strong(),
                 )
@@ -1137,7 +1136,7 @@ fn body(ui: &mut Ui, panel: &mut Panel) {
             );
         }
         Slot::Done(one) => {
-            ui.label(RichText::new(write_line(one)).size(11.0));
+            ui.label(write_line(one));
         }
     }
 }
@@ -1166,6 +1165,12 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
     *selected = selected.filter(|i| *i < one.rows.len());
     *detail = detail.filter(|d| d.row < one.rows.len());
 
+    // 字号问样式表要，行高与列宽再由这个字号量出来。以前 11 的字配 18 的行、140 的列，
+    // 三个数各写各的：样式表哪天调一档，格子就压字、列就少摆几个字。
+    let mono = egui::TextStyle::Monospace.resolve(ui.style());
+    let ch = ui.fonts_mut(|f| f.glyph_width(&mono, '0')).max(1.0);
+    let row_h = ui.text_style_height(&egui::TextStyle::Monospace) + 5.0;
+
     // 横向滚动条只能自己套：egui_extras 的表体内部写死 `ScrollArea::new([false, vscroll])`，
     // 压根没有横向这一维，列一多就只能看着被裁。表头和表体一起放进这个滚动区——
     // 表头是画在表体的滚动区外面的，分开包两半会列错位。
@@ -1184,25 +1189,26 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                 .min_scrolled_height(0.0)
                 .max_scroll_height(height)
                 .cell_layout(Layout::left_to_right(Align::Center))
-                .column(Column::initial(46.0).at_least(34.0).clip(true))
+                // 行号那一格够摆「▸ + 三四位」，数据那格先给 20 个字宽
+                .column(Column::initial(6.0 * ch).at_least(4.5 * ch).clip(true))
                 .columns(
-                    Column::initial(140.0)
-                        .at_least(56.0)
+                    Column::initial(20.0 * ch)
+                        .at_least(8.0 * ch)
                         .resizable(true)
                         .clip(true),
                     one.columns.len(),
                 );
             table
-                .header(18.0, |mut header| {
+                .header(row_h, |mut header| {
                     header.col(|ui| {
-                        ui.label(RichText::new("#").size(11.0).strong());
+                        ui.label(RichText::new("#").monospace().strong());
                     });
                     for col in &one.columns {
                         let name = col.name.clone();
                         let ty = col.type_name.clone();
                         header.col(|ui| {
                             let resp = ui.add(
-                                egui::Label::new(RichText::new(name).size(11.0).strong())
+                                egui::Label::new(RichText::new(name).monospace().strong())
                                     .truncate()
                                     .selectable(false),
                             );
@@ -1213,7 +1219,7 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                     }
                 })
                 .body(|body| {
-                    body.rows(18.0, one.rows.len(), |mut row| {
+                    body.rows(row_h, one.rows.len(), |mut row| {
                         let index = row.index();
                         // `set_selected` 只管它之后加进来的格子，所以第一格之前调。
                         // 也正因为这样，点下去那一帧不改亮哪一行，下一帧才跟上。
@@ -1222,7 +1228,7 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                             let opened = detail.is_some_and(|d| d.row == index);
                             let arrow = if opened { "▾" } else { "▸" };
                             let resp = ui.add(
-                                egui::Label::new(RichText::new(arrow).size(10.0).weak())
+                                egui::Label::new(RichText::new(arrow).small().weak())
                                     .selectable(false)
                                     .sense(egui::Sense::click()),
                             );
@@ -1242,7 +1248,7 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                                     pinned: pin,
                                 });
                             }
-                            let mut num = RichText::new(format!("{}", index + 1)).size(10.5);
+                            let mut num = RichText::new(format!("{}", index + 1)).small();
                             num = if *selected == Some(index) {
                                 num.strong()
                             } else {
@@ -1264,7 +1270,7 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                         for (col_index, cell) in one.rows[index].iter().enumerate() {
                             let text = cell.display().to_string();
                             let null = cell.is_null();
-                            let mut rt = RichText::new(text.clone()).size(11.0).monospace();
+                            let mut rt = RichText::new(text.clone()).monospace();
                             if null {
                                 rt = rt.weak().italics();
                             }
@@ -1276,11 +1282,7 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                                 // 表格只给可见行跑这段，量一行的宽度不贵。
                                 let full = ui
                                     .painter()
-                                    .layout_no_wrap(
-                                        text.clone(),
-                                        egui::FontId::monospace(11.0),
-                                        Color32::WHITE,
-                                    )
+                                    .layout_no_wrap(text.clone(), mono.clone(), Color32::WHITE)
                                     .size()
                                     .x;
                                 let resp = if full <= resp.rect.width() - 6.0 {
@@ -1355,7 +1357,7 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!("已选中第 {} 行", index + 1))
-                    .size(10.5)
+                    .small()
                     .strong(),
             );
             if crate::theme::chip(ui, "复制整行")
@@ -1532,7 +1534,7 @@ fn write_line(one: &StatementResult) -> String {
 }
 
 fn weak(text: impl Into<String>) -> RichText {
-    RichText::new(text.into()).size(10.5).weak()
+    RichText::new(text.into()).small().weak()
 }
 
 /// 「这一格全文」窗口最多铺多少字。
@@ -2427,6 +2429,75 @@ mod tests {
         assert!(
             long >= short * 2 && long >= 18,
             "结果区高了一倍半，列表还是只亮那么几行：矮的 {short} 行 / 高的 {long} 行"
+        );
+    }
+
+    /// 字号问样式表要：数据走 `Monospace`，辅助说明走 `Small`，行高跟着字号长。
+    ///
+    /// 这轮之前结果区自己写死 10.5 / 11 / 11.5，比界面其他角落矮一档，从编辑器
+    /// （默认 14）抬眼看下来只觉得结果那一小片字发虚。这里得用应用真的那套样式量，
+    /// `Context::default()` 的 `Small` 是 9pt，拿它量出来的数说明不了界面长什么样。
+    #[test]
+    fn the_grid_uses_the_text_sizes_the_rest_of_the_app_uses() {
+        let mut dock = ResultsDock::new();
+        dock.start_run("本机", "查用户", &parts(&["SELECT name FROM t"]), None);
+        let rows = (0..8)
+            .map(|n| vec![Cell::Text(format!("行 {n}"))])
+            .collect();
+        dock.on_event(&event(1, Ok(DbOutcome::Statement(table(&["name"], rows)))));
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        crate::theme::apply_style(&ctx, true);
+        let out = show_pass(&mut dock, &ctx, vec![], 1.0);
+        // 字体的量法得等第一帧跑完才拿得到，样式表里那两档就是这一帧用的
+        let style = ctx.global_style();
+        let cell_font = style.text_styles[&egui::TextStyle::Monospace].clone();
+        let small_font = style.text_styles[&egui::TextStyle::Small].clone();
+        drop(style);
+        let line = |id: &egui::FontId| ctx.fonts_mut(|f| f.row_height(id));
+        assert!(
+            line(&cell_font) > line(&small_font) + 0.5,
+            "两档字号量出来一样高，样式表怕是没生效"
+        );
+
+        let marks = seen(&out);
+        let rect_of = |want: &str| {
+            marks
+                .iter()
+                .find(|(t, _)| t == want)
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| {
+                    let all: Vec<&String> = marks.iter().map(|(t, _)| t).collect();
+                    panic!("「{want}」没画出来：{all:?}")
+                })
+        };
+
+        // 格子里的值是数据，和列名同一档
+        let value = rect_of("行 0");
+        assert!(
+            (value.height() - line(&cell_font)).abs() < 1.0,
+            "格子按 {} 排，样式表要的是 {}",
+            value.height(),
+            line(&cell_font)
+        );
+        // 行高跟着字号走，不是从前那个 18：字撑到 13 而行没动，下一行就压上来了
+        let pitch = rect_of("行 1").center().y - value.center().y;
+        assert!(
+            pitch >= value.height() + 4.0,
+            "行间距 {pitch:.1} 挤不下 {} 高的字",
+            value.height()
+        );
+
+        // 辅助那一档：抬头那行提示
+        let hint = rect_of(
+            "点页签换一份 · 右键页签一次关一批 · 双击格子看全文 · 点行号选整行 · 行首 ▸ 开详情",
+        );
+        assert!(
+            (hint.height() - line(&small_font)).abs() < 1.0,
+            "提示行按 {} 排，样式表要的是 {}",
+            hint.height(),
+            line(&small_font)
         );
     }
 
