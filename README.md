@@ -108,7 +108,7 @@ With no arguments, the startup folder is chosen by: **command-line argument > cu
 
 ### Opening files
 
-The folder in the sidebar is an **entry point**, not a boundary on what you are allowed to read. `Ctrl+Shift+O`, the toolbar `Open file` button and the `Open file` button on the welcome page all do the same thing: they open the system file picker (multi-select) and put the chosen files into tabs.
+The folder in the sidebar is an **entry point**, not a boundary on what you are allowed to read. `Ctrl+Shift+O` and the toolbar `Open file` button are the same thing: they open the system file picker (multi-select) and put the chosen files into tabs. That is the only place the entry lives — the welcome page and the empty sidebar offer a line of text instead of a second row of buttons.
 
 Opening a file that lives outside the workspace **leaves the workspace completely alone** — the tree still shows the same folder, the quick-open index is not rescanned, terminal panes keep their cwd, and not one existing tab is closed. If you want the neighbourhood too, that is a separate `Open folder` (`Ctrl+O`). The picker starts in the current workspace; with no workspace open it specifies nothing, so Windows remembers where it was last.
 

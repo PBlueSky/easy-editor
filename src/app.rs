@@ -3752,11 +3752,7 @@ impl EasyEditorApp {
                             }
                             PaneKind::Editor(None) => {
                                 let full = self.tabs.is_empty() && layout.panes.len() == 1;
-                                match pane_welcome(ui, full, hints, &hint) {
-                                    Welcome::Nothing => {}
-                                    Welcome::Folder => self.want_open_folder = true,
-                                    Welcome::File => self.want_open_files = true,
-                                }
+                                pane_welcome(ui, full, hints, &hint);
                             }
                             PaneKind::Terminal(t) => {
                                 self.terminal.ui_leaf(ui, t, font_size * 0.95, dark);
@@ -4916,16 +4912,11 @@ fn pane_desc(panes: &PaneTree<PaneKind>, layout: &TreeLayout) -> String {
     format!("PaneId({}) {kind} 左边缘x={x}", id.0)
 }
 
-/// 欢迎页上那两颗按钮各自要点哪个对话框。
-enum Welcome {
-    Nothing,
-    Folder,
-    File,
-}
-
 /// 空白面板的内容。`full` 是「整屏就这一块面板且一个文件都没开」，那种情况才显示欢迎页。
-/// 返回要点哪个对话框。
-fn pane_welcome(ui: &mut Ui, full: bool, hints: &str, hint: &dyn Fn(&str) -> String) -> Welcome {
+///
+/// 欢迎页只说「这是什么、怎么开始」，不摆按钮：`打开文件夹` / `打开文件` 顶栏已经有了，
+/// 这里再排一颗等于把同一件事画两遍。
+fn pane_welcome(ui: &mut Ui, full: bool, hints: &str, hint: &dyn Fn(&str) -> String) {
     if !full {
         ui.add_space(16.0);
         ui.vertical_centered(|ui| {
@@ -4938,9 +4929,8 @@ fn pane_welcome(ui: &mut Ui, full: bool, hints: &str, hint: &dyn Fn(&str) -> Str
                 .weak(),
             );
         });
-        return Welcome::Nothing;
+        return;
     }
-    let mut want = Welcome::Nothing;
     ui.vertical_centered(|ui| {
         ui.add_space(ui.available_height() * 0.22);
         ui.label(RichText::new("EasyEditor").size(crate::theme::display(ui)).strong());
@@ -4949,20 +4939,9 @@ fn pane_welcome(ui: &mut Ui, full: bool, hints: &str, hint: &dyn Fn(&str) -> Str
                 .size(crate::theme::md(ui))
                 .weak(),
         );
-        ui.add_space(14.0);
-        // 一排两颗：文件夹是「把这一片都给我」，文件是「我就要看这一个」。
-        ui.horizontal(|ui| {
-            if ui.button("打开文件夹").clicked() {
-                want = Welcome::Folder;
-            }
-            if ui.button("打开文件").clicked() {
-                want = Welcome::File;
-            }
-        });
         ui.add_space(18.0);
         ui.label(RichText::new(hints).size(crate::theme::sm(ui)).weak());
     });
-    want
 }
 
 /// 一批文案里最宽的那条有多长，照给定字号实量。
@@ -8272,11 +8251,13 @@ mod tests {
         std::fs::remove_dir_all(&other).unwrap();
     }
 
-    /// 欢迎页上「打开文件夹」和「打开文件」并排两颗。只留前者，想看单个文件的人
-    /// 就得先挑一个目录当工作区，而这正是「打开文件」要避免的副作用。
+    /// 「打开文件夹」「打开文件」各自只出现一次，就是顶栏那一颗。
+    ///
+    /// 欢迎页和侧栏空态以前都摆过同样一排按钮，等于把同一件事画两三遍；欢迎页那排更糟：
+    /// `vertical_centered` 里嵌 `horizontal` 不居中，两颗按钮直接贴到面板左边。
     #[test]
-    fn welcome_page_offers_both_open_entry_points() {
-        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-welcome-both", "a\n");
+    fn open_buttons_appear_only_in_the_toolbar() {
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-single-open-entry", "a\n");
         let count = |out: &egui::FullOutput, needle: &str| {
             texts(out)
                 .iter()
@@ -8284,15 +8265,35 @@ mod tests {
                 .count()
         };
 
-        // 一个标签都没开：顶栏一颗 + 欢迎页一颗
+        // 一个标签都没开：中央是欢迎页
         let out = frame(&mut app, &ctx, vec![]);
-        assert_eq!(count(&out, "打开文件"), 2, "欢迎页少了「打开文件」");
-        assert_eq!(count(&out, "打开文件夹"), 2, "欢迎页少了「打开文件夹」");
+        assert_eq!(count(&out, "打开文件"), 1, "欢迎页又摆了一颗「打开文件」");
+        assert_eq!(
+            count(&out, "打开文件夹"),
+            1,
+            "欢迎页又摆了一颗「打开文件夹」"
+        );
 
-        // 开了文件，欢迎页退场，只剩顶栏那颗
+        // 连工作区都没有：侧栏空态只给一句提示
+        app.root = None;
+        app.tree = None;
+        app.index.clear();
+        let out = frame(&mut app, &ctx, vec![]);
+        assert_eq!(count(&out, "打开文件"), 1, "侧栏空态又摆了一颗「打开文件」");
+        assert_eq!(
+            count(&out, "打开文件夹"),
+            1,
+            "侧栏空态又摆了一颗「打开文件夹」"
+        );
+        assert!(
+            texts(&out).iter().any(|t| t.contains("尚未打开文件夹")),
+            "侧栏空态那句去哪儿开的提示也得留着"
+        );
+
+        // 开了文件以后仍然只有顶栏那一颗
         app.open_file(dir.join("a.txt"), None);
         let out = frame(&mut app, &ctx, vec![]);
-        assert_eq!(count(&out, "打开文件"), 1, "有文件开着还在画欢迎页那颗");
+        assert_eq!(count(&out, "打开文件"), 1);
         assert_eq!(count(&out, "打开文件夹"), 1);
     }
 
