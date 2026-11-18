@@ -1101,7 +1101,12 @@ fn header(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
 
 fn body(ui: &mut Ui, panel: &mut Panel) {
     if matches!(&panel.slot, Slot::Done(one) if one.is_query()) {
-        grid(ui, panel, 120.0);
+        // 列表高度跟着这一格剩下的空间走，不钉死在一个数上：底栏拖到多高就能一次看
+        // 多少行。以前写死 120 pt，把底栏拉高一截，多出来的地方全空着，
+        // 而那份结果明明还有十几行在滚动条后面。
+        // 留 12 pt 是给这一格自己的横向滚动条的，不留就两个人抢最后一行高。
+        let height = (ui.available_height() - 12.0).max(80.0);
+        grid(ui, panel, height);
         return;
     }
     match &panel.slot {
@@ -1138,7 +1143,8 @@ fn body(ui: &mut Ui, panel: &mut Panel) {
 }
 
 /// 结果网格。`height` 是这块最多能占到多高，超出行数走它自己的滚动条：
-/// 底部那一格给 120，放大窗口给整屏。列比这一格还宽时走外面那根横向滚动条。
+/// 底部那一格拿当下剩下的空间（结果区拖多高就看多少行），放大窗口给整屏。
+/// 列比这一格还宽时走外面那根横向滚动条。
 ///
 /// 每格都是截断显示，装不下的那一截有两条路看全：双击格子把这一格单独弹出来
 /// （见 [`draw_cell_peek`]），行首 ▸ 在屏幕右边单独开一个窗口看整行
@@ -1610,11 +1616,20 @@ mod tests {
         events: Vec<egui::Event>,
         time: f64,
     ) -> egui::FullOutput {
+        show_pass_at(dock, ctx, events, time, egui::vec2(900.0, 620.0))
+    }
+
+    /// 上面那个的「给结果区多高说得上话」版：结果列表要跟着这一格的高度走，
+    /// 只能拿两格不同高的屏幕量才知道它到底跟没跟。
+    fn show_pass_at(
+        dock: &mut ResultsDock,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        time: f64,
+        screen: egui::Vec2,
+    ) -> egui::FullOutput {
         let raw = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(900.0, 620.0),
-            )),
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
             time: Some(time),
             events,
             ..Default::default()
@@ -1648,6 +1663,35 @@ mod tests {
         let mut v = Vec::new();
         for group in &out.shapes {
             walk_text(&group.shape, &mut v);
+        }
+        v
+    }
+
+    /// 看得见的那几行：文字落在自己那块裁剪区里面才算数。
+    ///
+    /// `seen()` 只看 shape 在不在——egui 对完全裁掉的文字照样留一条 shape，
+    /// 于是「列表只铺了六行、剩下的都在裁剪区外」在它眼里和四十行都在屏上一模一样。
+    /// 要数这一格到底装了几行，只能连 clip 一起量。
+    fn visible(out: &egui::FullOutput) -> Vec<String> {
+        fn walk(shape: &egui::Shape, clip: egui::Rect, v: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let rect = text.galley.rect.translate(text.pos.to_vec2());
+                    if clip.intersects(rect) {
+                        v.push(text.galley.job.text.clone());
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for s in shapes {
+                        walk(s, clip, v);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut v = Vec::new();
+        for group in &out.shapes {
+            walk(&group.shape, group.clip_rect, &mut v);
         }
         v
     }
@@ -2353,6 +2397,36 @@ mod tests {
         assert!(
             lefts.windows(2).all(|w| w[1] - w[0] > 1.0),
             "页签互相压着或者叠在同一格：{lefts:?}"
+        );
+    }
+
+    /// 结果列表的高度跟着结果区那一格走，不钉死在 120 pt 上。
+    ///
+    /// 同一份四十行的结果，底栏给 240 和给 620 该摊开不一样的行数。以前写死一个数，
+    /// 把结果区拖到多高都只亮那一小截，多出来的地方整块空着，其余的行排在
+    /// 列表自己的滚动条后面——那根滚动条本来该是没地方去时才用上的。
+    #[test]
+    fn the_grid_takes_the_height_it_is_given() {
+        let mut dock = ResultsDock::new();
+        dock.start_run("本机", "查用户", &parts(&["SELECT name FROM t"]), None);
+        let rows = (0..40)
+            .map(|n| vec![Cell::Text(format!("行 {n}"))])
+            .collect();
+        dock.on_event(&event(1, Ok(DbOutcome::Statement(table(&["name"], rows)))));
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let lined_up =
+            |out: &egui::FullOutput| visible(out).iter().filter(|t| t.starts_with("行 ")).count();
+        let thin = show_pass_at(&mut dock, &ctx, vec![], 1.0, egui::vec2(900.0, 240.0));
+        let tall = show_pass_at(&mut dock, &ctx, vec![], 2.0, egui::vec2(900.0, 620.0));
+        let (short, long) = (lined_up(&thin), lined_up(&tall));
+        assert!(short >= 2, "240 那一格连两行都没摊开：{short}");
+        // 620 那一格扣掉抬头、页签栏、面板标题这些，剩下的全是列表的：四十行里
+        // 该看得见大半（量下来是 22 行），而不是像以前那样只亮 120 pt 那六行。
+        assert!(
+            long >= short * 2 && long >= 18,
+            "结果区高了一倍半，列表还是只亮那么几行：矮的 {short} 行 / 高的 {long} 行"
         );
     }
 
