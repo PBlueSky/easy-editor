@@ -14,7 +14,7 @@
 //! 「同一条 Split 对应同一条分隔线」这种跨帧关系就没法断言，也没法在测试里比对。
 //! 需要 `egui::Id` 的地方自己 `Id::new(("pane", id.0))` 派生即可。
 
-use eframe::egui::{pos2, Rect};
+use eframe::egui::{pos2, Pos2, Rect};
 
 /// 面板身份。在一棵树的整个生命周期内唯一且稳定。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -86,6 +86,34 @@ impl TreeLayout {
     pub fn pane_rect(&self, id: PaneId) -> Option<Rect> {
         self.panes.iter().find(|p| p.id == id).map(|p| p.rect)
     }
+
+    /// 命中测试：这个点落在哪块面板上。
+    pub fn pane_at(&self, point: Pos2) -> Option<PaneId> {
+        self.panes
+            .iter()
+            .find(|p| p.rect.contains(point))
+            .map(|p| p.id)
+    }
+
+    /// 最靠某个方向边缘的那块面板，`skip` 那块不算。
+    ///
+    /// [`PaneTree::move_to_edge`] 用它定落点，`skip` 就是正在被搬走的那块：把它自己
+    /// 当成落点等于原地打转。上下堆叠的两块面板左右边缘一模一样，所以这一条不是
+    /// 边界情况而是常态——两块一样大时 `max_by` 取最后一个，正好能挑到被搬的那块。
+    /// 那一刻手上有的只有这一帧算好的矩形，没有树。
+    pub fn edge_pane(&self, dir: Dir, skip: PaneId) -> Option<PaneId> {
+        let key = |r: Rect| match dir {
+            Dir::Right => r.max.x,
+            Dir::Left => -r.min.x,
+            Dir::Up => -r.min.y,
+            Dir::Down => r.max.y,
+        };
+        self.panes
+            .iter()
+            .filter(|p| p.id != skip)
+            .max_by(|a, b| key(a.rect).total_cmp(&key(b.rect)))
+            .map(|p| p.id)
+    }
 }
 
 /// 分隔线热区宽度（左右、上下共用）。
@@ -96,6 +124,52 @@ const MIN_RATIO: f32 = 0.05;
 
 /// 方向键找邻居时允许的边界重叠容差：两块面板紧贴时浮点上会差一点点。
 const GAP_TOLERANCE: f32 = 1.0;
+
+/// 从 `cur` 这块矩形往 `dir` 看，挑一块最近的面板。
+///
+/// 主轴上必须在 `dir` 那一侧，副轴偏移越小越优先，其次才是主轴间距。`skip` 是「自己」，
+/// 按几何找邻居时不能把自己当成邻居。
+fn pick_dir(panes: &[PaneRect], skip: PaneId, cur: Rect, dir: Dir) -> Option<PaneId> {
+    let mut best: Option<(f32, f32, PaneId)> = None;
+    for pane in panes {
+        if pane.id == skip {
+            continue;
+        }
+        let other = pane.rect;
+        let (gap, cross) = match dir {
+            Dir::Right => (
+                other.min.x - cur.max.x,
+                (other.center().y - cur.center().y).abs(),
+            ),
+            Dir::Left => (
+                cur.min.x - other.max.x,
+                (other.center().y - cur.center().y).abs(),
+            ),
+            Dir::Down => (
+                other.min.y - cur.max.y,
+                (other.center().x - cur.center().x).abs(),
+            ),
+            Dir::Up => (
+                cur.min.y - other.max.y,
+                (other.center().x - cur.center().x).abs(),
+            ),
+        };
+        if gap < -GAP_TOLERANCE {
+            continue;
+        }
+        let better = match best {
+            None => true,
+            Some((best_cross, best_gap, _)) => {
+                cross < best_cross - GAP_TOLERANCE
+                    || ((cross - best_cross).abs() <= GAP_TOLERANCE && gap < best_gap)
+            }
+        };
+        if better {
+            best = Some((cross, gap, pane.id));
+        }
+    }
+    best.map(|(_, _, id)| id)
+}
 
 impl<T> Default for PaneTree<T> {
     fn default() -> Self {
@@ -244,51 +318,44 @@ impl<T> PaneTree<T> {
     pub fn focus_dir(&mut self, layout: &TreeLayout, dir: Dir) -> Option<PaneId> {
         let cur_id = self.focus?;
         let cur = layout.pane_rect(cur_id)?;
-        let mut best: Option<(f32, f32, PaneId)> = None;
-        for pane in &layout.panes {
-            if pane.id == cur_id {
-                continue;
-            }
-            let other = pane.rect;
-            // 主轴上必须在 `dir` 那一侧，副轴偏移越小越优先
-            let (gap, cross) = match dir {
-                Dir::Right => (
-                    other.min.x - cur.max.x,
-                    (other.center().y - cur.center().y).abs(),
-                ),
-                Dir::Left => (
-                    cur.min.x - other.max.x,
-                    (other.center().y - cur.center().y).abs(),
-                ),
-                Dir::Down => (
-                    other.min.y - cur.max.y,
-                    (other.center().x - cur.center().x).abs(),
-                ),
-                Dir::Up => (
-                    cur.min.y - other.max.y,
-                    (other.center().x - cur.center().x).abs(),
-                ),
-            };
-            if gap < -GAP_TOLERANCE {
-                continue;
-            }
-            let better = match best {
-                None => true,
-                Some((best_cross, best_gap, _)) => {
-                    cross < best_cross - GAP_TOLERANCE
-                        || ((cross - best_cross).abs() <= GAP_TOLERANCE && gap < best_gap)
-                }
-            };
-            if better {
-                best = Some((cross, gap, pane.id));
-            }
-        }
-        let id = match best {
-            Some((_, _, id)) => id,
-            None => return Some(cur_id),
+        let Some(id) = pick_dir(&layout.panes, cur_id, cur, dir) else {
+            return Some(cur_id);
         };
         self.focus = Some(id);
         Some(id)
+    }
+
+    /// 把一块面板移到最靠某个方向的边缘。
+    ///
+    /// 先把它从树里摘下来（父 Split 自动收起），再把负载切到边缘面板的对应一侧。
+    /// `split` 总是把新面板排在后面，要落到左侧/上方时再交换一次负载。
+    /// 需要 [`PaneTree::layout`] 的结果来定「哪一格最靠边」。
+    pub fn move_to_edge(&mut self, layout: &TreeLayout, id: PaneId, dir: Dir) -> Option<PaneId>
+    where
+        T: Clone,
+    {
+        if self.count() < 2 || !self.contains(id) {
+            return None;
+        }
+        let payload = self.payload_of(id).cloned()?;
+        let target = layout.edge_pane(dir, id)?;
+        self.remove(id)?;
+        let axis = match dir {
+            Dir::Left | Dir::Right => Axis::Horizontal,
+            Dir::Up | Dir::Down => Axis::Vertical,
+        };
+        let new_id = self.split(target, axis, payload)?;
+        if matches!(dir, Dir::Left | Dir::Up) {
+            // 拆出来的面板排在右侧/下方，交换负载就能让它落到左侧/上方
+            let a = self.payload_of(target).cloned();
+            let b = self.payload_of(new_id).cloned();
+            if let (Some(a), Some(b)) = (a, b) {
+                *self.payload_of_mut(target)? = b;
+                *self.payload_of_mut(new_id)? = a;
+            }
+        }
+        self.set_focus(new_id);
+        Some(new_id)
     }
 
     /// 算出每块面板的矩形和每条分隔线的位置。

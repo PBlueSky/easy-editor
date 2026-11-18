@@ -506,6 +506,9 @@ pub struct Terminal {
     pub title: String,
     /// 这个终端实际使用的 shell
     pub shell: Shell,
+    /// 起进程时所在的目录。shell 里再 `cd` 我们跟踪不到，同一扇窗口里再切一格时
+    /// 照这个目录起新进程，用户预期就是「旁边那格和我在同一个地方」。
+    pub cwd: PathBuf,
     term: Term<Listener>,
     processor: Processor,
     writer: Box<dyn Write + Send>,
@@ -586,6 +589,7 @@ impl Terminal {
         Ok(Self {
             id,
             title: shell.label(),
+            cwd: cwd.to_path_buf(),
             shell,
             term,
             processor: Processor::new(),
@@ -1447,13 +1451,8 @@ impl TerminalPanel {
             base
         })
     }
-    /// 起一个新终端，返回它的 id。
-    pub fn create(&mut self) -> Result<u64, String> {
-        let cwd = self.cwd.clone();
-        self.create_at(&cwd)
-    }
 
-    /// 在指定目录里起一块终端（文件树右键「在此处打开终端」）。
+    /// 在指定目录里起一块终端（新建终端窗口、同窗口再切一格）。
     pub fn create_at(&mut self, cwd: &Path) -> Result<u64, String> {
         let id = self.next_id;
         self.next_id += 1;
@@ -1862,7 +1861,8 @@ mod tests {
     fn pty_terminal_publishes_ime_anchor_and_routes_commit() {
         let mut panel = TerminalPanel::new(std::env::temp_dir(), TerminalSettings::default());
         panel.shell = Shell::Builtin(ShellKind::Cmd);
-        let term_id = panel.create().unwrap();
+        let cwd = panel.cwd.clone();
+        let term_id = panel.create_at(&cwd).unwrap();
         let wait = |ms: u64| std::thread::sleep(std::time::Duration::from_millis(ms));
 
         let ctx = egui::Context::default();
