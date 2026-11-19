@@ -5219,6 +5219,8 @@ impl eframe::App for EasyEditorApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // 防抖可能还没来得及落盘，退出时补一次
         self.config.save_now();
+        // 后台 shell 不会因为窗口关了自己退出，得挨个收掉（含它们起的子进程）
+        self.terminal.kill_all();
     }
 }
 

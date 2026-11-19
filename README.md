@@ -340,6 +340,8 @@ Inside one tab nothing is lost: it has its own pane tree, so splitting, divider 
 
 A terminal tab that is not in front keeps running: the PTY stays up, output keeps landing in its scrollback, and flipping back shows everything that arrived in the meantime. A shell only ends when you close its cell or its group.
 
+Closing really does end it. The shell's own children are torn down with it (deepest first), so nothing keeps a port or a file handle open behind a tab that is no longer there, and quitting the app sweeps whatever shells are still open.
+
 The `shell:` dropdown in the toolbar picks *which shell the next terminal uses*, auto-detecting PowerShell 7 / Windows PowerShell / cmd / Git Bash / WSL on your machine plus any custom entry you added in settings; already-open terminals are unaffected.
 
 When a terminal has focus, `Tab` (completion), the arrow keys (history / cursor movement) and `Esc` are handled by the terminal itself and are not stolen by egui to move widget focus. After selecting text with the mouse:
@@ -559,7 +561,7 @@ Everything is immediate-mode GUI: no QSS, no CSS, no webview. Widget state lives
 
 ## Code layout
 
-About 26,600 lines of Rust in a single binary crate, 23 source files:
+About 26,900 lines of Rust in a single binary crate, 24 source files:
 
 | File | Responsibility |
 |---|---|
@@ -568,6 +570,7 @@ About 26,600 lines of Rust in a single binary crate, 23 source files:
 | `src/pane.rs` | tmux-style recursive binary pane tree (`Leaf` / `Split`); layout only, no content. One instance for the editor, one per terminal tab |
 | `src/editor.rs` | The editor widget: line numbers + highlighting + editing + jumping + read-only virtual rendering for large files + overlay painting |
 | `src/terminal.rs` | PTY I/O, VT parsing, keyboard/mouse routing, selection and scrollbar |
+| `src/procs.rs` | Process-tree cleanup: a Toolhelp32 snapshot finds what a shell spawned and terminates it deepest-first (closing a cell, a tab, or the app) |
 | `src/filetree.rs` | Directory tree, lazy loading, file search, type colours, tab-label disambiguation |
 | `src/find.rs` | Find/replace within the current file (match positions are byte offsets) |
 | `src/search.rs` | Project-wide search: ripgrep first, built-in scanner as the fallback |
@@ -593,7 +596,7 @@ About 26,600 lines of Rust in a single binary crate, 23 source files:
 
 ```bash
 cargo check                             # type checking only, fastest
-cargo test                              # 235 unit tests
+cargo test                              # 312 unit tests
 cargo build                             # debug build → target/debug/easy-editor.exe
 cargo build --release                   # release build → target/release/easy-editor.exe
 cargo clippy --all-targets              # requires rustup component add clippy
@@ -602,11 +605,11 @@ cargo fmt --check                       # requires rustup component add rustfmt
 
 Release builds use `windows_subsystem = "windows"` (first line of `src/main.rs`), so double-clicking the exe does not spawn a console.
 
-Tests cover the pane tree, keybinding parsing, journal and SQL block parsing, statement splitting, the database protocol and results dock, CSV quoting, formatting, title bar colours, icon composition, terminal scrolling and selection, highlight background alignment, edge auto-scroll, IME anchors and more. A batch of them are **headless UI tests**: they feed a constructed sequence of input events through `Context::run_pass` and inspect the resulting layers and `PlatformOutput`. No window is ever opened, so the whole suite runs unattended in one go. Everything database-related is tested against a `MockDriver`, so `cargo test` needs no MySQL server.
+Tests cover the pane tree, keybinding parsing, journal and SQL block parsing, statement splitting, the database protocol and results dock, CSV quoting, formatting, title bar colours, icon composition, terminal scrolling and selection, highlight background alignment, edge auto-scroll, IME anchors, the order a process tree is harvested and more. A batch of them are **headless UI tests**: they feed a constructed sequence of input events through `Context::run_pass` and inspect the resulting layers and `PlatformOutput`. No window is ever opened, so the whole suite runs unattended in one go. Everything database-related is tested against a `MockDriver`, so `cargo test` needs no MySQL server.
 
 ```bash
 cargo test --bin easy-editor            # this is a binary crate, there is no lib target
-cargo test -- --ignored --nocapture     # one end-to-end terminal test that really spawns a cmd.exe PTY
+cargo test -- --ignored --nocapture     # two tests that really spawn processes: a cmd.exe PTY, and a cmd grandchild that must die
 ```
 
 ### Release packages
@@ -722,6 +725,10 @@ The minimize / maximize / close row is drawn by the Windows DWM, which egui does
 Cramming terminals next to the code meant every terminal pane was paid for out of the editing area, and glancing at output cost a slice of the screen. The version before this one went the other way — Windows Terminal style, one shell per OS window — and that turned out to be worse in practice: a row of identically-named windows on the taskbar that you tell apart by reading titles, and the trick only pays off if you actually have a second monitor to throw one at. Tabs are the browser answer: a terminal takes one slot in the strip that already holds the files, `` Ctrl+` `` flips the centre area over to it and back, and the group inside a tab splits as much as you like. Only one side is ever on screen, so neither has to give up room.
 
 Flipping a tab to the back does not stop the shell: PTY, scrollback and selection all live in `TerminalPanel`, and `pump()` drains *every* terminal rather than only the visible one (a background shell whose output piles up in an unbounded channel is both a memory leak and a stale screen when you return). A shell ends only when you close its cell or its whole group.
+
+Ending one, though, had two holes. `Child::kill()` only calls `TerminateProcess` on the shell itself — the `vim`, `node` or half-finished build it spawned carry on holding ports and file handles after the tab is gone. So `Terminal::kill()` first walks the process tree through a Toolhelp32 snapshot (`src/procs.rs`) and terminates it **deepest first**, so a parent cannot respawn what you just killed, then hands the root to portable-pty. The second hole was `on_exit`: closing the window quit the app and left every shell behind, orphaned.
+
+A job object (one shell per job, `TerminateJobObject` on close, dissolved automatically when the app exits) is the tidier design and was not chosen: attaching requires `CREATE_SUSPENDED` and a hand on the child before it resumes, and portable-pty's builder exposes only program path, arguments, environment and window size — no hook for creation flags, which means bypassing it and rebuilding the spawn path. Rewriting PTY startup to save a few dozen lines is not worth it when the snapshot walk has to exist on Windows anyway.
 
 Each tab owns one `PaneTree`, so a group's split layout travels with the tab and survives a trip through the file tabs. The one thing that needs care across trees: the editor tree and a terminal tree both number their `PaneId`s from 1, and egui keys widget state to ids — so `draw_grid` mixes the scope (`PaneScope::Main` / `Term(tab id)`) into every persistent id. Without that salt, switching tabs would carry focus and scroll position from one group into another.
 

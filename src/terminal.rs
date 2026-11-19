@@ -631,7 +631,14 @@ impl Terminal {
     /// 只把 `Terminal` drop 掉是不够的：`Box<dyn Child>` 的析构不会杀进程，
     /// 阅读器线程会因为 `Receiver` 一起被 drop 而退出，于是留下一个
     /// 没有终端可连的孤儿 shell。
+    ///
+    /// `child.kill()` 又只杀 shell 自己：它在里面起的 `vim`、`node`、跑一半的构建
+    /// 命令会接着占端口和文件句柄。所以先把整棵子进程树从深往浅收掉，
+    /// 最后再杀 shell（见 `crate::procs`）。
     fn kill(&mut self) {
+        if let Some(pid) = self.child.process_id() {
+            crate::procs::kill_descendants(pid);
+        }
         let _ = self.child.kill();
     }
 
@@ -1468,6 +1475,18 @@ impl TerminalPanel {
         };
         self.terms[at].kill();
         self.terms.remove(at);
+    }
+
+    /// 退出应用时把所有页签里的 shell（连它们起的子进程）一起收掉。
+    ///
+    /// 关窗口不会顺手关子进程：`EasyEditorApp` 一死，`Terminal` 只是被 drop，
+    /// 底下那些 cmd / bash 会留在系统里继续跑。切走的页签也在这一步一起收——
+    /// 页签间切换时留着 shell 是为了不中断跑一半的活，应用都不在了就没必要留了。
+    pub fn kill_all(&mut self) {
+        for term in &mut self.terms {
+            term.kill();
+        }
+        self.terms.clear();
     }
 
     /// 每帧把所有终端的 PTY 输出读进屏幕模型，不管这块面板有没有被画到。

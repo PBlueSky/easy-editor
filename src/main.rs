@@ -17,6 +17,7 @@ mod journal;
 mod keymap;
 mod nav;
 mod pane;
+mod procs;
 mod results;
 mod search;
 #[allow(dead_code)]

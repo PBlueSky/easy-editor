@@ -338,6 +338,8 @@ LIMIT 50;
 
 终端页签退到后面时 PTY 一直在跑、滚动区一个字不少，切回来还是那些输出；要真结束一条 shell 得显式关掉那一格或那一组。
 
+关掉的 shell 是**真的结束**，不是藏起来：先顺着进程树把它自己起的子进程从最深一层往上收掉（`vim`、`node`、正在跑的构建），再收 shell 本身——只杀 shell 的话孙进程会继续占着端口和文件句柄。退出应用时（窗口直接关掉）也会把所有页签里的 shell 挨个收一遍，不会留下没人管的孤儿进程。
+
 顶部工具栏的 `shell:` 下拉框选的是「下一个新建终端用哪个 shell」，列表里是自动探测到的本机 PowerShell 7 / Windows PowerShell / 命令提示符 / Git Bash / WSL，再加上你在设置里自己加的几条；已经开着的终端不受影响。
 
 终端有焦点时，`Tab`（补全）、方向键（历史 / 光标移动）、`Esc` 都由终端自己处理，不会被 egui 拿去切换控件焦点。鼠标拖选文字后：
@@ -559,7 +561,7 @@ Windows 上启动时会把自己登记成能打开 `.txt` 的程序，于是两�
 
 ## 代码结构
 
-约 26600 行 Rust，单个 binary crate，23 个源文件：
+约 26900 行 Rust，单个 binary crate，24 个源文件：
 
 | 文件 | 职责 |
 |---|---|
@@ -568,6 +570,7 @@ Windows 上启动时会把自己登记成能打开 `.txt` 的程序，于是两�
 | `src/pane.rs` | tmux 风格的递归二分面板树（`Leaf` / `Split`），只管布局不管内容；编辑区一棵、每个终端页签一棵 |
 | `src/editor.rs` | 编辑器控件：行号 + 高亮 + 编辑 + 跳转 + 大文件只读虚拟渲染 + 覆盖层绘制 |
 | `src/terminal.rs` | PTY 读写、VT 解析、键盘鼠标事件路由、选区与滚动条 |
+| `src/procs.rs` | 进程树回收：用 Toolhelp32 快照找出某条 shell 起的子孙进程，最深优先挨个终止（关格子、关页签、退出应用时都走这里） |
 | `src/filetree.rs` | 目录树、懒加载、文件搜索、类型配色、标签同名时的父目录消歧 |
 | `src/find.rs` | 当前文件内查找替换（匹配位置统一用字节偏移） |
 | `src/search.rs` | 全局搜索：ripgrep 优先，内置扫描兜底 |
@@ -593,7 +596,7 @@ Windows 上启动时会把自己登记成能打开 `.txt` 的程序，于是两�
 
 ```bash
 cargo check                             # 只做类型检查，最快
-cargo test                              # 235 个单元测试
+cargo test                              # 312 个单元测试
 cargo build                             # 调试构建 → target/debug/easy-editor.exe
 cargo build --release                   # 发布构建 → target/release/easy-editor.exe
 cargo clippy --all-targets              # 需要 rustup component add clippy
@@ -602,11 +605,11 @@ cargo fmt --check                       # 需要 rustup component add rustfmt
 
 发布构建走 `windows_subsystem = "windows"`（见 `src/main.rs` 首行），双击运行不带控制台窗口。
 
-测试覆盖面板树、快捷键解析、日志块与 SQL 块解析、语句拆分、数据库协议与结果区、CSV 转义、格式化、标题栏配色、图标构图、终端滚动与选区、高亮底色对齐、边缘自动横向滚动、输入法锚点等。其中一批是**无头界面测试**：用 `Context::run_pass` 喂构造好的输入事件序列，检查产出的图层和 `PlatformOutput`，不需要真的开一个窗口，所以在没人盯着的机器上也能一次跑完。数据库相关的都对着 `MockDriver` 测，`cargo test` 不需要一台 MySQL。
+测试覆盖面板树、快捷键解析、日志块与 SQL 块解析、语句拆分、数据库协议与结果区、CSV 转义、格式化、标题栏配色、图标构图、终端滚动与选区、高亮底色对齐、边缘自动横向滚动、输入法锚点、进程树回收的取值顺序等。其中一批是**无头界面测试**：用 `Context::run_pass` 喂构造好的输入事件序列，检查产出的图层和 `PlatformOutput`，不需要真的开一个窗口，所以在没人盯着的机器上也能一次跑完。数据库相关的都对着 `MockDriver` 测，`cargo test` 不需要一台 MySQL。
 
 ```bash
 cargo test --bin easy-editor            # 这是个 binary crate，没有 lib target
-cargo test -- --ignored --nocapture     # 附带一个真起 cmd.exe PTY 的终端端到端测试
+cargo test -- --ignored --nocapture     # 两条会真起进程：PTY 端到端 + cmd 的孙进程确实被收掉
 ```
 
 ### 打发布包
@@ -722,6 +725,10 @@ Windows 上按一次键，egui-winit 往事件队列里塞两个事件：`Event:
 把终端和代码挤在同一块面板树里，屏幕就那么宽，切出去看一眼输出就得牺牲一块编辑区。上一版试的是 Windows Terminal 那样「一条 shell 一扇操作系统窗口」，用下来不合适：任务栏里一排同名窗口要靠标题认，副屏不在手边时反而更挤。这版改成浏览器式——终端在页签条上占一格，和文件页签并排，`` Ctrl+` `` 一下从编辑区翻到终端、再一下翻回来；一个页签里面还能继续切分，每格一条独立 PTY。一次只显示一边，两块地方都不必给对面让位。
 
 页签翻到后面时 shell 不退出：PTY、滚动区、选区都留在 `TerminalPanel` 里，输出照常收进来（`pump()` 是遍历所有终端的，不是只喂看得见的那块），翻回来还是那些内容——跑一半的活被切走就断，是不能接受的。真正的结束只有两种：关掉那一格，或者关掉整个页签。
+
+「结束」得真把进程收干净，这里原来有两个洞。一是 `Child::kill()` 只对 shell 自己 `TerminateProcess`，它在里面起的 `vim`、`node`、跑一半的构建一个都不动——页签是没了，端口和文件句柄还占着；现在 `Terminal::kill()` 先用 `src/procs.rs` 顺着 Toolhelp32 快照把这棵进程树**从最深一层往上**收（先杀孙，父进程才不会顺手把它复活），再交给 portable-pty 杀根。二是直接关掉窗口退出应用时，`on_exit` 什么都没做，留下的是一整套没人管的 shell。
+
+没走 job object（一条 shell 挂一个 job，关格时 `TerminateJobObject`，退出时随本进程自动解散）。道理上它更省事，但挂 job 要在 `CreateProcess` 时带 `CREATE_SUSPENDED`，把子进程塞进 job 再放行——portable-pty 的 builder 只给了程序路径、参数、环境和窗口大小，没有传 flag 的口子，只能绕开它自己拼一套 spawn。为了少写几十行去重写 PTY 启动链路不值，何况快照杀树这活儿在 Windows 上本来就躲不掉，就只留一条路。
 
 一个页签一棵 `PaneTree`，格子划分跟着页签走，切去别的页签再回来还是那个划分。树和树之间只有一处要注意：编辑树和终端树的 `PaneId` 各数各的、都从 1 开始，而 egui 的控件状态是按 id 存的，所以画网格时把作用域（`PaneScope::Main` / `Term(页签 id)`）一并编进持久化 id——不加这层盐，切页签时焦点和滚动位置会串到隔壁那组去。
 
