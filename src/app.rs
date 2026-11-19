@@ -8783,29 +8783,32 @@ mod tests {
         );
     }
 
-    /// 行首的 ▸ 不再往表格里塞一块明细：那块收不回去，还老被表格自己的裁剪切掉。
-    /// 现在改成在屏幕右边单独开一个窗口：点别处自己收，钉住就一直开着。
+    /// 整行详情不再有行首那个 ▸：点这一行的任意一格就把它开在屏幕右边。
+    /// 那块明细从前塞在表格里，收不回去还老被表格自己的裁剪切掉。
     #[test]
-    fn the_row_arrow_opens_a_detail_window_on_the_right() {
+    fn a_plain_click_opens_a_detail_window_on_the_right() {
         let (ctx, mut app, _dir) = app_on_sql_block("ee_sql_expand");
         app.sql_run_block();
         settle_results(&mut app, &ctx);
+        // 结果区那两格写的也是「1」「2」，编辑器那一栏的行号同样是，右边那扇详情里
+        // 也有：只看屏幕左半边、且最靠下的那一个，那才是结果区里的行号格。
+        let low = |out: &egui::FullOutput, needle: &str| {
+            seen(out)
+                .into_iter()
+                .filter(|(t, r)| t == needle && r.center().x < SCREEN.x / 2.0)
+                .map(|(_, r)| r.center())
+                .max_by(|a, b| a.y.total_cmp(&b.y))
+                .unwrap_or_else(|| panic!("结果区里没有「{needle}」"))
+        };
         let out = frame(&mut app, &ctx, vec![]);
-        // 表格每行行首那个 ▸（页签栏和标题行都没有这一串）
-        let mut arrows = seen(&out)
-            .into_iter()
-            .filter(|(t, _)| t == "▸")
-            .map(|(_, r)| r.center())
-            .collect::<Vec<_>>();
-        assert_eq!(arrows.len(), 2, "当前那页两行，就该两个 ▸：{arrows:?}");
-        arrows.sort_by(|a, b| a.y.total_cmp(&b.y));
-        tap(&mut app, &ctx, arrows[0]);
+        // 点第一行「行0」那一格——▸ 撤了以后，这一格就是这一行的入口
+        click_first(&mut app, &ctx, &out, "行0");
 
         let shown = seen(&frame(&mut app, &ctx, vec![]));
         let title = shown.iter().find(|(t, _)| t == "详情 · 第 1 行");
         let Some((_, rect)) = title else {
             panic!(
-                "行首 ▸ 没把详情窗口开出来：{:?}",
+                "点一格没把详情窗口开出来：{:?}",
                 shown.iter().map(|(t, _)| t).collect::<Vec<_>>()
             );
         };
@@ -8824,7 +8827,7 @@ mod tests {
             "窗口里没带拷贝整行那一条：{words:?}"
         );
 
-        // 看完不必回去点那个 ▸：窗口外面随便一下——这里点页签栏——就把它收掉
+        // 看完不必回去找那个 ▸：窗口外面随便一下——这里点页签栏——就把它收掉
         let out = frame(&mut app, &ctx, vec![]);
         click_first(&mut app, &ctx, &out, "1·SELECT id FROM a");
         let shown = texts(&frame(&mut app, &ctx, vec![]));
@@ -8834,7 +8837,13 @@ mod tests {
         );
 
         // 钉住的那一份不吃这一下：对着两列长值来回比的时候，点哪儿都不该散
-        tap(&mut app, &ctx, arrows[0]);
+        let out = frame(&mut app, &ctx, vec![]);
+        tap(&mut app, &ctx, low(&out, "1"));
+        let shown = texts(&frame(&mut app, &ctx, vec![]));
+        assert!(
+            shown.iter().any(|t| t == "详情 · 第 1 行"),
+            "点行号那一格也是点这一行，详情该跟着开：{shown:?}"
+        );
         let out = frame(&mut app, &ctx, vec![]);
         click_first(&mut app, &ctx, &out, "钉住");
         assert!(
@@ -8849,12 +8858,21 @@ mod tests {
             "钉住了还被点外面收走：{shown:?}"
         );
 
-        // 同一个 ▸ 再点一下照样能手动收掉（没钉住时是 toggling，钉住后也得收）
-        tap(&mut app, &ctx, arrows[0]);
+        // 再点这一行照样能手动收掉。这里点的是行号那一格：窗口开着的时候
+        // 「行0」那串字在窗口里也有一份，点下去就先落到窗口上了
+        let out = frame(&mut app, &ctx, vec![]);
+        tap(&mut app, &ctx, low(&out, "1"));
+        let shown = texts(&frame(&mut app, &ctx, vec![]));
+        assert!(
+            shown.iter().any(|t| t == "详情 · 第 1 行"),
+            "钉住之后点这一行，详情该重新跟着这一行开：{shown:?}"
+        );
+        let out = frame(&mut app, &ctx, vec![]);
+        tap(&mut app, &ctx, low(&out, "1"));
         let shown = texts(&frame(&mut app, &ctx, vec![]));
         assert!(
             !shown.iter().any(|t| t.starts_with("详情 · ")),
-            "再点同一个 ▸ 没收掉详情：{shown:?}"
+            "再点同一行没收掉详情：{shown:?}"
         );
     }
 

@@ -102,7 +102,7 @@ impl Panel {
 }
 
 /// 单独查看整行的详情。
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Detail {
     pub row: usize,
     /// 按下那一帧的光标位置：窗口固定在屏幕右侧，纵向跟着这一下走，之后归用户拖
@@ -416,7 +416,7 @@ impl ResultsDock {
             };
             ui.label(RichText::new(head).small().strong());
             ui.label(weak(
-                "点页签换一份 · 右键页签一次关一批 · 双击格子看全文 · 点行号选整行 · 右键一格复制或导 SQL",
+                "点页签换一份 · 右键页签一次关一批 · 点一格选整行（右边开详情）· 双击看全文 · 右键一格复制或导 SQL",
             ));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if crate::theme::chip(ui, "关闭")
@@ -1203,13 +1203,18 @@ fn body(ui: &mut Ui, panel: &mut Panel, skip_auto: &mut bool) {
     }
 }
 
+/// 数据格上的悬浮文案：点这一下管选行，双击管把这一格的完整内容单独开一扇。
+const CELL_CLICK_TIP: &str = "点一下选中这一行（Ctrl+点 加减一行，Shift+点 连成一段）\n\
+                              双击把这一格完整内容单独开一个窗口\n";
+
 /// 结果网格。`height` 是这块最多能占到多高，超出行数走它自己的滚动条：
 /// 底部那一格拿当下剩下的空间（结果区拖多高就看多少行），放大窗口给整屏。
 /// 列比这一格还宽时走外面那根横向滚动条。
 ///
 /// 每格都是截断显示，装不下的那一截有两条路看全：双击格子把这一格单独弹出来
-/// （见 [`draw_cell_peek`]），行首 ▸ 在屏幕右边单独开一个窗口看整行
-/// （见 [`draw_row_detail`]）。点行号选行——裸点一行、Ctrl+点 加减一行、Shift+点 一段，
+/// （见 [`draw_cell_peek`]），裸点这一行在屏幕右边单独开一个窗口看整行
+/// （见 [`draw_row_detail`]）。点行和点格子是同一件事——裸点一行、Ctrl+点 加减一行、
+/// Shift+点 一段，行号那一格照旧点得到，以前挂在行首那个 ▸ 已经没了。
 /// 右键任意一格把这一行（或选中的那几行）复制成文本、导出成 SQL。
 /// 点表格以外的地方自动收掉选中，所以没有「取消选中」那一个按钮。
 ///
@@ -1265,8 +1270,8 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32, skip_auto: &mut bool) {
                 .min_scrolled_height(0.0)
                 .max_scroll_height(height)
                 .cell_layout(Layout::left_to_right(Align::Center))
-                // 行号那一格够摆「▸ + 三四位」，数据那格先给 20 个字宽
-                .column(Column::initial(6.0 * ch).at_least(4.5 * ch).clip(true))
+                // 行号那一格只够摆三四位数字（▸ 撤了以后跟着收窄），数据那格先给 20 个字宽
+                .column(Column::initial(4.5 * ch).at_least(3.0 * ch).clip(true))
                 .columns(
                     Column::initial(20.0 * ch)
                         .at_least(8.0 * ch)
@@ -1277,7 +1282,15 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32, skip_auto: &mut bool) {
             table
                 .header(row_h, |mut header| {
                     header.col(|ui| {
-                        ui.label(RichText::new("#").monospace().strong());
+                        ui.add(
+                            egui::Label::new(RichText::new("#").monospace().strong())
+                                .selectable(false)
+                                .sense(egui::Sense::hover()),
+                        )
+                        .on_hover_text(
+                            "行号那一列和每一格都一样能点：点一下选中整行，Ctrl+点 加减一行，\n\
+                             Shift+点 连成一段，双击那一格看它完整的内容",
+                        );
                     });
                     for col in &one.columns {
                         let name = col.name.clone();
@@ -1301,32 +1314,6 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32, skip_auto: &mut bool) {
                         // 也正因为这样，点下去那一帧不改亮哪一行，下一帧才跟上。
                         row.set_selected(selected.contains(&index));
                         row.col(|ui| {
-                            let opened = detail.is_some_and(|d| d.row == index);
-                            let arrow = if opened { "▾" } else { "▸" };
-                            let resp = ui.add(
-                                egui::Label::new(RichText::new(arrow).small().weak())
-                                    .selectable(false)
-                                    .sense(egui::Sense::click()),
-                            );
-                            let at = resp
-                                .interact_pointer_pos()
-                                .unwrap_or_else(|| resp.rect.center());
-                            if resp
-                                .on_hover_cursor(crate::theme::HAND)
-                                .on_hover_text("在右边单独开一个窗口看这一行")
-                                .clicked()
-                            {
-                                // 钉住的那份换行时保持钉住：对着几行来回看正是钉的理由。
-                                // JSON 那一面同理——连着核几行，不该每行重按一次。
-                                let pin = detail.is_some_and(|d| d.pinned);
-                                let json = detail.is_some_and(|d| d.json);
-                                *detail = (!opened).then_some(Detail {
-                                    row: index,
-                                    at,
-                                    pinned: pin,
-                                    json,
-                                });
-                            }
                             let mut num = RichText::new(format!("{}", index + 1)).small();
                             num = if selected.contains(&index) {
                                 num.strong()
@@ -1338,6 +1325,9 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32, skip_auto: &mut bool) {
                                     .selectable(false)
                                     .sense(egui::Sense::click()),
                             );
+                            let at = resp
+                                .interact_pointer_pos()
+                                .unwrap_or_else(|| resp.rect.center());
                             if resp
                                 .on_hover_cursor(crate::theme::HAND)
                                 .on_hover_text(
@@ -1345,7 +1335,8 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32, skip_auto: &mut bool) {
                                 )
                                 .clicked()
                             {
-                                pick(selected, anchor, index, ui.input(|i| i.modifiers));
+                                let mods = ui.input(|i| i.modifiers);
+                                pick(selected, anchor, index, at, mods, detail);
                             }
                         });
                         for (col_index, cell) in one.rows[index].iter().enumerate() {
@@ -1356,9 +1347,19 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32, skip_auto: &mut bool) {
                                 rt = rt.weak().italics();
                             }
                             row.col(|ui| {
-                                let resp = ui
-                                    .add(egui::Label::new(rt).truncate().selectable(true))
-                                    .on_hover_cursor(egui::CursorIcon::Text);
+                                // 整格都是点选这一行的热区：标签照旧管自己的文字选中，
+                                // 格子那一块矩形再单独登记一次点击。两者叠在同一处，
+                                // egui 只把拖拽判给更靠里的那一个，所以拖选词照样好使。
+                                let cell_rect = ui
+                                    .horizontal(|ui| {
+                                        ui.put(
+                                            ui.max_rect(),
+                                            egui::Label::new(rt).truncate().selectable(true),
+                                        )
+                                        .on_hover_cursor(egui::CursorIcon::Text)
+                                        .rect
+                                    })
+                                    .inner;
                                 // 只有真被列宽裁掉的格子才给悬浮，短值多弹一个框反而碍事。
                                 // 表格只给可见行跑这段，量一行的宽度不贵。
                                 let full = ui
@@ -1366,21 +1367,46 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32, skip_auto: &mut bool) {
                                     .layout_no_wrap(text.clone(), mono.clone(), Color32::WHITE)
                                     .size()
                                     .x;
-                                let resp = if full <= resp.rect.width() - 6.0 {
-                                    resp
+                                let tip = if full <= cell_rect.width() - 6.0 {
+                                    CELL_CLICK_TIP.to_string()
                                 } else {
-                                    resp.on_hover_text(hover_preview(&text))
+                                    format!("{CELL_CLICK_TIP}{}", hover_preview(&text))
                                 };
+                                let resp = ui
+                                    .interact(
+                                        cell_rect,
+                                        // `make_persistent_id` 而不是 `Id::unique`：每帧要认同
+                                        // 一个号，不然这一格的 hovered/clicked 记不到地方上。
+                                        // 底部面板和放大窗口那两份结果各有各的 `Ui`，那号本身
+                                        // 就把两边分开，再按行列号分格。
+                                        ui.make_persistent_id(("db_pick_cell", index, col_index)),
+                                        egui::Sense::click(),
+                                    )
+                                    .on_hover_cursor(crate::theme::HAND)
+                                    .on_hover_text(tip);
                                 let at = resp
                                     .interact_pointer_pos()
-                                    .unwrap_or_else(|| resp.rect.right_bottom());
+                                    .unwrap_or_else(|| cell_rect.right_bottom());
                                 if resp.double_clicked() {
+                                    // 双击的第二下只开单格那一扇，选中的那条路不走：
+                                    // 第一下已经把这一行选上了，第二下再走一遍会被认成
+                                    // 「再点已经在的这一行 = 取消选中」，双击反倒把行选没了。
                                     *peek = Some(Peek {
                                         row: index,
                                         col: col_index,
                                         at,
                                         pinned: peek.is_some_and(|p| p.pinned),
                                     });
+                                    // 这一扇一开，右边那扇整行详情就让位：同一格里
+                                    // 摆两份一样的内容没意思。它认的「点了别处」在这儿
+                                    // 帮不上忙——第二下的落点和第一下分毫不差，
+                                    // 正撞在那条「开窗口那一下不算点别处」的豁免里。
+                                    *detail = None;
+                                } else if resp.clicked() {
+                                    // 点哪一格都算点这一行：裸点那一下顺带在右边开这一行的详情，
+                                    // 带 Ctrl/Shift 的那几下只攒选中、不换窗口。
+                                    let mods = ui.input(|i| i.modifiers);
+                                    pick(selected, anchor, index, at, mods, detail);
                                 }
                                 // egui 的右键菜单默认「点一下就关」，那个「去掉自动生成列」的勾
                                 // 因此会把菜单抖掉，下一次导出得重新右键。改成只认菜单外的那一下：
@@ -1528,40 +1554,62 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32, skip_auto: &mut bool) {
     }
 }
 
-/// 点行号以后选中的是哪几行、Shift 的起点落在哪一行。
+/// 点一行以后选中的是哪几行、Shift 的起点落在哪一行、右边那扇详情开不开。
 ///
 /// 三种点法各管一件事：裸点重设（再点一次同一行等于取消），Ctrl+点 加减一行，
 /// Shift+点 从起点连到这一行。连着按 Shift 只换终点、起点不动，这才是表格软件里
 /// 框一段的手感；起点是最近一次不带 Shift 的那一下。
+///
+/// 只有裸点那一下顺带把这一行送到右边那扇详情窗口（`at` 是点下去的位置，窗口的
+/// 纵向跟着它走）；带 Ctrl/Shift 的那几下是在攒一批行准备批量导出，窗口跟着每次
+/// 点的位置跳反倒看不清选中了谁，所以那两下改成把详情收掉。
+///
+/// 双击不走这一条：调用方把第二下留给自己开单格那一扇，第一下该选中还是选中。
+/// 不然第二下会当成「再点一次同一行」，双击反倒把刚选中的行又取消了。
 fn pick(
     selected: &mut Vec<usize>,
     anchor: &mut Option<usize>,
     index: usize,
+    at: egui::Pos2,
     mods: egui::Modifiers,
+    detail: &mut Option<Detail>,
 ) {
-    if mods.shift {
-        let from = anchor.unwrap_or(index);
-        let (lo, hi) = (from.min(index), from.max(index));
-        *selected = (lo..=hi).collect();
-    } else if mods.command || mods.ctrl {
+    if mods.shift || mods.command || mods.ctrl {
         // 和 keymap 那条判定一样认两样：Windows/Linux 上 eframe 两个都置位，
         // 测试里手写的 `Modifiers::CTRL` 只有 ctrl 那一份
-        match selected.iter().position(|r| *r == index) {
-            Some(at) => {
-                selected.remove(at);
+        if mods.shift {
+            let from = anchor.unwrap_or(index);
+            let (lo, hi) = (from.min(index), from.max(index));
+            *selected = (lo..=hi).collect();
+        } else {
+            match selected.iter().position(|r| *r == index) {
+                Some(hit) => {
+                    selected.remove(hit);
+                }
+                None => {
+                    selected.push(index);
+                    selected.sort_unstable();
+                }
             }
-            None => {
-                selected.push(index);
-                selected.sort_unstable();
-            }
+            *anchor = Some(index);
         }
-        *anchor = Some(index);
+        *detail = None;
     } else if selected.as_slice() == [index] {
+        // 再点一次已经单独选中的那行等于取消，详情跟着收
         selected.clear();
         *anchor = None;
+        *detail = None;
     } else {
         *selected = vec![index];
         *anchor = Some(index);
+        // 钉住的那份换行时保持钉住：对着几行来回看正是钉的理由。
+        // JSON 那一面同理——连着核几行，不该每行重按一次。
+        *detail = Some(Detail {
+            row: index,
+            at,
+            pinned: detail.is_some_and(|d| d.pinned),
+            json: detail.is_some_and(|d| d.json),
+        });
     }
 }
 
@@ -1605,11 +1653,31 @@ fn export_menu(
         .on_hover_text(format!(
             "把{head}拼成一条 INSERT INTO {table}（列名照结果里的顺序），拷进剪贴板。\n\
              数值列裸写、文本列带引号、NULL 就是 NULL、二进制列走 0x…。\n\
-             多行合成一条语句：VALUES 后面一行一组，一次提交。{off}",
+             多行合成一条语句：VALUES 后面一行一组，一次提交。\n\
+             要一行一条的写法用下面那条。{off}",
         ))
         .clicked()
     {
         ui.ctx().copy_text(insert_sql(table, columns, rows, skip_auto));
+        ui.close();
+    }
+    // 一条一组那种在某一列出错时整批都进不去；分行那种能逐条提交、哪条报错一眼看出来。
+    // 只有一行时两种拼法一字不差，所以那一行不开这一条。
+    if rows.len() > 1
+        && ui
+            .button(format!("导出{head} 每行一条 INSERT"))
+            .on_hover_cursor(crate::theme::HAND)
+            .on_hover_text(format!(
+                "把{head}各拼成一条独立的 INSERT INTO {table}，一条一行，拷进剪贴板。\n\
+                 列名和值跟上面那条完全一样，只是拆成 {n} 条、一次一条。\n\
+                 哪一行撞了约束就停在哪一条，前面的照旧进去——一批一条那种是一整条\
+                 语句，一列出错整批都进不去。{off}",
+                n = rows.len(),
+            ))
+            .clicked()
+    {
+        ui.ctx()
+            .copy_text(insert_sql_per_row(table, columns, rows, skip_auto));
         ui.close();
     }
     if ui
@@ -1833,7 +1901,8 @@ fn table_of(stmt: &str) -> Option<String> {
 /// 选中的几行拼成一条 INSERT：列名和值都按结果里的列顺序。
 ///
 /// 多行合成一条语句（`VALUES` 后一行一组），不摆几条 `INSERT` 并排——一次提交，
-/// 单行时拼出来的和以前一个字不差。
+/// 单行时拼出来的和以前一个字不差。要每条一行那种写法看
+/// [`insert_sql_per_row`]，菜单里是另一条。
 ///
 /// `skip_auto` 是右键菜单里那个勾：数据库自己填的那些列（自增）不进列名表，
 /// 值那一组也跟着少一个。全都自增时无列可写，`INSERT INTO t () VALUES ()` 不是合法
@@ -1845,23 +1914,57 @@ fn insert_sql(
     skip_auto: bool,
 ) -> String {
     let keep = kept_columns(columns, skip_auto);
-    let names: Vec<String> = keep.iter().map(|(_, col)| sql_ident(&col.name)).collect();
     let groups: Vec<String> = rows
         .iter()
-        .map(|row| {
-            let values: Vec<String> = keep
-                .iter()
-                .map(|(at, col)| sql_literal(&row[*at], &col.type_name))
-                .collect();
-            format!("({})", values.join(", "))
-        })
+        .map(|row| format!("({})", insert_values(row, &keep)))
         .collect();
     format!(
         "INSERT INTO {} ({}) VALUES {};\n",
         sql_ident(table),
-        names.join(", "),
+        insert_names(&keep),
         groups.join(",\n")
     )
+}
+
+/// 选中的几行各拼成一条独立的 INSERT，一条一行。
+///
+/// 列名、值、那个勾的作用范围都和 [`insert_sql`] 一个字不差，只是拆成 N 条：
+/// 一批一条那种是一整条语句，某一列撞了唯一键就整批进不去；拆开能逐条提交，
+/// 报错停在哪一条看得见。单行时两种拼法出来的文本一样，所以菜单里那一行不开这一条。
+fn insert_sql_per_row(
+    table: &str,
+    columns: &[crate::db::Column],
+    rows: &[&[Cell]],
+    skip_auto: bool,
+) -> String {
+    let keep = kept_columns(columns, skip_auto);
+    let names = insert_names(&keep);
+    rows.iter()
+        .map(|row| {
+            format!(
+                "INSERT INTO {} ({}) VALUES ({});\n",
+                sql_ident(table),
+                names,
+                insert_values(row, &keep)
+            )
+        })
+        .collect()
+}
+
+/// 两种 INSERT 共用的列名表：`(`a`, `b`)` 里那一段。
+fn insert_names(keep: &[(usize, &crate::db::Column)]) -> String {
+    keep.iter()
+        .map(|(_, col)| sql_ident(&col.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// 两种 INSERT 共用的一行值：`(1, '甲')` 里那一段。按下标取值，`skip_auto` 挑掉的列不参与。
+fn insert_values(row: &[Cell], keep: &[(usize, &crate::db::Column)]) -> String {
+    keep.iter()
+        .map(|(at, col)| sql_literal(&row[*at], &col.type_name))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// 选中的几行拼成 UPDATE，一行一条。
@@ -2444,18 +2547,23 @@ mod tests {
 
     /// 整行选中时一格一格铺出来的选中底色有几块。
     fn lit(out: &egui::FullOutput, want: Color32) -> usize {
-        fn walk(shape: &egui::Shape, want: Color32, n: &mut usize) {
+        lit_rects(out, want).len()
+    }
+
+    /// 上面那个的「亮的那几块都在哪儿」版：数出来不对时得知道多出来的是哪一块。
+    fn lit_rects(out: &egui::FullOutput, want: Color32) -> Vec<egui::Rect> {
+        fn walk(shape: &egui::Shape, want: Color32, v: &mut Vec<egui::Rect>) {
             match shape {
-                egui::Shape::Rect(r) if r.fill == want => *n += 1,
-                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, want, n)),
+                egui::Shape::Rect(r) if r.fill == want => v.push(r.rect),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, want, v)),
                 _ => {}
             }
         }
-        let mut n = 0;
+        let mut v = Vec::new();
         for group in &out.shapes {
-            walk(&group.shape, want, &mut n);
+            walk(&group.shape, want, &mut v);
         }
-        n
+        v
     }
 
     fn copied(out: &egui::FullOutput) -> Vec<String> {
@@ -2604,6 +2712,97 @@ mod tests {
         );
     }
 
+    /// ▸ 撤掉以后，网格里到处都能点：任意一格都是「这一行」的热区。
+    /// 攒一批（Ctrl+点）和连一段（Shift+点）那两下只动选中，不动右边那扇详情。
+    #[test]
+    fn clicking_any_cell_picks_the_row_it_is_in() {
+        let mut dock = ResultsDock::new();
+        dock.start_run("本机", "查用户", &parts(&["SELECT note FROM t"]), None);
+        let one = table(
+            &["note"],
+            vec![
+                vec![Cell::Text("甲".into())],
+                vec![Cell::Text("乙".into())],
+                vec![Cell::Text("丙".into())],
+            ],
+        );
+        dock.on_event(&event(1, Ok(DbOutcome::Statement(one))));
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let mark = egui::Style::default().visuals.selection.bg_fill;
+        let out = show_pass(&mut dock, &ctx, vec![], 0.0);
+        let b = spot(&out, "乙").expect("第二行那格没画出来");
+        let c = spot(&out, "丙").expect("第三行那格没画出来");
+        assert_eq!(
+            spot(&out, "▸"),
+            None,
+            "行首那个 ▸ 该整个没了，行号那一格也腾不出它"
+        );
+
+        click(&mut dock, &ctx, b, 1.0);
+        let out = show_pass(&mut dock, &ctx, vec![], 1.3);
+        assert!(
+            lit(&out, mark) >= 2,
+            "点数据格没把整行点亮：{}",
+            lit_rects(&out, mark).len()
+        );
+        assert_eq!(
+            dock.panels[0].detail.map(|d| d.row),
+            Some(1),
+            "裸点一格该顺带开这一行的详情——▸ 撤了以后它是唯一入口"
+        );
+        assert_eq!(dock.panels[0].selected, [1], "点的是第二行那一格");
+
+        // 攒一批：选中多一行，详情别跟着每次点跳
+        click_mod(&mut dock, &ctx, c, 2.0, egui::Modifiers::CTRL);
+        let out = show_pass(&mut dock, &ctx, vec![], 2.3);
+        assert_eq!(dock.panels[0].selected, [1, 2], "Ctrl+点 该再加一行");
+        assert_eq!(dock.panels[0].detail, None, "Ctrl+点 在攒一批，详情别开");
+        let shown = texts(&out);
+        assert!(
+            shown.iter().any(|t| t.contains("已选中 2 行")),
+            "攒了两行抬头没报：{shown:?}"
+        );
+
+        // 从起点连一段：终点在第二行，起点是刚才 Ctrl+点的第三行
+        click_mod(&mut dock, &ctx, b, 3.0, egui::Modifiers::SHIFT);
+        assert_eq!(dock.panels[0].selected, [1, 2], "Shift+点 从起点连过来");
+        assert_eq!(dock.panels[0].detail, None, "Shift+点 也是在攒一批");
+    }
+
+    /// 双击归单格：只把那一格的完整内容开成一扇，整行详情不该跟着凑热闹。
+    /// 双击的第一下会顺带选中那一行（那是它本来就该干的事），第二下开出单格那扇、
+    /// 同时把整行那扇收掉，选中照旧留着。
+    #[test]
+    fn a_double_click_belongs_to_the_cell_not_the_row() {
+        let mut dock = ResultsDock::new();
+        let long = "备注".repeat(60);
+        dock.start_run("本机", "查备注", &parts(&["SELECT note FROM t"]), None);
+        let one = table(
+            &["note"],
+            vec![
+                vec![Cell::Text(long.clone())],
+                vec![Cell::Text("乙".into())],
+            ],
+        );
+        dock.on_event(&event(1, Ok(DbOutcome::Statement(one))));
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        assert!(
+            double_click(&mut dock, &ctx, &long),
+            "长值那一格没画出来，双击无从下手"
+        );
+        assert_eq!(
+            dock.panels[0].peek.map(|p| (p.row, p.col)),
+            Some((0, 0)),
+            "双击该开这一格那扇"
+        );
+        assert_eq!(dock.panels[0].selected, [0], "双击的第一下顺带选中了这一行");
+        assert_eq!(dock.panels[0].detail, None, "双击该归单格，整行详情别一起开着");
+    }
+
     /// 右键一格里就有这两个导出：表名从这条语句里认，认出来才给那两条，
     /// 拼好的 SQL 直接进剪贴板——存盘框那一套得先把「拷一段」这条路挤掉，不值。
     #[test]
@@ -2644,6 +2843,10 @@ mod tests {
             !shown.iter().any(|t| t.starts_with("导出选中")),
             "只选了一行，菜单里不该摆批量那两条：{shown:?}"
         );
+        assert!(
+            !shown.iter().any(|t| t.contains("每行一条")),
+            "只有一行时两种拼法一字不差，别摆两条一样的：{shown:?}"
+        );
         let at = spot(&out, "导出这一行 INSERT").expect("右键菜单里没有「导出这一行 INSERT」");
         let out = click(&mut dock, &ctx, at, 2.5);
         assert_eq!(
@@ -2667,36 +2870,62 @@ mod tests {
     }
 
     /// 三种点法各管一件事，全在 `pick` 这一处判，别散到格子的 closures 里。
+    /// 详情那扇也跟着这一处判：只有裸点那一下开，攒一批的那几下不开。
     #[test]
     fn picking_rows_follows_the_three_click_modes() {
         let mut sel = Vec::new();
         let mut anchor = None;
+        let mut detail = None;
+        let at = egui::pos2(40.0, 20.0);
         let none = egui::Modifiers::NONE;
         let ctrl = egui::Modifiers::CTRL;
         let shift = egui::Modifiers::SHIFT;
 
-        pick(&mut sel, &mut anchor, 3, none);
+        pick(&mut sel, &mut anchor, 3, at, none, &mut detail);
         assert_eq!(sel, [3], "裸点只留这一行");
         assert_eq!(anchor, Some(3), "起点跟着裸点走");
-        pick(&mut sel, &mut anchor, 3, none);
+        assert_eq!(
+            detail.map(|d| (d.row, d.at)),
+            Some((3, at)),
+            "裸点顺带把这一行送到右边那扇详情（▸ 撤了以后它是唯一入口）"
+        );
+        pick(&mut sel, &mut anchor, 3, at, none, &mut detail);
         assert!(sel.is_empty(), "再点同一行等于取消");
         assert_eq!(anchor, None, "取消了就不留起点");
+        assert!(detail.is_none(), "取消选中，详情跟着收");
 
-        pick(&mut sel, &mut anchor, 6, ctrl);
-        pick(&mut sel, &mut anchor, 1, ctrl);
+        pick(&mut sel, &mut anchor, 6, at, ctrl, &mut detail);
+        assert_eq!(detail, None, "Ctrl+点 在攒一批，详情别跟着每次点跳");
+        pick(&mut sel, &mut anchor, 1, at, ctrl, &mut detail);
         assert_eq!(sel, [1, 6], "Ctrl+点 加行，行号排升序");
-        pick(&mut sel, &mut anchor, 6, ctrl);
+        pick(&mut sel, &mut anchor, 6, at, ctrl, &mut detail);
         assert_eq!(sel, [1], "Ctrl+点 已有的那行是摘掉，不是再塞一份");
 
-        pick(&mut sel, &mut anchor, 6, none);
-        pick(&mut sel, &mut anchor, 2, shift);
+        pick(&mut sel, &mut anchor, 6, at, none, &mut detail);
+        pick(&mut sel, &mut anchor, 2, at, shift, &mut detail);
         assert_eq!(sel, [2, 3, 4, 5, 6], "Shift+点 从起点连到终点");
         assert_eq!(anchor, Some(6), "Shift 不动起点");
-        pick(&mut sel, &mut anchor, 8, shift);
+        assert_eq!(detail, None, "Shift+点 也是在攒一批");
+        pick(&mut sel, &mut anchor, 8, at, shift, &mut detail);
         assert_eq!(sel, [6, 7, 8], "连着按 Shift 只换终点，起点还在 6");
+
+        // 钉住和 JSON 那一面是「连着核几行」时按下的，换一行不该重按一次
+        detail = Some(Detail {
+            row: 1,
+            at,
+            pinned: true,
+            json: true,
+        });
+        pick(&mut sel, &mut anchor, 5, at, none, &mut detail);
+        assert_eq!(
+            detail.map(|d| (d.row, d.pinned, d.json)),
+            Some((5, true, true)),
+            "换行只换内容，钉住和 JSON 那两面跟着留下"
+        );
     }
 
-    /// 选中多行后右键：这一行和整批各摆一组导出。INSERT 合成一条、UPDATE 一行一条。
+    /// 选中多行后右键：这一行和整批各摆一组导出。批量 INSERT 给两种拼法
+    /// （合成一条 / 每行一条），UPDATE 只有一行一条那种。
     #[test]
     fn several_selected_rows_export_together() {
         let mut dock = ResultsDock::new();
@@ -2750,6 +2979,7 @@ mod tests {
             "导出这一行 INSERT",
             "导出这一行 UPDATE",
             "导出选中 2 行 INSERT",
+            "导出选中 2 行 每行一条 INSERT",
             "导出选中 2 行 UPDATE",
             "复制选中 2 行",
         ] {
@@ -2758,6 +2988,10 @@ mod tests {
                 "选了也右键了，菜单里却没有「{want}」：{shown:?}"
             );
         }
+        assert!(
+            !shown.iter().any(|t| t == "导出这一行 每行一条 INSERT"),
+            "「这一行」只有一行，两种拼法一字不差，那条不开：{shown:?}"
+        );
 
         let at = spot(&out, "导出选中 2 行 INSERT").expect("菜单里没找到批量 INSERT");
         let out = click(&mut dock, &ctx, at, 3.0);
@@ -2767,6 +3001,21 @@ mod tests {
                 "INSERT INTO `users` (`id`, `note`) VALUES (8, '乙'),\n(10, '丁');\n".to_string()
             ],
             "两行合成一条语句，VALUES 一行一组"
+        );
+
+        // 同一份选中换一种拼法：列名和值一个字不改，只是拆成两条各提交各的
+        let out = right_click(&mut dock, &ctx, cell, 3.2);
+        let at = spot(&out, "导出选中 2 行 每行一条 INSERT")
+            .expect("菜单里没找到每行一条那种批量 INSERT");
+        let out = click(&mut dock, &ctx, at, 3.4);
+        assert_eq!(
+            copied(&out),
+            vec![
+                "INSERT INTO `users` (`id`, `note`) VALUES (8, '乙');\n\
+                 INSERT INTO `users` (`id`, `note`) VALUES (10, '丁');\n"
+                    .to_string()
+            ],
+            "两行各一条独立的 INSERT"
         );
 
         let out = right_click(&mut dock, &ctx, cell, 3.5);
@@ -2884,8 +3133,15 @@ mod tests {
         assert!(lit(&out, mark) >= 2, "这一下先选中一行");
 
         // 表格底下那一截空白：两行结果，620 高的屏上剩下的都是它
-        let out = click(&mut dock, &ctx, egui::pos2(300.0, 560.0), 2.0);
+        click(&mut dock, &ctx, egui::pos2(300.0, 560.0), 2.0);
+        // 选中的底色在这一帧就没了；右边那扇详情是「点了别处」自己收的，那一条记在
+        // 画完之后的收尾里，所以量稳定态要多看一帧。
+        let out = show_pass(&mut dock, &ctx, vec![], 2.4);
         assert_eq!(lit(&out, mark), 0, "点了旁边的空白却还亮着");
+        assert!(
+            dock.panels[0].detail.is_none(),
+            "选中都收掉了，右边那扇详情还留着"
+        );
         let shown = texts(&out);
         assert!(
             !shown.iter().any(|t| t.contains("已选中第 2 行")),
@@ -2924,8 +3180,8 @@ mod tests {
         });
         let id = egui::Id::unique(("db_row_detail", 1u64));
         let out = show_pass(&mut dock, &ctx, vec![], 0.0);
-        let arrow = spot(&out, "▸").expect("没有 ▸");
-        click(&mut dock, &ctx, arrow, 1.0);
+        let row1 = spot(&out, "1").expect("第一行的行号没画出来");
+        click(&mut dock, &ctx, row1, 1.0);
 
         let first = ctx
             .memory(|m| m.area_rect(id))
@@ -3020,9 +3276,11 @@ mod tests {
         assert_eq!(spot(&out, "导出这一行 UPDATE"), None);
     }
 
-    /// 行首的 ▸ 开的是右边那个独立窗口，不往表格里塞块——塞进去那块收不回去。
+    /// ▸ 撤掉以后，详情那扇窗只有一个入口：裸点一行。这里点的是数据格，
+    /// 顺带把「点整行的任意一格都算点这一行」也量住。窗口开在屏幕右边，
+    /// 不往表格里塞块——塞进去那块收不回去。
     #[test]
-    fn the_row_arrow_opens_a_detail_window_and_closes_it_again() {
+    fn a_plain_click_opens_a_detail_window_and_closes_it_again() {
         let mut dock = ResultsDock::new();
         dock.start_run("本机", "查用户", &parts(&["SELECT * FROM t"]), None);
         let one = table(
@@ -3037,13 +3295,13 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.set_pixels_per_point(1.0);
         let out = show_pass(&mut dock, &ctx, vec![], 0.0);
-        let arrow = seen(&out)
+        let cell = seen(&out)
             .into_iter()
-            .find(|(t, _)| t == "▸")
+            .find(|(t, _)| t == "甲")
             .map(|(_, rect)| rect.center())
-            .expect("行首那个 ▸ 没画出来");
+            .expect("第一行那一格没画出来");
 
-        click(&mut dock, &ctx, arrow, 1.0);
+        click(&mut dock, &ctx, cell, 1.0);
         let mut out = show_pass(&mut dock, &ctx, vec![], 1.2);
         // 新开的窗口头几帧只在量尺寸、摆位置，尺寸落定才轮到画内容
         for step in [1.25, 1.3] {
@@ -3052,11 +3310,15 @@ mod tests {
         let shown = texts(&out);
         assert!(
             shown.iter().any(|t| t == "详情 · 第 1 行"),
-            "点 ▸ 没把详情窗口开出来：{shown:?}"
+            "点这一格没把详情窗口开出来：{shown:?}"
         );
         assert!(
             shown.iter().any(|t| t == "note =") && shown.iter().any(|t| t == "很长的一段备注"),
             "详情窗口里没摊开「列名 = 完整值」：{shown:?}"
+        );
+        assert!(
+            shown.iter().any(|t| t.contains("已选中第 1 行")),
+            "点一格连整行一起选中：{shown:?}"
         );
         // 详情在屏幕右边，不会把表格本身盖住
         let title = seen(&out)
@@ -3070,14 +3332,13 @@ mod tests {
             title.center().x
         );
 
-        // 收窗口点的是同一个位置：行首那个字换成了 ▾，但按字去找会先撞到面板
-        // 标题上那枚同字的折叠钮，把整块收起来。格子没动过，坐标直接复用。
-        click(&mut dock, &ctx, arrow, 2.0);
+        // 收窗口点的是同一格：再点一次那行等于取消选中，详情跟着收
+        click(&mut dock, &ctx, cell, 2.0);
         let out = show_pass(&mut dock, &ctx, vec![], 2.2);
         let shown = texts(&out);
         assert!(
             !shown.iter().any(|t| t.starts_with("详情 · ")),
-            "再点一次 ▾ 没把窗口收掉：{shown:?}"
+            "再点一次同一行没把窗口收掉：{shown:?}"
         );
         assert!(
             dock.panels[0].detail.is_none(),
@@ -3102,8 +3363,8 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.set_pixels_per_point(1.0);
         let out = show_pass(&mut dock, &ctx, vec![], 0.0);
-        let arrow = spot(&out, "▸").expect("行首那个 ▸ 没画出来");
-        click(&mut dock, &ctx, arrow, 1.0);
+        let row1 = spot(&out, "1").expect("第一行的行号没画出来");
+        click(&mut dock, &ctx, row1, 1.0);
         let mut out = show_pass(&mut dock, &ctx, vec![], 1.2);
         for step in [1.25, 1.3] {
             out = show_pass(&mut dock, &ctx, vec![], step);
@@ -3179,8 +3440,8 @@ mod tests {
             let ctx = egui::Context::default();
             ctx.set_pixels_per_point(1.0);
             let out = show_pass(&mut dock, &ctx, vec![], 0.0);
-            let arrow = spot(&out, "▸").expect("行首那个 ▸ 没画出来");
-            click(&mut dock, &ctx, arrow, 1.0);
+            let row1 = spot(&out, "1").expect("第一行的行号没画出来");
+            click(&mut dock, &ctx, row1, 1.0);
 
             // 1.25 是能量到外框的第一帧：窗口开出来的头几帧只在量尺寸、摆位置
             let heights: Vec<f32> = [1.25, 1.3, 1.35, 1.4, 1.5, 1.7, 2.0]
@@ -3927,6 +4188,49 @@ mod tests {
             insert_sql("users", &cols, &[row.as_slice()], false),
             "INSERT INTO `users` (`id`, `name`, `note`, `pic`) VALUES (7, 'O\\'Brien', NULL, 0x0dff);\n",
             "数值裸写、文本带引号、NULL 就是 NULL、二进制走 0x…"
+        );
+    }
+
+    /// 「每行一条 INSERT」：列名、值、那个勾的作用范围都和合成一条那一版一字不差，
+    /// 只是拆成 N 条。拆开的意义在提交那一头——一整条语句某一列撞了唯一键整批进不去，
+    /// 分行那种报错停在哪一条看得见。
+    #[test]
+    fn per_row_insert_writes_one_statement_per_row() {
+        let cols = typed(&[("id", "LONGLONG"), ("note", "VAR_STRING")]);
+        let rows = [
+            vec![Cell::Text("7".into()), Cell::Text("甲".into())],
+            vec![Cell::Text("8".into()), Cell::Null],
+            vec![Cell::Text("9".into()), Cell::Text("O'Brien".into())],
+        ];
+        let refs: Vec<&[Cell]> = rows.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            insert_sql_per_row("users", &cols, &refs, false),
+            "INSERT INTO `users` (`id`, `note`) VALUES (7, '甲');\n\
+             INSERT INTO `users` (`id`, `note`) VALUES (8, NULL);\n\
+             INSERT INTO `users` (`id`, `note`) VALUES (9, 'O\\'Brien');\n",
+            "一条一行，每条都自带完整的 INSERT INTO 和列名"
+        );
+        assert_eq!(
+            insert_sql("users", &cols, &refs, false),
+            "INSERT INTO `users` (`id`, `note`) VALUES (7, '甲'),\n(8, NULL),\n(9, 'O\\'Brien');\n",
+            "同一批行合成一条：VALUES 后面一行一组"
+        );
+
+        // 只有一行时两种拼法一字不差——菜单里那一行因此不开这一条
+        let one_row: [&[Cell]; 1] = [refs[1]];
+        assert_eq!(
+            insert_sql("users", &cols, &one_row, false),
+            insert_sql_per_row("users", &cols, &one_row, false),
+            "一行时两种拼法该是同一份文本"
+        );
+
+        let auto = auto_incremented(&[("id", "LONGLONG"), ("note", "VAR_STRING")], &["id"]);
+        assert_eq!(
+            insert_sql_per_row("users", &auto, &refs, true),
+            "INSERT INTO `users` (`note`) VALUES ('甲');\n\
+             INSERT INTO `users` (`note`) VALUES (NULL);\n\
+             INSERT INTO `users` (`note`) VALUES ('O\\'Brien');\n",
+            "勾了「去掉自动生成列」，两种拼法都该少同一列"
         );
     }
 
