@@ -107,6 +107,9 @@ pub struct Detail {
     /// 认这一份而不是全局开关：详情窗口是跟着面板走的，一个面板钉住不该影响
     /// 另一个面板新开的详情。
     pub pinned: bool,
+    /// 详情窗口这一面摆的是 JSON 而不是逐列表单。换行时留着：
+    /// 连着核几行 JSON 正是常见走法，每行都要重按一次就成负担了。
+    pub json: bool,
 }
 
 /// 单独查看某一格。
@@ -592,17 +595,11 @@ fn draw_row_detail(panel: &mut Panel, ctx: &egui::Context) {
     };
     // 列名和值先抄成自己拥有的：对 panel.slot 的借读不能跨过整个窗口，
     // 窗口没了还要写回 panel.detail。
-    let fields: Vec<(String, String)> = match &panel.slot {
+    let fields: Vec<Field> = match &panel.slot {
         Slot::Done(one) => one
             .rows
             .get(detail.row)
-            .map(|row| {
-                one.columns
-                    .iter()
-                    .zip(row.iter())
-                    .map(|(col, cell)| (col.name.clone(), cell.display().to_string()))
-                    .collect()
-            })
+            .map(|row| row_fields(&one.columns, row))
             .unwrap_or_default(),
         _ => Vec::new(),
     };
@@ -617,6 +614,8 @@ fn draw_row_detail(panel: &mut Panel, ctx: &egui::Context) {
         screen.min.y + (detail.at.y - screen.min.y).clamp(8.0, (screen.height() - 130.0).max(8.0));
     let title = format!("详情 · 第 {} 行", detail.row + 1);
     let mut pinned = detail.pinned;
+    let mut as_json = detail.json;
+    let json_text = as_json.then(|| row_json(&fields));
     let mut open = true;
     let shown = egui::Window::new(title)
         .id(egui::Id::unique(("db_row_detail", panel.task)))
@@ -627,28 +626,65 @@ fn draw_row_detail(panel: &mut Panel, ctx: &egui::Context) {
             // 底下那行按钮得先留出地方，不然整块高度归了滚动区，
             // 按钮被顶到窗口裁剪区外面
             let footer = ui.spacing().interact_size.y + 14.0;
+            // 纵向不跟着内容长：窗口多高就是多高，内容多了走滚动。
+            // 之前给它 auto_shrink，内容高度会回灌窗口高度、每帧再靠近一点，
+            // 看着就是窗口高度在那儿慢慢往上爬。
             ScrollArea::vertical()
+                .auto_shrink([false, false])
                 .max_height((ui.available_height() - footer).max(60.0))
-                .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    for (name, value) in &fields {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new(format!("{name} =")).small().weak());
-                            ui.add(
-                                egui::Label::new(RichText::new(value).monospace()).selectable(true),
-                            );
-                        });
-                        ui.add_space(1.0);
+                    if let Some(text) = &json_text {
+                        ui.add(
+                            egui::Label::new(RichText::new(text).monospace()).selectable(true),
+                        );
+                    } else {
+                        for f in &fields {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new(format!("{} =", f.name)).small().weak());
+                                ui.add(
+                                    egui::Label::new(RichText::new(&f.text).monospace())
+                                        .selectable(true),
+                                );
+                            });
+                            ui.add_space(1.0);
+                        }
                     }
                 });
             ui.separator();
             ui.horizontal(|ui| {
+                // 两面切换：对着表格读用表单，要拿整行喂给别的程序用 JSON
+                if ui
+                    .selectable_label(!as_json, "表单")
+                    .on_hover_cursor(crate::theme::HAND)
+                    .clicked()
+                {
+                    as_json = false;
+                }
+                if ui
+                    .selectable_label(as_json, "JSON")
+                    .on_hover_cursor(crate::theme::HAND)
+                    .on_hover_text(
+                        "整行排成一段 JSON：数值列是数字、NULL 是 null、\n值本身是对象/数组的那列摊成嵌套。列的顺序照表格。",
+                    )
+                    .clicked()
+                {
+                    as_json = true;
+                }
                 ui.label(weak(format!("{} 列", fields.len())));
-                if crate::theme::chip(ui, "复制整行")
+                if as_json {
+                    if crate::theme::chip(ui, "复制 JSON")
+                        .on_hover_text("整行那段 JSON 原样拷进剪贴板")
+                        .clicked()
+                    {
+                        if let Some(text) = &json_text {
+                            ui.ctx().copy_text(text.clone());
+                        }
+                    }
+                } else if crate::theme::chip(ui, "复制整行")
                     .on_hover_text("制表符分隔的一行，直接粘进表格软件")
                     .clicked()
                 {
-                    let line = tsv_row(fields.iter().map(|(_, v)| v.as_str().into()));
+                    let line = tsv_row(fields.iter().map(|f| f.text.as_str().into()));
                     ui.ctx().copy_text(line);
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -661,6 +697,7 @@ fn draw_row_detail(panel: &mut Panel, ctx: &egui::Context) {
             });
         });
     detail.pinned = pinned;
+    detail.json = as_json;
     stays_open(ctx, shown, &mut open, detail.at, pinned);
     panel.detail = open.then_some(detail);
 }
@@ -702,9 +739,10 @@ fn draw_cell_peek(panel: &mut Panel, ctx: &egui::Context) {
             // 底下那行按钮得先留出地方：整块高度都给滚动区的话，
             // 按钮被顶到窗口裁剪区外面，看着就像窗口里只有一段文字。
             let footer = ui.spacing().interact_size.y + 14.0;
+            // 同详情窗口一条规矩：纵向不跟着内容长，否则窗口高度一帧一帧往上爬
             ScrollArea::vertical()
                 .max_height((ui.available_height() - footer).max(60.0))
-                .auto_shrink([false, true])
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.add(
                         egui::Label::new(RichText::new(shown).monospace()).selectable(true),
@@ -1153,6 +1191,7 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
     let Panel {
         task,
         slot,
+        stmt,
         selected,
         detail,
         peek,
@@ -1240,12 +1279,15 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                                 .on_hover_text("在右边单独开一个窗口看这一行")
                                 .clicked()
                             {
-                                // 钉住的那份换行时保持钉住：对着几行来回看正是钉的理由
+                                // 钉住的那份换行时保持钉住：对着几行来回看正是钉的理由。
+                                // JSON 那一面同理——连着核几行，不该每行重按一次。
                                 let pin = detail.is_some_and(|d| d.pinned);
+                                let json = detail.is_some_and(|d| d.json);
                                 *detail = (!opened).then_some(Detail {
                                     row: index,
                                     at,
                                     pinned: pin,
+                                    json,
                                 });
                             }
                             let mut num = RichText::new(format!("{}", index + 1)).small();
@@ -1354,7 +1396,7 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
     // 会把正在编辑器里拷贝的那只手抢走。
     if let Some(index) = *selected {
         ui.add_space(2.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new(format!("已选中第 {} 行", index + 1))
                     .small()
@@ -1367,6 +1409,38 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                 let line = tsv_row(one.rows[index].iter().map(Cell::display));
                 ui.ctx().copy_text(line);
             }
+            // 导出成 SQL：语句里认不出表名就只留一句说明——拼出 `INSERT INTO (SELECT`
+            // 那种半截话，比不给按钮更难查。
+            match table_of(stmt.as_str()) {
+                Some(table) => {
+                    let row = &one.rows[index];
+                    if crate::theme::chip(ui, "导出 INSERT")
+                        .on_hover_text(format!(
+                            "把这一行拼成 INSERT INTO {}（列名照结果里的顺序，一列不落），拷进剪贴板。\n\
+                             数值列裸写、文本列带引号、NULL 就是 NULL、二进制列走 0x…。",
+                            table
+                        ))
+                        .clicked()
+                    {
+                        let sql = insert_sql(&table, &one.columns, row);
+                        ui.ctx().copy_text(sql);
+                    }
+                    if crate::theme::chip(ui, "导出 UPDATE")
+                        .on_hover_text(
+                            "把这一行拼成 UPDATE，拷进剪贴板。\n\
+                             结果里不带主键信息，WHERE 只能拿整行的列值去配（NULL 那列写 IS NULL），\n\
+                             末尾再加 LIMIT 1 兜住多行。改过值的行导出来配不上原行，先回表格确认。",
+                        )
+                        .clicked()
+                    {
+                        let sql = update_sql(&table, &one.columns, row);
+                        ui.ctx().copy_text(sql);
+                    }
+                }
+                None => {
+                    ui.label(weak("认不出表名，导不了 SQL"));
+                }
+            }
             let resp = crate::theme::chip(ui, "看详情").on_hover_text(
                 "在右边单独开一个窗口，逐列看完整值。\n点了别处它自己收；要一直看着就勾上窗口里的「钉住」。",
             );
@@ -1377,10 +1451,12 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                     .interact_pointer_pos()
                     .unwrap_or_else(|| resp.rect.center());
                 let pin = detail.is_some_and(|d| d.pinned);
+                let json = detail.is_some_and(|d| d.json);
                 *detail = Some(Detail {
                     row: index,
                     at,
                     pinned: pin,
+                    json,
                 });
             }
             if crate::theme::chip(ui, "取消选中").clicked() {
@@ -1431,9 +1507,7 @@ fn to_csv(one: &StatementResult) -> String {
             row.iter().map(|cell| match cell {
                 crate::db::Cell::Null => String::new(),
                 crate::db::Cell::Text(text) => text.clone(),
-                crate::db::Cell::Blob(bytes) => {
-                    bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
-                }
+                crate::db::Cell::Blob(bytes) => hex(bytes),
             }),
         );
     }
@@ -1483,6 +1557,271 @@ fn csv_name(title: &str, task: u64) -> String {
     } else {
         format!("{head}.csv")
     }
+}
+
+// ---------- 选中行导出：SQL 与 JSON ----------
+
+/// 二进制列排成十六进制。CSV、SQL 字面量和 JSON 都用这一份。
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 这一列是不是数值类型。
+///
+/// `type_name` 是 mysql 那边 `ColumnType` 的 Debug 文本（`MYSQL_TYPE_LONGLONG`），
+/// MockDriver 用的是短名，所以先把前缀剥掉再比。
+fn numeric_type(type_name: &str) -> bool {
+    let t = type_name
+        .strip_prefix("MYSQL_TYPE_")
+        .unwrap_or(type_name)
+        .to_ascii_uppercase();
+    matches!(
+        t.as_str(),
+        "DECIMAL" | "TINY" | "SHORT" | "LONG" | "LONGLONG" | "INT24" | "NEWDECIMAL" | "FLOAT"
+            | "DOUBLE" | "YEAR" | "BIT"
+    )
+}
+
+/// 一格的 SQL 字面量。
+///
+/// 数值列裸写、文本列带引号、NULL 就是 NULL、二进制走 `0x…`。转义按 MySQL 默认
+/// sql_mode（反斜杠是转义符）来；开了 `NO_BACKSLASH_ESCAPES` 的库这两句得自己改。
+fn sql_literal(cell: &Cell, type_name: &str) -> String {
+    match cell {
+        Cell::Null => "NULL".into(),
+        Cell::Blob(bytes) => format!("0x{}", hex(bytes)),
+        Cell::Text(text) if numeric_type(type_name) && text.parse::<f64>().is_ok() => {
+            text.clone()
+        }
+        Cell::Text(text) => format!("'{}'", sql_escape(text)),
+    }
+}
+
+fn sql_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        match c {
+            '\'' => out.push_str("\\'"),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\0"),
+            // MySQL 自己认这个：读文件时 ^Z 是文件尾
+            '\x1a' => out.push_str("\\Z"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// 标识符两边钉反引号，`库.表` 一段一段钉，段里的反引号翻倍。
+fn sql_ident(name: &str) -> String {
+    name.split('.')
+        .map(|part| format!("`{}`", part.replace('`', "``")))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// 表名那一词能出现的字符。多一个少一个都算认不出来。
+fn is_table_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '$' | '.' | '`')
+}
+
+/// 从语句里认出表名。
+///
+/// 只认 `FROM` / `UPDATE` / `INSERT INTO` 后面那一个词，取先碰到的那个。行注释先剥掉：
+/// 注释掉的句子和真句子在同一份文本里，而且多半排在前面。子查询（`FROM (SELECT …)`）、
+/// 多表（`FROM a, b`）、被空格断开的引号表名都归为认不出来，返回 None——
+/// 这时候导出按钮该消失，而不是拼出一句 `INSERT INTO (SELECT`。
+fn table_of(stmt: &str) -> Option<String> {
+    let words: Vec<&str> = stmt
+        .lines()
+        .flat_map(|line| {
+            let line = match line.find("--") {
+                Some(at) => &line[..at],
+                None => line,
+            };
+            line.split_ascii_whitespace()
+        })
+        .collect();
+    for pair in words.windows(2) {
+        // 关键字那一头要一字不差：`'from` 是字符串里的一段话，不是子句开头
+        if !matches!(
+            pair[0].to_ascii_lowercase().as_str(),
+            "from" | "update" | "into"
+        ) {
+            continue;
+        }
+        let raw = pair[1].trim_end_matches(';');
+        if raw.is_empty() || !raw.chars().all(is_table_char) {
+            return None;
+        }
+        let parts: Vec<&str> = raw.split('.').collect();
+        // 每一段都得是完整的一个词：反引号只包上一头，说明表名里带空格、
+        // 被上面那次按空白拆开了——这种认不准，宁可不给
+        let ok = parts.iter().all(|part| {
+            let quoted = part.starts_with('`') && part.ends_with('`') && part.len() > 1;
+            (quoted || !part.contains('`')) && !part.trim_matches('`').is_empty()
+        });
+        return ok.then(|| {
+            parts
+                .iter()
+                .map(|part| part.trim_matches('`'))
+                .collect::<Vec<_>>()
+                .join(".")
+        });
+    }
+    None
+}
+
+/// 选中行拼成一条 INSERT：列名和值都按结果里的列顺序，一列不落。
+fn insert_sql(table: &str, columns: &[crate::db::Column], row: &[Cell]) -> String {
+    let names: Vec<String> = columns.iter().map(|c| sql_ident(&c.name)).collect();
+    let values: Vec<String> = columns
+        .iter()
+        .zip(row)
+        .map(|(c, cell)| sql_literal(cell, &c.type_name))
+        .collect();
+    format!(
+        "INSERT INTO {} ({}) VALUES ({});\n",
+        sql_ident(table),
+        names.join(", "),
+        values.join(", ")
+    )
+}
+
+/// 选中行拼成一条 UPDATE。
+///
+/// 结果里不带主键信息（文本协议不返回索引），WHERE 只能拿整行的列值去配，NULL 那列
+/// 写 `IS NULL`——`= NULL` 在 SQL 里永远不成立。整行值配不上第二行时 `LIMIT 1` 兜住。
+fn update_sql(table: &str, columns: &[crate::db::Column], row: &[Cell]) -> String {
+    let sets: Vec<String> = columns
+        .iter()
+        .zip(row)
+        .map(|(c, cell)| format!("{} = {}", sql_ident(&c.name), sql_literal(cell, &c.type_name)))
+        .collect();
+    let wheres: Vec<String> = columns
+        .iter()
+        .zip(row)
+        .map(|(c, cell)| {
+            if cell.is_null() {
+                format!("{} IS NULL", sql_ident(&c.name))
+            } else {
+                format!(
+                    "{} = {}",
+                    sql_ident(&c.name),
+                    sql_literal(cell, &c.type_name)
+                )
+            }
+        })
+        .collect();
+    format!(
+        "UPDATE {} SET {} WHERE {} LIMIT 1;\n",
+        sql_ident(table),
+        sets.join(", "),
+        wheres.join(" AND ")
+    )
+}
+
+/// 详情窗口里的一栏。
+///
+/// 值先抄成自己拥有的：详情窗口那一整帧不能一直借着 `panel.slot`，窗口关掉还要写回
+/// `panel.detail`。
+struct Field {
+    name: String,
+    /// 表单那一面的显示文本
+    text: String,
+    /// JSON 那一面怎么摆这一格
+    json: JsonCell,
+}
+
+/// 一格的 JSON 摆法。
+enum JsonCell {
+    Null,
+    /// 数值列裸写：`42` 和 `"42"` 在 JSON 里是两种东西
+    Number(String),
+    /// 二进制列 JSON 里没有对应类型，给十六进制串
+    Hex(String),
+    /// 值本身是个对象或数组（MySQL 的 json 列多半长这样），摊成嵌套
+    Nested(String),
+    /// 其余按字符串，引号和转义交给 serde_json
+    Text(String),
+}
+
+/// 一行抄成详情窗口能自己拿着用的那份。
+fn row_fields(columns: &[crate::db::Column], row: &[Cell]) -> Vec<Field> {
+    columns
+        .iter()
+        .zip(row)
+        .map(|(col, cell)| Field {
+            name: col.name.clone(),
+            text: cell.display().to_string(),
+            json: json_cell(cell, &col.type_name),
+        })
+        .collect()
+}
+
+fn json_cell(cell: &Cell, type_name: &str) -> JsonCell {
+    match cell {
+        Cell::Null => JsonCell::Null,
+        Cell::Blob(bytes) => JsonCell::Hex(hex(bytes)),
+        Cell::Text(text) => {
+            if numeric_type(type_name) && text.parse::<f64>().is_ok() {
+                return JsonCell::Number(text.clone());
+            }
+            // 只认对象和数组：`123`、`true` 这类裸值当字符串更贴近列里实际存的东西，
+            // 一列 varchar 里全是 "1"，摆成一堆 1 反而像是在说它是数字
+            match serde_json::from_str::<serde_json::Value>(text) {
+                Ok(value) if value.is_object() || value.is_array() => JsonCell::Nested(
+                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| json_quote(text)),
+                ),
+                _ => JsonCell::Text(text.clone()),
+            }
+        }
+    }
+}
+
+/// 整行排成一段带缩进的 JSON。
+///
+/// 顶层自己拼，不走 `serde_json::Map`：没开 `preserve_order`，它的对象按键名排序，
+/// 列的顺序就没了——一行数据先按字母重排一遍，对着表格看反而更累。
+fn row_json(fields: &[Field]) -> String {
+    let mut out = String::from("{\n");
+    for (i, f) in fields.iter().enumerate() {
+        out.push_str("  ");
+        out.push_str(&json_quote(&f.name));
+        out.push_str(": ");
+        out.push_str(&indent_tail(&json_text(&f.json), "  "));
+        if i + 1 < fields.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push('}');
+    out
+}
+
+/// 一个值在 JSON 里的写法，不含键名。
+fn json_text(cell: &JsonCell) -> String {
+    match cell {
+        JsonCell::Null => "null".to_string(),
+        JsonCell::Number(n) => n.clone(),
+        JsonCell::Hex(h) => json_quote(h),
+        JsonCell::Text(t) => json_quote(t),
+        JsonCell::Nested(v) => v.clone(),
+    }
+}
+
+fn json_quote(text: &str) -> String {
+    serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into())
+}
+
+/// 嵌套那一段 pretty 打印从第 0 列起算，第二行起补一层缩进才不看着像塌了一半。
+fn indent_tail(text: &str, pad: &str) -> String {
+    if !text.contains('\n') {
+        return text.to_string();
+    }
+    text.replace('\n', &format!("\n{pad}"))
 }
 
 /// 标题行左边那个词。查询/写操作用块标题，异常状态单独说。
@@ -2004,6 +2343,85 @@ mod tests {
         );
     }
 
+    /// 选中行那一排的两个导出按钮：表名从这条语句里认，认出来才摆按钮，
+    /// 拼好的 SQL 直接进剪贴板——存盘框那一套得先把「拷一段」这条路挤掉，不值。
+    #[test]
+    fn a_selected_row_exports_itself_as_sql() {
+        let mut dock = ResultsDock::new();
+        dock.start_run(
+            "本机",
+            "查用户",
+            &parts(&["SELECT id, note FROM users"]),
+            None,
+        );
+        let one = StatementResult {
+            columns: typed(&[("id", "LONGLONG"), ("note", "VAR_STRING")]),
+            rows: vec![
+                vec![Cell::Text("7".into()), Cell::Text("甲".into())],
+                vec![Cell::Text("9".into()), Cell::Null],
+            ],
+            affected_rows: 2,
+            last_insert_id: 0,
+            warnings: 0,
+            truncated: false,
+            elapsed_ms: 1,
+            preview: "SELECT".into(),
+        };
+        dock.on_event(&event(1, Ok(DbOutcome::Statement(one))));
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let out = show_pass(&mut dock, &ctx, vec![], 0.0);
+        let row2 = spot(&out, "2").expect("第二行的行号没画出来");
+        let out = click(&mut dock, &ctx, row2, 1.0);
+
+        let at = spot(&out, "导出 INSERT").expect("那一排里没有「导出 INSERT」");
+        let out = click(&mut dock, &ctx, at, 2.0);
+        assert_eq!(
+            copied(&out),
+            vec!["INSERT INTO `users` (`id`, `note`) VALUES (9, NULL);\n".to_string()],
+            "导的该是选中那一行，NULL 就是 NULL"
+        );
+
+        let at = spot(&out, "导出 UPDATE").expect("那一排里没有「导出 UPDATE」");
+        let out = click(&mut dock, &ctx, at, 3.0);
+        assert_eq!(
+            copied(&out),
+            vec![
+                "UPDATE `users` SET `id` = 9, `note` = NULL \
+                 WHERE `id` = 9 AND `note` IS NULL LIMIT 1;\n"
+                    .to_string()
+            ],
+            "WHERE 里 NULL 那列得写 IS NULL"
+        );
+    }
+
+    /// 语句里认不出表名（选中一段跑的、或者压根不带表名的），那两个按钮就不该出现。
+    #[test]
+    fn no_table_name_means_no_sql_export() {
+        let mut dock = ResultsDock::new();
+        dock.start_run("本机", "选中内容", &parts(&["SELECT 1 + 1"]), None);
+        let one = table(&["n"], vec![vec![Cell::Text("2".into())]]);
+        dock.on_event(&event(1, Ok(DbOutcome::Statement(one))));
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let out = show_pass(&mut dock, &ctx, vec![], 0.0);
+        let row = spot(&out, "1").expect("行号没画出来");
+        let out = click(&mut dock, &ctx, row, 1.0);
+        let shown = texts(&out);
+        assert!(
+            shown.iter().any(|t| t == "已选中第 1 行"),
+            "没选中上：{shown:?}"
+        );
+        assert!(
+            shown.iter().any(|t| t == "认不出表名，导不了 SQL"),
+            "认不出表名时该说一句，而不是闷着不给按钮：{shown:?}"
+        );
+        assert_eq!(spot(&out, "导出 INSERT"), None);
+        assert_eq!(spot(&out, "导出 UPDATE"), None);
+    }
+
     /// 行首的 ▸ 开的是右边那个独立窗口，不往表格里塞块——塞进去那块收不回去。
     #[test]
     fn the_row_arrow_opens_a_detail_window_and_closes_it_again() {
@@ -2066,6 +2484,121 @@ mod tests {
         assert!(
             dock.panels[0].detail.is_none(),
             "窗口收掉了，状态里还留着那一行"
+        );
+    }
+
+    /// 详情窗口的另一面：整行排成 JSON，给别的程序用。
+    #[test]
+    fn the_detail_window_has_a_json_side() {
+        let mut dock = ResultsDock::new();
+        dock.start_run("本机", "查用户", &parts(&["SELECT * FROM t"]), None);
+        let one = table(
+            &["name", "note"],
+            vec![vec![
+                Cell::Text("甲".into()),
+                Cell::Text("很长的一段备注".into()),
+            ]],
+        );
+        dock.on_event(&event(1, Ok(DbOutcome::Statement(one))));
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let out = show_pass(&mut dock, &ctx, vec![], 0.0);
+        let arrow = spot(&out, "▸").expect("行首那个 ▸ 没画出来");
+        click(&mut dock, &ctx, arrow, 1.0);
+        let mut out = show_pass(&mut dock, &ctx, vec![], 1.2);
+        for step in [1.25, 1.3] {
+            out = show_pass(&mut dock, &ctx, vec![], step);
+        }
+        let shown = texts(&out);
+        assert!(
+            shown.iter().any(|t| t == "note ="),
+            "默认那一面该是逐列表单：{shown:?}"
+        );
+
+        let at = spot(&out, "JSON").expect("底下那排没有「JSON」");
+        click(&mut dock, &ctx, at, 2.0);
+        let out = show_pass(&mut dock, &ctx, vec![], 2.2);
+        let shown = texts(&out);
+        assert!(
+            shown
+                .iter()
+                .any(|t| t.contains("\"note\": \"很长的一段备注\"")),
+            "切到 JSON 那面没排出来：{shown:?}"
+        );
+        assert!(
+            !shown.iter().any(|t| t == "note ="),
+            "切过去了，表单那一面还留着"
+        );
+        // 切过去之后，底下那颗按钮换人高亮，点「表单」回得去
+        assert!(shown.iter().any(|t| t == "表单"));
+
+        let at = spot(&out, "复制 JSON").expect("JSON 那一面该给「复制 JSON」");
+        let out = click(&mut dock, &ctx, at, 3.0);
+        assert_eq!(
+            copied(&out),
+            vec!["{\n  \"name\": \"甲\",\n  \"note\": \"很长的一段备注\"\n}".to_string()],
+            "拷出去的就是屏上那段，别再加一层引号或转义"
+        );
+    }
+
+    /// 详情窗口那一帧的外框：窗口底色画出来的最大的那块矩形。屏幕底色跟它同色，
+    /// 但占满整屏，按宽度和横坐标筛掉。
+    fn detail_frame(out: &egui::FullOutput) -> Option<egui::Rect> {
+        fn walk(shape: &egui::Shape, want: Color32, v: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Rect(r) if r.fill == want => v.push(r.rect),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, want, v)),
+                _ => {}
+            }
+        }
+        let want = egui::Style::default().visuals.window_fill;
+        let mut v = Vec::new();
+        for group in &out.shapes {
+            walk(&group.shape, want, &mut v);
+        }
+        v.into_iter()
+            .filter(|r| r.width() < 800.0 && r.min.x > 400.0)
+            .max_by(|a, b| a.area().total_cmp(&b.area()))
+    }
+
+    /// 「窗口高度慢慢出现」那一次：纵向跟着内容缩，内容高度就反过来定了窗口高度——
+    /// 两列的行开出来一小条，十四列的行一大条，换一行、值长到要折行，它都得重新凑
+    /// 一遍，凑的活儿是按帧干的，看着就是高度在那儿慢慢长。
+    /// 滚动区纵向不缩之后：窗口多高就是多高，第一帧落定，装不下的走滚动。
+    #[test]
+    fn the_detail_window_takes_its_size_once() {
+        let mut firsts: Vec<f32> = Vec::new();
+        for n in [2usize, 14] {
+            let mut dock = ResultsDock::new();
+            dock.start_run("本机", "查用户", &parts(&["SELECT * FROM t"]), None);
+            let names: Vec<String> = (0..n).map(|i| format!("c{i}")).collect();
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            let row = (0..n).map(|i| Cell::Text(format!("值{i}"))).collect();
+            let one = table(&refs, vec![row]);
+            dock.on_event(&event(1, Ok(DbOutcome::Statement(one))));
+
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(1.0);
+            let out = show_pass(&mut dock, &ctx, vec![], 0.0);
+            let arrow = spot(&out, "▸").expect("行首那个 ▸ 没画出来");
+            click(&mut dock, &ctx, arrow, 1.0);
+
+            // 1.25 是能量到外框的第一帧：窗口开出来的头几帧只在量尺寸、摆位置
+            let heights: Vec<f32> = [1.25, 1.3, 1.35, 1.4, 1.5, 1.7, 2.0]
+                .into_iter()
+                .map(|step| detail_frame(&show_pass(&mut dock, &ctx, vec![], step)))
+                .map(|r| r.expect("详情窗口的外框没画出来").height().round())
+                .collect();
+            assert!(
+                heights.windows(2).all(|w| (w[0] - w[1]).abs() < 0.6),
+                "{n} 列：窗口高度在逐帧凑，量到 {heights:?}"
+            );
+            firsts.push(heights[0]);
+        }
+        assert_eq!(
+            firsts[0], firsts[1],
+            "窗口高度跟着列数走：2 列 {firsts:?}——尺寸该归窗口管，内容多了走滚动"
         );
     }
 
@@ -2743,6 +3276,153 @@ mod tests {
             to_tsv(&one),
             "name\tn\n张三 工程师\t1\n第一行 第二行\tNULL",
             "表头在首行，NULL 跟网格里写的一样"
+        );
+    }
+
+    /// 带类型名的列。上面那个 `table()` 把类型名留空了，而导出 SQL、排 JSON 全靠
+    /// 类型名判断这格该裸写还是该加引号，所以这儿单开一个。
+    fn typed(names: &[(&str, &str)]) -> Vec<Column> {
+        names
+            .iter()
+            .map(|(name, ty)| Column {
+                name: (*name).to_string(),
+                type_name: (*ty).to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn insert_covers_every_column_in_the_order_they_came() {
+        let cols = typed(&[
+            ("id", "MYSQL_TYPE_LONGLONG"),
+            ("name", "MYSQL_TYPE_VAR_STRING"),
+            ("note", "MYSQL_TYPE_VAR_STRING"),
+            ("pic", "MYSQL_TYPE_BLOB"),
+        ]);
+        let row = vec![
+            Cell::Text("7".into()),
+            Cell::Text("O'Brien".into()),
+            Cell::Null,
+            Cell::Blob(vec![0x0d, 0xff]),
+        ];
+        assert_eq!(
+            insert_sql("users", &cols, &row),
+            "INSERT INTO `users` (`id`, `name`, `note`, `pic`) VALUES (7, 'O\\'Brien', NULL, 0x0dff);\n",
+            "数值裸写、文本带引号、NULL 就是 NULL、二进制走 0x…"
+        );
+    }
+
+    #[test]
+    fn update_matches_the_row_by_every_value_it_carries() {
+        let cols = typed(&[("id", "LONGLONG"), ("note", "VAR_STRING")]);
+        let row = vec![Cell::Text("7".into()), Cell::Null];
+        assert_eq!(
+            update_sql("my.users", &cols, &row),
+            "UPDATE `my`.`users` SET `id` = 7, `note` = NULL \
+             WHERE `id` = 7 AND `note` IS NULL LIMIT 1;\n",
+            "结果里不带主键，WHERE 只能整行列值；NULL 那列必须写 IS NULL，\
+             `= NULL` 在 SQL 里永远不成立"
+        );
+    }
+
+    #[test]
+    fn a_value_is_bare_only_when_the_column_is_numeric() {
+        // varchar 里存数字照样是字符串：导出去变成另一个类型，回填就错了
+        assert_eq!(
+            sql_literal(&Cell::Text("42".into()), "MYSQL_TYPE_VAR_STRING"),
+            "'42'"
+        );
+        assert_eq!(
+            sql_literal(&Cell::Text("42".into()), "MYSQL_TYPE_LONGLONG"),
+            "42"
+        );
+        // 数值列里读出不是数字的东西（驱动偶尔会这样），宁可加引号也别拼出半截语法
+        assert_eq!(
+            sql_literal(&Cell::Text("abc".into()), "LONGLONG"),
+            "'abc'"
+        );
+        // 反斜杠在 MySQL 默认 sql_mode 下是转义符，不翻倍就把它后面的引号吃了
+        assert_eq!(
+            sql_literal(&Cell::Text("C:\\a'b\n".into()), "VAR_STRING"),
+            "'C:\\\\a\\'b\\n'"
+        );
+    }
+
+    #[test]
+    fn table_of_reads_the_names_statements_carry() {
+        assert_eq!(
+            table_of("SELECT * FROM users WHERE id = 1").as_deref(),
+            Some("users")
+        );
+        assert_eq!(table_of("update `my`.Orders o set o.a = 1").as_deref(), Some("my.Orders"));
+        assert_eq!(table_of("INSERT INTO t VALUES (1);").as_deref(), Some("t"));
+        // 注释掉的句子排在前面，不能拿它当表名
+        assert_eq!(
+            table_of("-- sql 查订单\n-- SELECT * FROM users;\nSELECT * FROM orders;").as_deref(),
+            Some("orders")
+        );
+        // 认不出来的这几种都得让按钮消失，而不是拼半截
+        assert_eq!(table_of("SELECT * FROM (SELECT 1) x"), None);
+        assert_eq!(table_of("SELECT * FROM a, b"), None);
+        assert_eq!(table_of("WHERE note = 'from users'"), None);
+        assert_eq!(table_of("SELECT 1"), None);
+    }
+
+    #[test]
+    fn json_keeps_the_column_order_the_table_has() {
+        let cols = typed(&[
+            ("zeta", "MYSQL_TYPE_VAR_STRING"),
+            ("alpha", "MYSQL_TYPE_LONGLONG"),
+        ]);
+        let fields = row_fields(
+            &cols,
+            &[Cell::Text("z".into()), Cell::Text("3".into())],
+        );
+        assert_eq!(
+            row_json(&fields),
+            "{\n  \"zeta\": \"z\",\n  \"alpha\": 3\n}",
+            "serde_json 的对象按键名排序，列的顺序就没了——顶层只能自己拼"
+        );
+    }
+
+    #[test]
+    fn json_tells_null_number_and_binary_apart() {
+        let cols = typed(&[
+            ("n", "LONGLONG"),
+            ("t", "VAR_STRING"),
+            ("z", "VAR_STRING"),
+            ("b", "BLOB"),
+        ]);
+        let fields = row_fields(
+            &cols,
+            &[
+                Cell::Text("12".into()),
+                Cell::Text("12".into()),
+                Cell::Null,
+                Cell::Blob(vec![0x01, 0xab]),
+            ],
+        );
+        assert_eq!(
+            row_json(&fields),
+            "{\n  \"n\": 12,\n  \"t\": \"12\",\n  \"z\": null,\n  \"b\": \"01ab\"\n}"
+        );
+    }
+
+    #[test]
+    fn a_json_column_opens_up_instead_of_staying_a_string() {
+        let cols = typed(&[("meta", "JSON"), ("flag", "VAR_STRING")]);
+        let fields = row_fields(
+            &cols,
+            &[
+                Cell::Text(r#"{"a":1,"b":[1,2]}"#.into()),
+                // 裸值不当嵌套：varchar 里一列 "1" 全摆成 1，反而像在说它是数字
+                Cell::Text("true".into()),
+            ],
+        );
+        assert_eq!(
+            row_json(&fields),
+            "{\n  \"meta\": {\n    \"a\": 1,\n    \"b\": [\n      1,\n      2\n    ]\n  },\n  \"flag\": \"true\"\n}",
+            "嵌套那一段第二行起要补一层缩进，不然看着像塌了一半"
         );
     }
 }

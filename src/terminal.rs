@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::theme;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Dims {
     cols: usize,
     rows: usize,
@@ -516,6 +516,9 @@ pub struct Terminal {
     child: Box<dyn Child + Send + Sync>,
     rx: Receiver<Msg>,
     dims: Dims,
+    /// 面板算出来想要的尺寸，PTY 还没认下时挂在这里等下一帧重试。
+    /// 见 [`Terminal::resize`]。
+    want: Option<Dims>,
     pub exited: bool,
     /// 滚轮攒下的不足一行的零头
     scroll_acc: f32,
@@ -598,6 +601,7 @@ impl Terminal {
             child,
             rx,
             dims,
+            want: None,
             exited: false,
             scroll_acc: 0.0,
             sb_grab: None,
@@ -642,18 +646,37 @@ impl Terminal {
         let _ = self.child.kill();
     }
 
+    /// 把尺寸对齐到面板算出来的 `cols` × `rows`。
+    ///
+    /// 关键是**尺寸由 PTY 认下了才算数**：`ResizePseudoConsole` 上一轮还没消化完时
+    /// 再来一轮是可能被拒的（本机造不出这一拒，但不能拿用户的屏幕去赌），而绘制行数
+    /// 一旦跑到 shell 前面，多出来的那几行就再没人重画——`cls`、PSReadLine 重画命令行
+    /// 这类按绝对行号动的操作只会擦到 shell 自己那几行，下面那一截永远停在旧内容上。
+    /// 所以没认下的尺寸留在 `want` 里下一帧重试，`dims` 只跟真正生效的尺寸走。
     fn resize(&mut self, cols: usize, rows: usize) {
-        if cols == self.dims.cols && rows == self.dims.rows {
-            return;
+        self.want = Some(Dims { cols, rows });
+        self.sync_size();
+    }
+
+    fn sync_size(&mut self) {
+        let master = &mut self.master;
+        let applied = settle_size(
+            |want| {
+                master
+                    .resize(PtySize {
+                        rows: want.rows as u16,
+                        cols: want.cols as u16,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .is_ok()
+            },
+            &mut self.dims,
+            &mut self.want,
+        );
+        if let Some(applied) = applied {
+            self.term.resize(applied);
         }
-        self.dims = Dims { cols, rows };
-        self.term.resize(self.dims);
-        let _ = self.master.resize(PtySize {
-            rows: rows as u16,
-            cols: cols as u16,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
     }
 
     fn write(&mut self, bytes: &[u8]) {
@@ -684,9 +707,13 @@ impl Terminal {
         let char_w = ui.fonts_mut(|f| f.glyph_width(&font, 'M')).max(1.0);
 
         let avail = ui.available_size();
-        let cols = ((avail.x / char_w).floor() as usize).max(20);
-        let rows = ((avail.y / row_h).floor() as usize).max(5);
-        self.resize(cols, rows);
+        self.resize(
+            ((avail.x / char_w).floor() as usize).max(20),
+            ((avail.y / row_h).floor() as usize).max(5),
+        );
+        // 画的是 PTY 认下来的那几行。尺寸还在重试时，面板多出来的空间就留白：
+        // shell 够不着的行没人重画，画上去只会是一段永远擦不掉的旧内容。
+        let (cols, rows) = (self.dims.cols, self.dims.rows);
 
         // 先占位，再用同一个 id 注册可聚焦的交互区域
         let (rect, _) = ui.allocate_exact_size(avail, Sense::hover());
@@ -1124,6 +1151,33 @@ impl Terminal {
                 Color32::from_rgb(200, 120, 120),
             );
         }
+    }
+}
+
+/// 一次尺寸对齐的裁决，返回真正生效的尺寸（没生效就不返回）。
+///
+/// `apply` 是「把这块尺寸报给 PTY」，单独抽出来是因为**真 ConPTY 拒不掉尺寸**
+/// （本机试过 28x9999、连打 36 次都不报错），被拒那条分支只能这么造出来测。
+/// 规矩是 PTY 认下了才算数：一旦屏幕模型比 shell 以为的屏幕多出几行，多出来的
+/// 那几行就再没人重画，`cls`、PSReadLine 重画命令行这类按绝对行号动的操作只会
+/// 擦到 shell 自己那几行，下面那一截永远停在旧内容上。所以没认下的尺寸原样挂在
+/// `want` 里，下一帧接着试。
+fn settle_size(
+    mut apply: impl FnMut(Dims) -> bool,
+    dims: &mut Dims,
+    want: &mut Option<Dims>,
+) -> Option<Dims> {
+    let next = (*want)?;
+    if next == *dims {
+        *want = None;
+        return None;
+    }
+    if apply(next) {
+        *dims = next;
+        *want = None;
+        Some(next)
+    } else {
+        None
     }
 }
 
@@ -1868,6 +1922,102 @@ mod tests {
         // 常规比例：28 行可见 / 128 行总共
         let h = thumb_rect(track, 100, 0, 28).height();
         assert!((h - track.height() * 28.0 / 128.0).abs() < 0.01, "{h}");
+    }
+
+    /// 尺寸没被 PTY 认下时，绘制行数不许先涨上去——涨上去的那几行没人重画，
+    /// 就是一段永远擦不掉的旧内容。挂着的尺寸下一帧接着试。
+    #[test]
+    fn a_refused_resize_waits_for_the_next_frame() {
+        let mut dims = Dims { cols: 100, rows: 28 };
+        let mut want = Some(Dims { cols: 120, rows: 40 });
+        let mut asked = Vec::new();
+        let mut refuse = |next: Dims| {
+            asked.push(next);
+            false
+        };
+        assert_eq!(
+            settle_size(&mut refuse, &mut dims, &mut want),
+            None,
+            "PTY 拒了却把尺寸算作生效"
+        );
+        assert_eq!(asked, [Dims { cols: 120, rows: 40 }]);
+        assert_eq!(dims, Dims { cols: 100, rows: 28 }, "没认下的尺寸进了绘制");
+        assert_eq!(want, Some(Dims { cols: 120, rows: 40 }), "被拒的没留着下一帧重试");
+
+        assert_eq!(
+            settle_size(|_| true, &mut dims, &mut want),
+            Some(Dims { cols: 120, rows: 40 }),
+            "下一帧认下了却没生效"
+        );
+        assert_eq!(dims, Dims { cols: 120, rows: 40 });
+        assert_eq!(want, None, "生效了还挂着");
+    }
+
+    /// 面板算出的尺寸和已经生效的一样，就不该再去动 PTY：每次 resize shell
+    /// 都要重排一次画面，白折腾还会把光标位置抖一下。
+    #[test]
+    fn an_unchanged_size_never_touches_the_pty() {
+        let mut dims = Dims { cols: 100, rows: 28 };
+        let mut want = Some(dims);
+        let mut asked = 0;
+        assert_eq!(
+            settle_size(
+                |_| {
+                    asked += 1;
+                    true
+                },
+                &mut dims,
+                &mut want
+            ),
+            None
+        );
+        assert_eq!(asked, 0, "尺寸没变也去动 PTY");
+        assert_eq!(want, None);
+    }
+
+    /// 真 ConPTY 走一遍：面板画多大，PTY 就多大，而且不留挂着的尺寸。
+    /// 尺寸挂着一不再试，或者绘制行数跑到 PTY 前面，都会留下一段擦不掉的旧内容。
+    /// 要起真实 PTY 进程，所以默认忽略：
+    /// `cargo test -- --ignored --nocapture pty_terminal_tracks_the_panel`
+    #[test]
+    #[ignore = "要起真实 PTY 进程，手动跑：cargo test -- --ignored --nocapture pty_terminal_tracks_the_panel"]
+    fn pty_terminal_tracks_the_panel() {
+        let mut panel = TerminalPanel::new(std::env::temp_dir(), TerminalSettings::default());
+        panel.shell = Shell::Builtin(ShellKind::Cmd);
+        let cwd = panel.cwd.clone();
+        let term_id = panel.create_at(&cwd).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let mut sizes = Vec::new();
+        for h in [300.0f32, 620.0, 120.0, 620.0] {
+            let mut out = ctx.run_pass(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(900.0, h),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|ui| panel.ui_leaf(ui, term_id, 14.0, true));
+                },
+            );
+            // 没有渲染器消费字体图集的增量，epaint 会在 drop 时断言
+            out.textures_delta.clear();
+            let t = panel.get(term_id).unwrap();
+            let pty = t.master.get_size().unwrap();
+            assert_eq!(t.want, None, "{h}px 这帧想要的尺寸没落到 PTY 上");
+            assert_eq!(
+                (t.dims.cols, t.dims.rows),
+                (pty.cols as usize, pty.rows as usize),
+                "{h}px：绘制用的行数和 PTY 对不上"
+            );
+            sizes.push(t.dims);
+        }
+        assert!(sizes[1].rows > sizes[0].rows, "拉高没多出行：{sizes:?}");
+        assert!(sizes[2].rows < sizes[1].rows, "缩矮没减行：{sizes:?}");
     }
 
     /// 终端的中文输入要起真实 shell 才算验证过，所以默认忽略：

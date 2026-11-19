@@ -1704,6 +1704,9 @@ impl EasyEditorApp {
         if self.keymap.consume(ctx, "sql_run_block") {
             self.sql_run_block();
         }
+        if self.keymap.consume(ctx, "sql_comment") {
+            self.toggle_sql_comment();
+        }
         if self.keymap.consume(ctx, "results_toggle") {
             self.results.open = !self.results.open;
         }
@@ -2149,6 +2152,55 @@ impl EasyEditorApp {
             }
             Err(e) => self.status = format!("格式化失败：{e}"),
         }
+    }
+
+    /// `Ctrl+/` 切换 SQL 行注释。和格式化一样只动 buffer，要不要落盘交给 Ctrl+S。
+    ///
+    /// 只管开了 SQL 模式的那份文件：日志和纯文本里塞 `--` 不是注释，按错了得说一声。
+    fn toggle_sql_comment(&mut self) {
+        let Some(idx) = self.focused_tab() else {
+            self.status = "请先打开一个文件".into();
+            return;
+        };
+        if !self.tabs[idx].sql_mode {
+            self.status = "行注释只管 SQL：`.sql` 文件，或顶栏开了 SQL 模式的那份".into();
+            return;
+        }
+        let file = &mut self.tabs[idx];
+        if file.large {
+            self.status = "大文件为只读预览，无法改注释".into();
+            return;
+        }
+        let (start, end) = file
+            .selection_range
+            .unwrap_or((file.caret_byte, file.caret_byte));
+        let Some(edit) = sql::toggle_comment(&file.text, start, end) else {
+            self.status = "这几行只有空行和块头，没有能注释的语句".into();
+            return;
+        };
+        let sql::CommentEdit {
+            replace,
+            insert,
+            caret,
+            commented,
+        } = edit;
+        // 有选区时把这一下当成「按住 Shift 点行首拖到行尾」：注释完选区还盖着那几行，
+        // 接着按能在两个状态间来回跳，不用重新选
+        let select = start != end;
+        let selected_to = replace.0 + insert.len();
+        file.pending_edit = Some(PendingEdit {
+            range: Some(replace),
+            insert,
+            caret: (!select).then_some(caret),
+        });
+        if select {
+            file.pending_select = Some((replace.0, selected_to));
+        }
+        self.status = if commented {
+            "已加注释，Ctrl+S 保存".into()
+        } else {
+            "已去掉注释，Ctrl+S 保存".into()
+        };
     }
 
     /// 文件树右键的格式化：已经打开的文件改 buffer（等 Ctrl+S），没打开的原地写盘。
@@ -2984,6 +3036,18 @@ impl EasyEditorApp {
                     .clicked()
                 {
                     self.sql_run_block();
+                    ui.close();
+                }
+                let h_sql_comment = format!(
+                    "选区压到哪几行就注释哪几行；已经注释过的整段一起解开  {}",
+                    hint("sql_comment")
+                );
+                if ui
+                    .add_enabled(self.active.is_some(), egui::Button::new("切换行注释"))
+                    .on_hover_text(h_sql_comment)
+                    .clicked()
+                {
+                    self.toggle_sql_comment();
                     ui.close();
                 }
                 let n = self.results.count();
@@ -8438,6 +8502,42 @@ mod tests {
             edit.insert.contains("conn=本机"),
             "头部要写死当前连接：{}",
             edit.insert
+        );
+    }
+
+    /// `Ctrl+/` 的落点：待办编辑贴回 buffer 后，注释确实落在行首缩进之后。
+    #[test]
+    fn sql_comment_rewrites_the_lines_the_caret_touches() {
+        let (_ctx, mut app, dir) = app_in_folder("ee_sql_comment", "x\n");
+        let file = dir.join("q.sql");
+        std::fs::write(&file, "SELECT 1;\nSELECT 2;\n").unwrap();
+        app.open_file(file, None);
+        let idx = app.active.unwrap();
+        assert!(app.tabs[idx].sql_mode, ".sql 打开就该按 SQL 对待");
+        // 光标停在第二句的那个 "2" 上
+        app.tabs[idx].caret_byte = 17;
+        app.toggle_sql_comment();
+        let edit = app.tabs[idx]
+            .pending_edit
+            .take()
+            .expect("注释该排成一次待落地的编辑");
+        app.tabs[idx].apply_edit(edit);
+        assert_eq!(app.tabs[idx].text, "SELECT 1;\n-- SELECT 2;\n");
+        assert!(app.tabs[idx].dirty, "动了 buffer 就得挂着未保存");
+    }
+
+    /// 普通文本里按 `Ctrl+/`：正文一个字不动，但要说清去哪儿开 SQL 模式。
+    #[test]
+    fn sql_comment_refuses_a_plain_text_file() {
+        let (_ctx, mut app, dir) = app_in_folder("ee_sql_comment_plain", "hello\n");
+        app.open_file(dir.join("a.txt"), None);
+        app.toggle_sql_comment();
+        let idx = app.active.unwrap();
+        assert!(app.tabs[idx].pending_edit.is_none(), "纯文本不该被塞 `--`");
+        assert!(
+            app.status.contains("SQL 模式"),
+            "拒绝得指出出路：{}",
+            app.status
         );
     }
 

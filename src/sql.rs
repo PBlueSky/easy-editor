@@ -520,6 +520,119 @@ pub fn statement_index_at(sql: &str, ranges: &[(usize, usize)], caret: usize) ->
     )
 }
 
+/// 行注释前缀。MySQL 要求 `--` 后面跟空白才算注释，所以固定带一个空格。
+pub const COMMENT: &str = "-- ";
+
+/// `Ctrl+/` 算出来的那一次替换：动哪一段、换成什么、光标落哪儿。
+pub struct CommentEdit {
+    /// 替换的字节范围，从压到的第一行行首到最后一行行尾
+    pub replace: (usize, usize),
+    /// 换上去的新内容
+    pub insert: String,
+    /// 原来那个位置（没有选区时就是光标）在新文本里的落点
+    pub caret: usize,
+    /// 这一次是加上注释（true）还是去掉注释（false）
+    pub commented: bool,
+}
+
+/// 切换行注释：`[start, end)` 压到哪几行动哪几行。
+///
+/// 只给一个光标位置（start == end）时动它所在那一行。判据和常见编辑器一致：这几行里
+/// 只要还有一行没注释就整体加上注释，全注释了才整体去掉，所以连着按能在两个状态间来回跳。
+///
+/// `-- sql xxx` 那种块头不参与：它长得像注释，其实是这套文件约定的结构行，全选一键注释
+/// 要把块头拆了，这块 SQL 就再也扫不出来了。区间里只剩块头和空行时返回 `None`。
+pub fn toggle_comment(text: &str, start: usize, end: usize) -> Option<CommentEdit> {
+    let start = floor_char_boundary(text, start.min(text.len()));
+    let end = floor_char_boundary(text, end.max(start).min(text.len()));
+    // 选区的最后一个字节正好是换行符时，那点选区的人要的是上一行，别把下一行也拖进来
+    let probe = if end > start && text.as_bytes()[end - 1] == b'\n' {
+        end - 1
+    } else {
+        end
+    };
+    let from = text[..start].rfind('\n').map_or(0, |i| i + 1);
+    let to = text[probe..].find('\n').map_or(text.len(), |i| probe + i);
+    // CRLF 文件的行尾有个 `\r`，判断前先摘出去，写回时原样贴上
+    let lines: Vec<(&str, &str)> = text[from..to]
+        .split('\n')
+        .map(|l| {
+            let content = l.strip_suffix('\r').unwrap_or(l);
+            (content, &l[content.len()..])
+        })
+        .collect();
+
+    // 空行不挡路、块头不插手，剩下的才是这一轮真该点亮的行
+    let bodies: Vec<&str> = lines.iter().map(|(l, _)| l.trim_start()).collect();
+    let movable: Vec<&str> = bodies
+        .iter()
+        .copied()
+        .filter(|b| !b.is_empty() && !b.starts_with(PREFIX))
+        .collect();
+    if movable.is_empty() {
+        return None;
+    }
+    let strip = movable.iter().all(|b| b.starts_with("--"));
+
+    // 改动只发生在行首缩进之后，所以每行记下动到第几个字节、动了多长，光标照着它平移
+    let mut indent = Vec::with_capacity(lines.len());
+    let mut new_lines: Vec<String> = Vec::with_capacity(lines.len());
+    for (n, (line, cr)) in lines.iter().enumerate() {
+        let body = bodies[n];
+        indent.push(line.len() - body.len());
+        let already = body.starts_with("--");
+        let mut out = String::with_capacity(line.len() + 4);
+        if !strip && !already {
+            // 前缀插在缩进之后：`    SELECT` → `    -- SELECT`，缩进留在注释外面
+            out.push_str(&line[..indent[n]]);
+            out.push_str(COMMENT);
+            out.push_str(body);
+        } else if strip && already {
+            // 剥掉 `-- `；`--SELECT` 这种漏了空格的也认，去掉 `--` 就够
+            let rest = body
+                .strip_prefix(COMMENT)
+                .or_else(|| body.strip_prefix("--"))
+                .unwrap_or(body);
+            out.push_str(&line[..indent[n]]);
+            out.push_str(rest);
+        } else {
+            out.push_str(line);
+        }
+        out.push_str(cr);
+        new_lines.push(out);
+    }
+
+    // 光标落在改动位置右边才跟着挪；落在左边（含缩进上）说明在注释外面，原地不动
+    let caret_line = text[from..start].matches('\n').count();
+    let mut insert = String::with_capacity(to - from + 8);
+    let mut old_pos = from;
+    let mut caret = from;
+    for (n, line) in new_lines.iter().enumerate() {
+        if n > 0 {
+            insert.push('\n');
+        }
+        if n == caret_line {
+            let off = start - old_pos;
+            let delta = line.len() as isize - lines[n].0.len() as isize - lines[n].1.len() as isize;
+            let moved = if off > indent[n] {
+                (off as isize + delta).max(indent[n] as isize) as usize
+            } else {
+                off
+            };
+            caret = from + insert.len() + moved;
+        }
+        insert.push_str(line);
+        old_pos += lines[n].0.len() + lines[n].1.len() + 1;
+    }
+
+    Some(CommentEdit {
+        replace: (from, to),
+        insert,
+        caret,
+        commented: !strip,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -800,5 +913,92 @@ SELECT 2;
         assert_eq!(pick(sql, 12), Some(0), "跨行语句的中间一行也归它");
         assert_eq!(pick(sql, 27), Some(0), "结束的分号");
         assert_eq!(pick(sql, 29), Some(1));
+    }
+
+    /// 把 [`toggle_comment`] 算出来的编辑真打上去，返回 (新文本, 光标, 是否加注释)
+    fn comment(text: &str, start: usize, end: usize) -> (String, usize, bool) {
+        let e = toggle_comment(text, start, end).expect("这段该有改动");
+        let mut out = text.to_string();
+        out.replace_range(e.replace.0..e.replace.1, &e.insert);
+        (out, e.caret, e.commented)
+    }
+
+    #[test]
+    fn caret_alone_comments_its_own_line() {
+        let text = "SELECT 1;\nSELECT 2;\n";
+        // 光标停在第二句的那个 "2" 上
+        let (out, caret, commented) = comment(text, 17, 17);
+        assert!(commented);
+        assert_eq!(out, "SELECT 1;\n-- SELECT 2;\n");
+        assert_eq!(&out[caret..caret + 1], "2", "光标还指着原来那个字符");
+    }
+
+    #[test]
+    fn comment_goes_the_other_way_on_the_next_press() {
+        let text = "-- SELECT 1;\n-- SELECT 2;\n";
+        let (out, _, commented) = comment(text, 3, 3);
+        assert!(!commented, "整行已经注释过了，这一轮是去掉");
+        assert_eq!(out, "SELECT 1;\n-- SELECT 2;\n");
+    }
+
+    #[test]
+    fn a_selection_comments_every_line_it_touches() {
+        let text = "SELECT 1;\nSELECT 2;\nSELECT 3;\n";
+        // 只选中间那一句
+        let (out, _, _) = comment(text, 10, 19);
+        assert_eq!(out, "SELECT 1;\n-- SELECT 2;\nSELECT 3;\n");
+        // 混合状态：有一行没注释就整体加上，已注释的那行不叠第二层
+        let mixed = "-- a\nb\n";
+        let (out, _, _) = comment(mixed, 0, mixed.len());
+        assert_eq!(out, "-- a\n-- b\n");
+    }
+
+    #[test]
+    fn indentation_stays_outside_the_marker() {
+        let text = "    SELECT 1;\n";
+        let (out, caret, _) = comment(text, 9, 9);
+        assert_eq!(out, "    -- SELECT 1;\n");
+        assert_eq!(&out[caret..caret + 1], "T", "光标跟着前缀右移，仍指着同一个字符");
+    }
+
+    #[test]
+    fn block_head_is_never_touched() {
+        let text = "-- sql 活跃用户 2026-11-15 14:03 [待执行]\nSELECT 1;\n";
+        // 全选：块头是结构行，拆了这块就扫不出来了
+        let (out, _, _) = comment(text, 0, text.len());
+        assert_eq!(
+            out,
+            "-- sql 活跃用户 2026-11-15 14:03 [待执行]\n-- SELECT 1;\n"
+        );
+        assert_eq!(scan(&out).len(), 1, "注释完还得能扫出原来那个块");
+        // 区间里只有块头和空行，没有可注释的内容
+        assert!(toggle_comment(text, 0, 42).is_none());
+    }
+
+    #[test]
+    fn crlf_lines_keep_their_carriage_return() {
+        let text = "SELECT 1;\r\nSELECT 2;\r\n";
+        let (out, _, _) = comment(text, 11, 11);
+        assert_eq!(out, "SELECT 1;\r\n-- SELECT 2;\r\n");
+        // 空行带个 `\r` 也算空行，不该被点亮成 `-- \r`
+        let blank = "a\r\n\r\n";
+        let (out, _, _) = comment(blank, 0, 1);
+        assert_eq!(out, "-- a\r\n\r\n");
+    }
+
+    #[test]
+    fn selection_ending_on_a_newline_stays_on_its_line() {
+        let text = "SELECT 1;\nSELECT 2;\n";
+        // 选区正好吃到第一句末尾的换行符
+        let (out, _, _) = comment(text, 0, 10);
+        assert_eq!(out, "-- SELECT 1;\nSELECT 2;\n");
+    }
+
+    #[test]
+    fn utf8_offsets_land_on_char_boundaries() {
+        let text = "SELECT '中文';\n";
+        // 光标故意停在「中」这个三字节字符中间
+        let (out, _, _) = comment(text, 9, 9);
+        assert_eq!(out, "-- SELECT '中文';\n");
     }
 }

@@ -150,6 +150,12 @@ pub const ACTIONS: &[ActionDef] = &[
         default: "Ctrl+Shift+Enter",
     },
     ActionDef {
+        id: "sql_comment",
+        label: "切换 SQL 行注释",
+        group: "数据库",
+        default: "Ctrl+Slash",
+    },
+    ActionDef {
         id: "results_toggle",
         label: "显示 / 隐藏结果区",
         group: "数据库",
@@ -610,6 +616,25 @@ mod tests {
             );
             // 松开键的事件留着：它不打字，egui 自己会用来收尾按键状态
             assert_eq!(i.events, vec![release(Key::D, alt_shift)]);
+        });
+    }
+
+    /// `Ctrl+/` 也逃不掉这条：斜杠漏进编辑区，SQL 里就凭空多出一根 `/`。
+    #[test]
+    fn sql_comment_chord_leaves_no_slash() {
+        let km = Keymap::default();
+        let ctx = egui::Context::default();
+        ctx.input_mut(|i| {
+            i.events = vec![press(Key::Slash, Modifiers::CTRL), typed("/")]
+        });
+
+        assert!(km.consume(&ctx, "sql_comment"), "Ctrl+/ 没触发切换注释");
+        ctx.input(|i| {
+            assert!(
+                i.events.iter().all(|e| !matches!(e, egui::Event::Text(_))),
+                "斜杠漏给了编辑区/终端：{:?}",
+                i.events
+            );
         });
     }
 

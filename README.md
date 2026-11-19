@@ -4,7 +4,7 @@
 
 A Windows desktop editor written in **Rust + egui**. It does not have many features — it has the ones you use every day: file tree, terminal tabs that sit in the same strip as your file tabs, recursive split panes, journal blocks inside plain text files, SQL blocks that run against MySQL with the results sitting right under the text, cursor position back/forward, project-wide search, find and replace, syntax highlighting, and every keybinding is yours to change.
 
-**Current version** v0.5.0 | **Platform** Windows 10 / 11 x64 | **License** MIT
+**Current version** v0.6.0 | **Platform** Windows 10 / 11 x64 | **License** MIT
 
 The release package is a **single exe** (about 12 MB, 5.2 MB zipped). No .NET, no Electron, no runtime of any kind.
 
@@ -64,7 +64,7 @@ Grab one of the packages from the [Releases](https://github.com/PBlueSky/easy-ed
 Both packages work: without `rg.exe`, project-wide search silently falls back to the built-in scanner — a bit slower on large repos. Each package ships with a matching `.sha256.txt`; verify it:
 
 ```powershell
-Get-FileHash .\EasyEditor-0.5.0-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\EasyEditor-0.6.0-windows-x64.zip -Algorithm SHA256
 ```
 
 ### Run from source
@@ -218,6 +218,7 @@ Header = `-- sql` + title + `YYYY-MM-DD HH:MM` + `[status]` + tail keys. Two tai
 - `.sql` files open in **SQL mode**; any other file can switch it on from `Database ▸ 本文件按 SQL 处理`. SQL mode is per-tab and does not touch the file: the buffer is highlighted as SQL (`Ctrl+Enter` runs statements, not lines), and it is what unlocks running a file that has no blocks in it
 - `Ctrl+Enter` runs **the selection if there is one, otherwise only the one statement the caret is sitting on** — split by semicolons inside the block (or the whole file, in SQL mode). The status bar reports `已提交 n 条语句到「conn」（第 2/3 句）`, so you always know which slice went out. `Ctrl+Shift+Enter` is the deliberate "hand over the whole block" key
 - `Ctrl+Shift+J` (or `Database ▸ Insert SQL block`) drops a block at the cursor, already carrying today's date / time and the default connection
+- `Ctrl+/` (or `Database ▸ 切换行注释`) toggles `-- ` line comments over whatever lines the selection touches — or the caret's own line if there is no selection. If any touched line is uncommented the whole group gets commented; all of them commented and the group opens again, so the key alternates. The marker goes *after* the indentation (`    -- SELECT`), the caret stays where it was in the line, and a selection survives the edit so you can press it twice. `-- sql …` block headers are never touched — they look like comments but they are the structure the whole scanner reads, and a select-all that ate them would make the file unrunnable. Files that are not in SQL mode refuse the key and say so in the status bar
 - Statements are split by a scanner that knows `'…'`, `"…"`, `` `…` ``, `--`, `#` and `/* … */`, so a semicolon inside a string or a comment does not cut a statement in half; the same scanner produces both the panel titles and the byte spans, which is why the two can never disagree
 - Once every statement of a **whole-block** run (`Ctrl+Shift+Enter`) is back, the header status is rewritten `[待执行]` → `[已执行]` / `[失败]` (pending → done / failed). Running one statement with `Ctrl+Enter` deliberately leaves the status alone — one statement of the block finishing is not the block finishing
 - A statement that the server rejects gets a translucent red background **in the file itself**, so you can see which one to fix instead of counting panels. The span is validated against the text before it is painted (a mark whose bytes no longer match that statement is dropped rather than placed somewhere wrong), it slides along when the header write-back shortens the block, and typing clears it
@@ -240,7 +241,9 @@ Ten results in one strip would squeeze the editor out, so only one of them is on
 - **The results strip asks the shared style table for its text sizes.** Cell values, column names and the body text of the pop-out / row-detail / full-cell windows all render at `TextStyle::Monospace` (13 pt); timestamps, row counts, row numbers and the hint line under the tabs use `TextStyle::Small` (11.5 pt) — the same table `theme.rs` sets for the toolbar and the side panels. This area used to carry its own 10.5 / 11 / 11.5, one size per call site, so it sat a whole step below everything else in the window and a result looked tiny right after you had been reading SQL at 14 pt. Row pitch and column widths are measured from that size too: one row is the glyph height plus 5 pt, one column is 20 glyph widths, so the numbers cannot drift apart when the table changes. `Ctrl` + `+` / `-` still only moves the editor and terminal text
 - **The `▸` at the head of a row opens that row in its own window, pinned to the right of the screen**: one `column = full value` field per line, wrapped, selectable, with `复制整行` at the bottom. The same chevron closes it, one window per panel, and it reopens where you left it. It used to unfold a block inside the grid, which could not be folded back and kept getting clipped by the table's own viewport
 - **That window closes itself when you click anywhere else** — on a tab, another cell, the editor — so hunting for a `✕` is no longer part of reading a result. The `钉住` checkbox in its top-right turns that off while you compare a few rows; pinning follows the result, so switching tabs and back keeps it pinned
-- **Click a row number to select the whole row.** Every cell of it lights up and an action bar appears under the grid: `复制整行` (that row as TSV), `看详情` (the same right-side window) and `取消选中`. Copying lives on the bar rather than on `Ctrl+C` on purpose — that keystroke belongs to the editor, and stealing it would swap whatever you were about to copy there
+- **That window takes its size once.** Its height used to be read back out of the content, so a wide row had to grow for a few frames before you could read it, and a 2-column row and a 14-column row each re-derived the shape. The body is now a scroll area that fills the window instead of shrinking to its contents: 430×300 from the first frame (or whatever you dragged it to), with a long row scrolling. `表单` / `JSON` in its footer flip the same row between the per-column form and one JSON object — numeric columns as numbers, `NULL` as `null`, BLOBs as hex, a `json` column opened up into real nesting, and the columns in grid order rather than alphabetical. `复制 JSON` puts that object on the clipboard, and the face you picked survives switching rows
+- **Click a row number to select the whole row.** Every cell of it lights up and an action bar appears under the grid: `复制整行` (that row as TSV), `导出 INSERT` / `导出 UPDATE` (that row as one SQL statement on the clipboard), `看详情` (the same right-side window) and `取消选中`. Copying lives on the bar rather than on `Ctrl+C` on purpose — that keystroke belongs to the editor, and stealing it would swap whatever you were about to copy there
+- **The two export buttons read the table name out of the statement itself** (`FROM` / `UPDATE` / `INSERT INTO`), so they only appear when there is a real table behind the result; a `SELECT 1` or a subquery says `认不出表名，导不了 SQL` instead of pasting together half a statement. The `INSERT` lists every column the result has, in result order. The `UPDATE` cannot know your primary key — the text protocol reports no indexes — so its `WHERE` matches on *all* the row's values (`IS NULL` where a value is null) and ends in `LIMIT 1`; that is spelled out in its tooltip, and a row you have since edited will simply match nothing
 - A cell that is genuinely too narrow for its content shows a hover tooltip with the head of the value, and **double-clicking it opens that one cell in its own window** — wrapped, scrollable, select-all, with `复制本格` putting the *untruncated* value on the clipboard (the same item is on the right-click menu as `查看完整内容`). Same-grid, same-data: the window reads the panel it came from. Like the row window, it closes on any click outside and can be pinned
 - The bottom strip is resizable even before anything has run — dragging the divider up used to spring back to the default height, because an empty dock only measured one line of text and the panel booked that
 - The dock bar has `全部收起 / 全部展开`, `清空` (closes finished panels and keeps the ones still waiting for a reply) and `关闭`
@@ -355,6 +358,8 @@ Selections are recorded in absolute row coordinates, so they still point at the 
 
 Scrollback: the mouse wheel moves **3 rows per notch** (raw wheel events; trackpads are converted at 14 px per row). Whenever there is scrolled-back output, a floating scrollbar appears on the right edge of the pane — drag the thumb, click the track, or use the wheel. It is painted over the text and takes no layout width. Once you scroll up into history the screen stays pinned to the old content (alacritty's behaviour); pressing any key — even a pasted character — snaps the view back to the newest line.
 
+Resizing is conservative in one specific way: a pane only draws rows the PTY has actually accepted. When the panel grows — dragging the divider, resizing the window — the new row count goes to `ResizePseudoConsole` first, and if that call does not land the size stays pending and is retried on the next frame. Spare pixels at the bottom of the pane stay **blank** rather than showing rows the shell does not know it has: a screen model taller than the shell's own leaves those extra rows with nobody to repaint them, and `cls` or PSReadLine redrawing the command line — both of which work on absolute row numbers — would only clear the shell's rows, so the leftover strip at the bottom could never be erased.
+
 Auto-detection does not always find things (Git Bash missing from PATH, for example). The settings window's Terminal section gives each shell its own **program path** and **startup arguments**; leave them empty to go back to auto-detection / built-in args. Changes are written straight into `config.json`:
 
 ```json
@@ -457,6 +462,7 @@ Everything below is the default and everything is rebindable in `F1`.
 | `Ctrl+Alt+D` | Toggle the journal block's done state |
 | `Ctrl+Alt+N` | New query file (`query-<timestamp>.sql`, block header already bound to the default connection) |
 | `Ctrl+Shift+J` | Insert a SQL block at the cursor |
+| `Ctrl+/` | Toggle `-- ` line comments over the lines the selection (or the caret) touches — SQL mode only |
 | `Ctrl+Enter` | Run the selection, or just the statement the caret is on (split by `;`) — in SQL mode with no block, that reads from the whole file |
 | `Ctrl+Shift+Enter` | Hand the entire block (or the whole file in SQL mode) to the server and write the block status back |
 | `Ctrl+Shift+R` | Show / hide the results dock |
@@ -569,17 +575,17 @@ About 26,900 lines of Rust in a single binary crate, 24 source files:
 | `src/app.rs` | The application itself: layout, keybindings, open/save, project search, find/replace, journal blocks, terminal tabs (opening, splitting, closing, switching), SQL submitting, per-tab SQL mode and new-query files |
 | `src/pane.rs` | tmux-style recursive binary pane tree (`Leaf` / `Split`); layout only, no content. One instance for the editor, one per terminal tab |
 | `src/editor.rs` | The editor widget: line numbers + highlighting + editing + jumping + read-only virtual rendering for large files + overlay painting |
-| `src/terminal.rs` | PTY I/O, VT parsing, keyboard/mouse routing, selection and scrollbar |
+| `src/terminal.rs` | PTY I/O, VT parsing, keyboard/mouse routing, selection, scrollbar and size sync |
 | `src/procs.rs` | Process-tree cleanup: a Toolhelp32 snapshot finds what a shell spawned and terminates it deepest-first (closing a cell, a tab, or the app) |
 | `src/filetree.rs` | Directory tree, lazy loading, file search, type colours, tab-label disambiguation |
 | `src/find.rs` | Find/replace within the current file (match positions are byte offsets) |
 | `src/search.rs` | Project-wide search: ripgrep first, built-in scanner as the fallback |
 | `src/journal.rs` | Journal block parsing and insertion |
-| `src/sql.rs` | SQL block text layer: scan and build blocks, split statements **with byte spans**, pick out the one a byte offset falls in, decide what is read-only. Touches neither database nor UI |
+| `src/sql.rs` | SQL block text layer: scan and build blocks, split statements **with byte spans**, pick out the one a byte offset falls in, decide what is read-only, and work out what `Ctrl+/` rewrites. Touches neither database nor UI |
 | `src/database.rs` | Sidebar `Database` tab and the connection manager window: cached tree, in-flight requests, the connection draft, and the live session state (`○` / `⏳` / `✓` / `✗`) with the fingerprint that retires it |
 | `src/db/mod.rs` | Engine-agnostic protocol: `ConnectionSpec` → `Driver`, one worker thread per connection, events back out, plus `MockDriver` so the UI is testable without a server |
 | `src/db/mysql.rs` | The only file that knows MySQL: connect options, the text protocol → cells, one statement per call |
-| `src/results.rs` | Results dock: one panel per statement, batch headers, pop-out window, status write-back, TSV for `复制`, RFC 4180 CSV for `导出`, sideways scroll, whole-row selection, per-row detail window |
+| `src/results.rs` | Results dock: one panel per statement, batch headers, pop-out window, status write-back, TSV for `复制`, RFC 4180 CSV for `导出`, sideways scroll, whole-row selection, per-row detail window with a form/JSON side, `导出 INSERT` / `导出 UPDATE` for the selected row |
 | `src/nav.rs` | Cursor position history |
 | `src/format.rs` | JSON / XML formatting |
 | `src/keymap.rs` | Configurable keybindings: action ids, serialization, conflict detection |
@@ -618,7 +624,7 @@ cargo test -- --ignored --nocapture     # two tests that really spawn processes:
 mkdir -p dist/EasyEditor
 cp target/release/easy-editor.exe dist/EasyEditor/EasyEditor.exe   # keep it identical to the window title
 cp README.md README.zh-CN.md LICENSE dist/EasyEditor/
-powershell -NoProfile -Command "Compress-Archive -Path dist\EasyEditor -DestinationPath dist\EasyEditor-0.5.0-windows-x64.zip -Force"
+powershell -NoProfile -Command "Compress-Archive -Path dist\EasyEditor -DestinationPath dist\EasyEditor-0.6.0-windows-x64.zip -Force"
 ```
 
 For the `-with-rg` variant, drop `rg.exe` and `THIRD-PARTY-NOTICES.txt` into `dist\EasyEditor\` and compress again. Each package gets its own `.sha256.txt`.
