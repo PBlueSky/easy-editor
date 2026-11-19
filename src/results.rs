@@ -80,8 +80,12 @@ pub struct Panel {
     /// 这条语句出自哪个文件的哪个字节，用来跳回去、跑完回写状态
     pub origin: Option<Origin>,
     pub slot: Slot,
-    /// 整行选中的那一行（0 基）。选中只是高亮 + 下面那排按钮，不动剪贴板。
-    pub selected: Option<usize>,
+    /// 整行选中的哪几行（0 基，升序去重）。选中只是高亮 + 下面那排按钮，不动剪贴板。
+    ///
+    /// 点行号单选、Ctrl+点 加减一行、Shift+点 连成一段，导 SQL 要的正是「这几行」。
+    pub selected: Vec<usize>,
+    /// Shift+点 的起点：最近一次不带 Shift 点下去的那一行。清空选中就跟着清空。
+    pub anchor: Option<usize>,
     /// 单独在右边看详情的那一行。一行一个面板：摊开的明细比表格还占地方，
     /// 塞在表格下面经常掉到裁剪区外，看着就像点了没反应。
     pub detail: Option<Detail>,
@@ -275,7 +279,8 @@ impl ResultsDock {
             stmt_range: part.range,
             origin: origin.clone(),
             slot: Slot::Running,
-            selected: None,
+            selected: Vec::new(),
+            anchor: None,
             detail: None,
             peek: None,
         });
@@ -623,15 +628,64 @@ fn draw_row_detail(panel: &mut Panel, ctx: &egui::Context) {
         .default_size(egui::vec2(430.0, 300.0))
         .open(&mut open)
         .show(ctx, |ui| {
-            // 底下那行按钮得先留出地方，不然整块高度归了滚动区，
-            // 按钮被顶到窗口裁剪区外面
-            let footer = ui.spacing().interact_size.y + 14.0;
+            // 底下这排按钮先按实测高度占住底部一条，剩下的整条高度才归滚动区。
+            // 之前是照 `interact_size.y + 14` 估一份预留：估少了，「滚动区 + 按钮」
+            // 的总高就比窗口高出一截，egui 每帧拿这个差值去抬 desired_size，
+            // 而抬完 available_height 又跟着变大——界面字号一大，看着就是窗口
+            // 高度一帧一帧爬到顶满整屏。实测没有这个反馈环。
+            egui::Panel::bottom("footer")
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        // 两面切换：对着表格读用表单，要拿整行喂给别的程序用 JSON
+                        if ui
+                            .selectable_label(!as_json, "表单")
+                            .on_hover_cursor(crate::theme::HAND)
+                            .clicked()
+                        {
+                            as_json = false;
+                        }
+                        if ui
+                            .selectable_label(as_json, "JSON")
+                            .on_hover_cursor(crate::theme::HAND)
+                            .on_hover_text(
+                                "整行排成一段 JSON：数值列是数字、NULL 是 null、\n值本身是对象/数组的那列摊成嵌套。列的顺序照表格。",
+                            )
+                            .clicked()
+                        {
+                            as_json = true;
+                        }
+                        ui.label(weak(format!("{} 列", fields.len())));
+                        if as_json {
+                            if crate::theme::chip(ui, "复制 JSON")
+                                .on_hover_text("整行那段 JSON 原样拷进剪贴板")
+                                .clicked()
+                            {
+                                if let Some(text) = &json_text {
+                                    ui.ctx().copy_text(text.clone());
+                                }
+                            }
+                        } else if crate::theme::chip(ui, "复制整行")
+                            .on_hover_text("制表符分隔的一行，直接粘进表格软件")
+                            .clicked()
+                        {
+                            let line = tsv_row(fields.iter().map(|f| f.text.as_str().into()));
+                            ui.ctx().copy_text(line);
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.checkbox(&mut pinned, "钉住")
+                                .on_hover_cursor(crate::theme::HAND)
+                                .on_hover_text(
+                                    "钉住：点别处它也不关。\n不勾时点了窗口外面任何一处，这一份自己收掉。",
+                                );
+                        });
+                    });
+                });
             // 纵向不跟着内容长：窗口多高就是多高，内容多了走滚动。
             // 之前给它 auto_shrink，内容高度会回灌窗口高度、每帧再靠近一点，
             // 看着就是窗口高度在那儿慢慢往上爬。
             ScrollArea::vertical()
                 .auto_shrink([false, false])
-                .max_height((ui.available_height() - footer).max(60.0))
                 .show(ui, |ui| {
                     if let Some(text) = &json_text {
                         ui.add(
@@ -650,51 +704,6 @@ fn draw_row_detail(panel: &mut Panel, ctx: &egui::Context) {
                         }
                     }
                 });
-            ui.separator();
-            ui.horizontal(|ui| {
-                // 两面切换：对着表格读用表单，要拿整行喂给别的程序用 JSON
-                if ui
-                    .selectable_label(!as_json, "表单")
-                    .on_hover_cursor(crate::theme::HAND)
-                    .clicked()
-                {
-                    as_json = false;
-                }
-                if ui
-                    .selectable_label(as_json, "JSON")
-                    .on_hover_cursor(crate::theme::HAND)
-                    .on_hover_text(
-                        "整行排成一段 JSON：数值列是数字、NULL 是 null、\n值本身是对象/数组的那列摊成嵌套。列的顺序照表格。",
-                    )
-                    .clicked()
-                {
-                    as_json = true;
-                }
-                ui.label(weak(format!("{} 列", fields.len())));
-                if as_json {
-                    if crate::theme::chip(ui, "复制 JSON")
-                        .on_hover_text("整行那段 JSON 原样拷进剪贴板")
-                        .clicked()
-                    {
-                        if let Some(text) = &json_text {
-                            ui.ctx().copy_text(text.clone());
-                        }
-                    }
-                } else if crate::theme::chip(ui, "复制整行")
-                    .on_hover_text("制表符分隔的一行，直接粘进表格软件")
-                    .clicked()
-                {
-                    let line = tsv_row(fields.iter().map(|f| f.text.as_str().into()));
-                    ui.ctx().copy_text(line);
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.checkbox(&mut pinned, "钉住")
-                        .on_hover_cursor(crate::theme::HAND)
-                        .on_hover_text(
-                            "钉住：点别处它也不关。\n不勾时点了窗口外面任何一处，这一份自己收掉。",
-                        );
-                });
-            });
         });
     detail.pinned = pinned;
     detail.json = as_json;
@@ -736,12 +745,31 @@ fn draw_cell_peek(panel: &mut Panel, ctx: &egui::Context) {
         .default_size(egui::vec2(460.0, 170.0))
         .open(&mut open)
         .show(ctx, |ui| {
-            // 底下那行按钮得先留出地方：整块高度都给滚动区的话，
-            // 按钮被顶到窗口裁剪区外面，看着就像窗口里只有一段文字。
-            let footer = ui.spacing().interact_size.y + 14.0;
-            // 同详情窗口一条规矩：纵向不跟着内容长，否则窗口高度一帧一帧往上爬
+            // 同详情窗口一条规矩：底下这排先量准了占住，剩下的高度才给滚动区，
+            // 否则「滚动区 + 按钮」总高略大于窗口，egui 每帧把窗口往上抬一点。
+            egui::Panel::bottom("footer")
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if !type_name.is_empty() {
+                            ui.label(weak(type_name));
+                        }
+                        ui.label(weak(format!("共 {count} 字")));
+                        if crate::theme::chip(ui, "复制本格")
+                            .on_hover_text("原文拷进剪贴板，不受上面显示长度的限制")
+                            .clicked()
+                        {
+                            ui.ctx().copy_text(value.clone());
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.checkbox(&mut pinned, "钉住")
+                                .on_hover_cursor(crate::theme::HAND)
+                                .on_hover_text("钉住：点别处它也不关。\n不勾时点了窗口外面任何一处，这一格自己收掉。");
+                        });
+                    });
+                });
+            // 纵向不跟着内容长，否则窗口高度一帧一帧往上爬
             ScrollArea::vertical()
-                .max_height((ui.available_height() - footer).max(60.0))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.add(
@@ -753,24 +781,6 @@ fn draw_cell_peek(panel: &mut Panel, ctx: &egui::Context) {
                         )));
                     }
                 });
-            ui.separator();
-            ui.horizontal(|ui| {
-                if !type_name.is_empty() {
-                    ui.label(weak(type_name));
-                }
-                ui.label(weak(format!("共 {count} 字")));
-                if crate::theme::chip(ui, "复制本格")
-                    .on_hover_text("原文拷进剪贴板，不受上面显示长度的限制")
-                    .clicked()
-                {
-                    ui.ctx().copy_text(value.clone());
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.checkbox(&mut pinned, "钉住")
-                        .on_hover_cursor(crate::theme::HAND)
-                        .on_hover_text("钉住：点别处它也不关。\n不勾时点了窗口外面任何一处，这一格自己收掉。");
-                });
-            });
         });
     peek.pinned = pinned;
     stays_open(ctx, shown, &mut open, peek.at, pinned);
@@ -1185,7 +1195,8 @@ fn body(ui: &mut Ui, panel: &mut Panel) {
 ///
 /// 每格都是截断显示，装不下的那一截有两条路看全：双击格子把这一格单独弹出来
 /// （见 [`draw_cell_peek`]），行首 ▸ 在屏幕右边单独开一个窗口看整行
-/// （见 [`draw_row_detail`]）。点行号把整行选中，格子底下跟出一排按钮。
+/// （见 [`draw_row_detail`]）。点行号选行——裸点一行、Ctrl+点 加减一行、Shift+点 一段，
+/// 格子底下跟出一排按钮，把选中的那几行导出成 SQL 或制表符文本。
 fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
     // 拆字段借：网格读 `slot` 里的结果，选中和详情要写回面板
     let Panel {
@@ -1193,6 +1204,7 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
         slot,
         stmt,
         selected,
+        anchor,
         detail,
         peek,
         ..
@@ -1201,7 +1213,8 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
     let task = *task;
     let one = &*one;
     // 换了结果行数就不一样了，旧行号别留着，一点对界就是一次 panic
-    *selected = selected.filter(|i| *i < one.rows.len());
+    selected.retain(|i| *i < one.rows.len());
+    *anchor = anchor.filter(|i| *i < one.rows.len());
     *detail = detail.filter(|d| d.row < one.rows.len());
 
     // 字号问样式表要，行高与列宽再由这个字号量出来。以前 11 的字配 18 的行、140 的列，
@@ -1262,7 +1275,7 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                         let index = row.index();
                         // `set_selected` 只管它之后加进来的格子，所以第一格之前调。
                         // 也正因为这样，点下去那一帧不改亮哪一行，下一帧才跟上。
-                        row.set_selected(*selected == Some(index));
+                        row.set_selected(selected.contains(&index));
                         row.col(|ui| {
                             let opened = detail.is_some_and(|d| d.row == index);
                             let arrow = if opened { "▾" } else { "▸" };
@@ -1291,7 +1304,7 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                                 });
                             }
                             let mut num = RichText::new(format!("{}", index + 1)).small();
-                            num = if *selected == Some(index) {
+                            num = if selected.contains(&index) {
                                 num.strong()
                             } else {
                                 num.weak()
@@ -1303,10 +1316,12 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                             );
                             if resp
                                 .on_hover_cursor(crate::theme::HAND)
-                                .on_hover_text("点一下选中 / 取消整行")
+                                .on_hover_text(
+                                    "点一下选中这一行\nCtrl+点：加减一行\nShift+点：从上次点的那行连成一段",
+                                )
                                 .clicked()
                             {
-                                *selected = (*selected != Some(index)).then_some(index);
+                                pick(selected, anchor, index, ui.input(|i| i.modifiers));
                             }
                         });
                         for (col_index, cell) in one.rows[index].iter().enumerate() {
@@ -1392,48 +1407,56 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                 });
         });
 
-    // 选中那一行的去处。快捷键留给编辑器，这里只给按钮——结果区抢一个 Ctrl+C
+    // 选中那几行的去处。快捷键留给编辑器，这里只给按钮——结果区抢一个 Ctrl+C
     // 会把正在编辑器里拷贝的那只手抢走。
-    if let Some(index) = *selected {
+    if !selected.is_empty() {
+        let rows: Vec<&[Cell]> = selected
+            .iter()
+            .filter_map(|i| one.rows.get(*i).map(Vec::as_slice))
+            .collect();
+        let many = rows.len();
         ui.add_space(2.0);
         ui.horizontal_wrapped(|ui| {
-            ui.label(
-                RichText::new(format!("已选中第 {} 行", index + 1))
-                    .small()
-                    .strong(),
-            );
-            if crate::theme::chip(ui, "复制整行")
-                .on_hover_text("制表符分隔的一行，直接粘进表格软件")
+            ui.label(RichText::new(picked_label(selected)).small().strong());
+            if crate::theme::chip(ui, if many == 1 { "复制整行" } else { "复制选中行" })
+                .on_hover_text(if many == 1 {
+                    "制表符分隔的一行，直接粘进表格软件"
+                } else {
+                    "选中的几行各占一行，还是制表符分隔"
+                })
                 .clicked()
             {
-                let line = tsv_row(one.rows[index].iter().map(Cell::display));
-                ui.ctx().copy_text(line);
+                let text = rows
+                    .iter()
+                    .map(|row| tsv_row(row.iter().map(Cell::display)))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                ui.ctx().copy_text(text);
             }
             // 导出成 SQL：语句里认不出表名就只留一句说明——拼出 `INSERT INTO (SELECT`
             // 那种半截话，比不给按钮更难查。
             match table_of(stmt.as_str()) {
                 Some(table) => {
-                    let row = &one.rows[index];
                     if crate::theme::chip(ui, "导出 INSERT")
                         .on_hover_text(format!(
-                            "把这一行拼成 INSERT INTO {}（列名照结果里的顺序，一列不落），拷进剪贴板。\n\
-                             数值列裸写、文本列带引号、NULL 就是 NULL、二进制列走 0x…。",
-                            table
+                            "把选中的 {many} 行拼成一条 INSERT INTO {table}（列名照结果里的顺序，一列不落），拷进剪贴板。\n\
+                             数值列裸写、文本列带引号、NULL 就是 NULL、二进制列走 0x…。\n\
+                             多行合成一条语句：VALUES 后面一行一组，一次提交。",
                         ))
                         .clicked()
                     {
-                        let sql = insert_sql(&table, &one.columns, row);
+                        let sql = insert_sql(&table, &one.columns, &rows);
                         ui.ctx().copy_text(sql);
                     }
                     if crate::theme::chip(ui, "导出 UPDATE")
                         .on_hover_text(
-                            "把这一行拼成 UPDATE，拷进剪贴板。\n\
+                            "把选中的每一行各拼成一条 UPDATE，拷进剪贴板。\n\
                              结果里不带主键信息，WHERE 只能拿整行的列值去配（NULL 那列写 IS NULL），\n\
-                             末尾再加 LIMIT 1 兜住多行。改过值的行导出来配不上原行，先回表格确认。",
+                             每条末尾再加 LIMIT 1 兜住多行。改过值的行导出来配不上原行，先回表格确认。",
                         )
                         .clicked()
                     {
-                        let sql = update_sql(&table, &one.columns, row);
+                        let sql = update_sql(&table, &one.columns, &rows);
                         ui.ctx().copy_text(sql);
                     }
                 }
@@ -1442,7 +1465,8 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                 }
             }
             let resp = crate::theme::chip(ui, "看详情").on_hover_text(
-                "在右边单独开一个窗口，逐列看完整值。\n点了别处它自己收；要一直看着就勾上窗口里的「钉住」。",
+                "在右边单独开一个窗口，逐列看完整值。一次只能放一行，看的是最后点的那一行。\n\
+                 点了别处它自己收；要一直看着就勾上窗口里的「钉住」。",
             );
             if resp.clicked() {
                 // 记的是这一下按在哪，不是按钮中心：详情窗口拿它挡「点外面就关」，
@@ -1452,15 +1476,22 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                     .unwrap_or_else(|| resp.rect.center());
                 let pin = detail.is_some_and(|d| d.pinned);
                 let json = detail.is_some_and(|d| d.json);
+                // 一次只放得下一行：看最后点的那一行（anchor）；它已经被 Ctrl+点 摘掉
+                // 就退到选中里最后一行
+                let show = match anchor {
+                    Some(a) if selected.contains(a) => *a,
+                    _ => selected.last().copied().unwrap_or(0),
+                };
                 *detail = Some(Detail {
-                    row: index,
+                    row: show,
                     at,
                     pinned: pin,
                     json,
                 });
             }
             if crate::theme::chip(ui, "取消选中").clicked() {
-                *selected = None;
+                selected.clear();
+                *anchor = None;
             }
         });
     }
@@ -1468,6 +1499,51 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
         ui.label(weak(
             "行数超过上限，只留了前面这些；要全量请在 SQL 里自己分页。",
         ));
+    }
+}
+
+/// 点行号以后选中的是哪几行、Shift 的起点落在哪一行。
+///
+/// 三种点法各管一件事：裸点重设（再点一次同一行等于取消），Ctrl+点 加减一行，
+/// Shift+点 从起点连到这一行。连着按 Shift 只换终点、起点不动，这才是表格软件里
+/// 框一段的手感；起点是最近一次不带 Shift 的那一下。
+fn pick(
+    selected: &mut Vec<usize>,
+    anchor: &mut Option<usize>,
+    index: usize,
+    mods: egui::Modifiers,
+) {
+    if mods.shift {
+        let from = anchor.unwrap_or(index);
+        let (lo, hi) = (from.min(index), from.max(index));
+        *selected = (lo..=hi).collect();
+    } else if mods.command || mods.ctrl {
+        // 和 keymap 那条判定一样认两样：Windows/Linux 上 eframe 两个都置位，
+        // 测试里手写的 `Modifiers::CTRL` 只有 ctrl 那一份
+        match selected.iter().position(|r| *r == index) {
+            Some(at) => {
+                selected.remove(at);
+            }
+            None => {
+                selected.push(index);
+                selected.sort_unstable();
+            }
+        }
+        *anchor = Some(index);
+    } else if selected.as_slice() == [index] {
+        selected.clear();
+        *anchor = None;
+    } else {
+        *selected = vec![index];
+        *anchor = Some(index);
+    }
+}
+
+/// 动作条开头那句：一行报行号，几行报数量。选了 40 行还挨个列出来，只会把那一排挤跑。
+fn picked_label(selected: &[usize]) -> String {
+    match selected {
+        [only] => format!("已选中第 {} 行", only + 1),
+        many => format!("已选中 {} 行", many.len()),
     }
 }
 
@@ -1674,53 +1750,68 @@ fn table_of(stmt: &str) -> Option<String> {
     None
 }
 
-/// 选中行拼成一条 INSERT：列名和值都按结果里的列顺序，一列不落。
-fn insert_sql(table: &str, columns: &[crate::db::Column], row: &[Cell]) -> String {
-    let names: Vec<String> = columns.iter().map(|c| sql_ident(&c.name)).collect();
-    let values: Vec<String> = columns
-        .iter()
-        .zip(row)
-        .map(|(c, cell)| sql_literal(cell, &c.type_name))
-        .collect();
-    format!(
-        "INSERT INTO {} ({}) VALUES ({});\n",
-        sql_ident(table),
-        names.join(", "),
-        values.join(", ")
-    )
-}
-
-/// 选中行拼成一条 UPDATE。
+/// 选中的几行拼成一条 INSERT：列名和值都按结果里的列顺序，一列不落。
 ///
-/// 结果里不带主键信息（文本协议不返回索引），WHERE 只能拿整行的列值去配，NULL 那列
-/// 写 `IS NULL`——`= NULL` 在 SQL 里永远不成立。整行值配不上第二行时 `LIMIT 1` 兜住。
-fn update_sql(table: &str, columns: &[crate::db::Column], row: &[Cell]) -> String {
-    let sets: Vec<String> = columns
+/// 多行合成一条语句（`VALUES` 后一行一组），不摆几条 `INSERT` 并排——一次提交，
+/// 单行时拼出来的和以前一个字不差。
+fn insert_sql(table: &str, columns: &[crate::db::Column], rows: &[&[Cell]]) -> String {
+    let names: Vec<String> = columns.iter().map(|c| sql_ident(&c.name)).collect();
+    let groups: Vec<String> = rows
         .iter()
-        .zip(row)
-        .map(|(c, cell)| format!("{} = {}", sql_ident(&c.name), sql_literal(cell, &c.type_name)))
-        .collect();
-    let wheres: Vec<String> = columns
-        .iter()
-        .zip(row)
-        .map(|(c, cell)| {
-            if cell.is_null() {
-                format!("{} IS NULL", sql_ident(&c.name))
-            } else {
-                format!(
-                    "{} = {}",
-                    sql_ident(&c.name),
-                    sql_literal(cell, &c.type_name)
-                )
-            }
+        .map(|row| {
+            let values: Vec<String> = columns
+                .iter()
+                .zip(*row)
+                .map(|(c, cell)| sql_literal(cell, &c.type_name))
+                .collect();
+            format!("({})", values.join(", "))
         })
         .collect();
     format!(
-        "UPDATE {} SET {} WHERE {} LIMIT 1;\n",
+        "INSERT INTO {} ({}) VALUES {};\n",
         sql_ident(table),
-        sets.join(", "),
-        wheres.join(" AND ")
+        names.join(", "),
+        groups.join(",\n")
     )
+}
+
+/// 选中的几行拼成 UPDATE，一行一条。
+///
+/// 不合成一条：一条 UPDATE 只能有一套 `SET`，几行各自的新值拼不到一块儿去。
+///
+/// 结果里不带主键信息（文本协议不返回索引），WHERE 只能拿整行的列值去配，NULL 那列
+/// 写 `IS NULL`——`= NULL` 在 SQL 里永远不成立。整行值配不上第二行时 `LIMIT 1` 兜住。
+fn update_sql(table: &str, columns: &[crate::db::Column], rows: &[&[Cell]]) -> String {
+    rows.iter()
+        .map(|row| {
+            let sets: Vec<String> = columns
+                .iter()
+                .zip(*row)
+                .map(|(c, cell)| format!("{} = {}", sql_ident(&c.name), sql_literal(cell, &c.type_name)))
+                .collect();
+            let wheres: Vec<String> = columns
+                .iter()
+                .zip(*row)
+                .map(|(c, cell)| {
+                    if cell.is_null() {
+                        format!("{} IS NULL", sql_ident(&c.name))
+                    } else {
+                        format!(
+                            "{} = {}",
+                            sql_ident(&c.name),
+                            sql_literal(cell, &c.type_name)
+                        )
+                    }
+                })
+                .collect();
+            format!(
+                "UPDATE {} SET {} WHERE {} LIMIT 1;\n",
+                sql_ident(table),
+                sets.join(", "),
+                wheres.join(" AND ")
+            )
+        })
+        .collect()
 }
 
 /// 详情窗口里的一栏。
@@ -2129,17 +2220,33 @@ mod tests {
         pos: egui::Pos2,
         t: f64,
     ) -> egui::FullOutput {
+        click_mod(dock, ctx, pos, t, egui::Modifiers::NONE)
+    }
+
+    /// 按住修饰键按一下。
+    ///
+    /// 修饰键另外发一条 `ModifiersChanged`：egui 的 `InputState::modifiers`（界面问
+    /// 「这会儿按住了什么」要的那个）只由这条更新，`PointerButton` 自带的那一份只用来
+    /// 判双击。收尾再发一条空修饰，别让它一直挂到下一帧。
+    fn click_mod(
+        dock: &mut ResultsDock,
+        ctx: &egui::Context,
+        pos: egui::Pos2,
+        t: f64,
+        mods: egui::Modifiers,
+    ) -> egui::FullOutput {
         let mut at = |pressed: bool, step: f64| {
             show_pass(
                 dock,
                 ctx,
                 vec![
+                    egui::Event::ModifiersChanged(mods),
                     egui::Event::PointerMoved(pos),
                     egui::Event::PointerButton {
                         pos,
                         button: egui::PointerButton::Primary,
                         pressed,
-                        modifiers: egui::Modifiers::NONE,
+                        modifiers: mods,
                     },
                 ],
                 step,
@@ -2147,7 +2254,12 @@ mod tests {
         };
         at(true, t);
         let out = at(false, t + 0.05);
-        show_pass(dock, ctx, vec![], t + 0.10);
+        show_pass(
+            dock,
+            ctx,
+            vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)],
+            t + 0.10,
+        );
         out
     }
 
@@ -2394,6 +2506,225 @@ mod tests {
             ],
             "WHERE 里 NULL 那列得写 IS NULL"
         );
+    }
+
+    /// 三种点法各管一件事，全在 `pick` 这一处判，别散到格子的 closures 里。
+    #[test]
+    fn picking_rows_follows_the_three_click_modes() {
+        let mut sel = Vec::new();
+        let mut anchor = None;
+        let none = egui::Modifiers::NONE;
+        let ctrl = egui::Modifiers::CTRL;
+        let shift = egui::Modifiers::SHIFT;
+
+        pick(&mut sel, &mut anchor, 3, none);
+        assert_eq!(sel, [3], "裸点只留这一行");
+        assert_eq!(anchor, Some(3), "起点跟着裸点走");
+        pick(&mut sel, &mut anchor, 3, none);
+        assert!(sel.is_empty(), "再点同一行等于取消");
+        assert_eq!(anchor, None, "取消了就不留起点");
+
+        pick(&mut sel, &mut anchor, 6, ctrl);
+        pick(&mut sel, &mut anchor, 1, ctrl);
+        assert_eq!(sel, [1, 6], "Ctrl+点 加行，行号排升序");
+        pick(&mut sel, &mut anchor, 6, ctrl);
+        assert_eq!(sel, [1], "Ctrl+点 已有的那行是摘掉，不是再塞一份");
+
+        pick(&mut sel, &mut anchor, 6, none);
+        pick(&mut sel, &mut anchor, 2, shift);
+        assert_eq!(sel, [2, 3, 4, 5, 6], "Shift+点 从起点连到终点");
+        assert_eq!(anchor, Some(6), "Shift 不动起点");
+        pick(&mut sel, &mut anchor, 8, shift);
+        assert_eq!(sel, [6, 7, 8], "连着按 Shift 只换终点，起点还在 6");
+    }
+
+    /// 多行选中那一排：报的是行数，导出的 INSERT 合成一条、UPDATE 一行一条。
+    #[test]
+    fn several_selected_rows_export_together() {
+        let mut dock = ResultsDock::new();
+        dock.start_run(
+            "本机",
+            "查用户",
+            &parts(&["SELECT id, note FROM users"]),
+            None,
+        );
+        let one = StatementResult {
+            columns: typed(&[("id", "LONGLONG"), ("note", "VAR_STRING")]),
+            rows: vec![
+                vec![Cell::Text("7".into()), Cell::Text("甲".into())],
+                vec![Cell::Text("8".into()), Cell::Text("乙".into())],
+                vec![Cell::Text("9".into()), Cell::Null],
+                vec![Cell::Text("10".into()), Cell::Text("丁".into())],
+            ],
+            affected_rows: 4,
+            last_insert_id: 0,
+            warnings: 0,
+            truncated: false,
+            elapsed_ms: 1,
+            preview: "SELECT".into(),
+        };
+        dock.on_event(&event(1, Ok(DbOutcome::Statement(one))));
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let mark = egui::Style::default().visuals.selection.bg_fill;
+        let out = show_pass(&mut dock, &ctx, vec![], 0.0);
+        let row2 = spot(&out, "2").expect("第二行的行号没画出来");
+        let row4 = spot(&out, "4").expect("第四行的行号没画出来");
+        click(&mut dock, &ctx, row2, 1.0);
+        click_mod(&mut dock, &ctx, row4, 1.5, egui::Modifiers::CTRL);
+
+        let out = show_pass(&mut dock, &ctx, vec![], 2.0);
+        let shown = texts(&out);
+        assert!(
+            shown.iter().any(|t| t == "已选中 2 行"),
+            "选了两行报的还是行号：{shown:?}"
+        );
+        assert!(
+            lit(&out, mark) >= 4,
+            "两行都该亮，每行两格"
+        );
+
+        let at = spot(&out, "导出 INSERT").expect("那一排里没有「导出 INSERT」");
+        let out = click(&mut dock, &ctx, at, 3.0);
+        assert_eq!(
+            copied(&out),
+            vec![
+                "INSERT INTO `users` (`id`, `note`) VALUES (8, '乙'),\n(10, '丁');\n".to_string()
+            ],
+            "两行合成一条语句，VALUES 一行一组"
+        );
+
+        let at = spot(&out, "导出 UPDATE").expect("那一排里没有「导出 UPDATE」");
+        let out = click(&mut dock, &ctx, at, 4.0);
+        assert_eq!(
+            copied(&out),
+            vec![
+                "UPDATE `users` SET `id` = 8, `note` = '乙' WHERE `id` = 8 AND `note` = '乙' LIMIT 1;\n\
+                 UPDATE `users` SET `id` = 10, `note` = '丁' WHERE `id` = 10 AND `note` = '丁' LIMIT 1;\n"
+                    .to_string()
+            ],
+            "UPDATE 一套 SET 配一行，只能一行一条"
+        );
+
+        let at = spot(&out, "复制选中行").expect("多行时那一排该换成「复制选中行」");
+        let out = click(&mut dock, &ctx, at, 5.0);
+        assert_eq!(
+            copied(&out),
+            vec!["8\t乙\n10\t丁".to_string()],
+            "选中的两行各占一行，还是制表符分隔"
+        );
+
+        // 裸点把选中重设成第 4 行，再按 Shift 点第 2 行——从起点往回框一段
+        click(&mut dock, &ctx, row4, 6.0);
+        click_mod(&mut dock, &ctx, row2, 6.5, egui::Modifiers::SHIFT);
+        let out = show_pass(&mut dock, &ctx, vec![], 7.0);
+        assert!(
+            texts(&out).iter().any(|t| t == "已选中 3 行"),
+            "从第 4 行往回框到第 2 行，该是 3 行：{:?}",
+            texts(&out)
+        );
+    }
+
+    /// 详情窗口的高度该一次到位，不跟着内容一帧帧往上爬。
+    ///
+    /// 字号推到 40 是故意的：底部那排按钮跟着长高，旧写法按 `interact_size.y + 14`
+    /// 估算预留，估少的那几十字每帧加到窗口高度上，一路够到屏幕上限（egui 的
+    /// `Resize` 只把 desired_size 往 `last_content_size` 上抬，而滚动区拿的高度
+    /// 又跟着窗口变，就是个正反馈）。现在改成先量准底部再让滚动区吃满剩余。
+    #[test]
+    fn row_detail_window_height_does_not_climb() {
+        let mut dock = ResultsDock::new();
+        dock.start_run("本机", "查用户", &parts(&["SELECT note FROM t"]), None);
+        let long = "很长的值abcdefgh".repeat(80);
+        let one = table(
+            &["note"],
+            vec![vec![Cell::Text(long)], vec![Cell::Text("乙".into())]],
+        );
+        dock.on_event(&event(1, Ok(DbOutcome::Statement(one))));
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        ctx.all_styles_mut(|s| {
+            for sty in [
+                egui::TextStyle::Body,
+                egui::TextStyle::Monospace,
+                egui::TextStyle::Small,
+                egui::TextStyle::Button,
+            ] {
+                s.text_styles.insert(sty, egui::FontId::proportional(40.0));
+            }
+        });
+        let id = egui::Id::unique(("db_row_detail", 1u64));
+        let out = show_pass(&mut dock, &ctx, vec![], 0.0);
+        let arrow = spot(&out, "▸").expect("没有 ▸");
+        click(&mut dock, &ctx, arrow, 1.0);
+
+        let first = ctx
+            .memory(|m| m.area_rect(id))
+            .expect("详情窗口没开出来");
+        for i in 0..14 {
+            let t = 2.0 + i as f64 * 0.1;
+            show_pass(&mut dock, &ctx, vec![], t);
+            let now = ctx.memory(|m| m.area_rect(id)).expect("窗口掉了");
+            assert_eq!(
+                now.height(),
+                first.height(),
+                "帧 {i} 高度从 {} 长到了 {}，又在跟着内容爬",
+                first.height(),
+                now.height()
+            );
+            assert!(
+                now.height() < 0.6 * ctx.viewport_rect().height(),
+                "帧 {i} 窗口高 {}，屏幕才 {}，都快顶满整个应用了",
+                now.height(),
+                ctx.viewport_rect().height()
+            );
+        }
+    }
+
+    /// 单元格全文窗口同一条规矩。
+    #[test]
+    fn cell_peek_window_height_does_not_climb() {
+        let mut dock = ResultsDock::new();
+        dock.start_run("本机", "查用户", &parts(&["SELECT note FROM t"]), None);
+        let long = "很长的值abcdefgh".repeat(80);
+        let one = table(&["note"], vec![vec![Cell::Text(long.clone())]]);
+        dock.on_event(&event(1, Ok(DbOutcome::Statement(one))));
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        ctx.all_styles_mut(|s| {
+            for sty in [
+                egui::TextStyle::Body,
+                egui::TextStyle::Monospace,
+                egui::TextStyle::Small,
+                egui::TextStyle::Button,
+            ] {
+                s.text_styles.insert(sty, egui::FontId::proportional(40.0));
+            }
+        });
+        assert!(
+            double_click(&mut dock, &ctx, &long),
+            "长值那一格没画出来，双击无从下手"
+        );
+        let id = egui::Id::unique(("db_cell_peek", 1u64, 0usize, 0usize));
+
+        let first = ctx
+            .memory(|m| m.area_rect(id))
+            .expect("双击没开出全文窗口");
+        for i in 0..14 {
+            let t = 2.0 + i as f64 * 0.1;
+            show_pass(&mut dock, &ctx, vec![], t);
+            let now = ctx.memory(|m| m.area_rect(id)).expect("窗口掉了");
+            assert_eq!(
+                now.height(),
+                first.height(),
+                "帧 {i} 高度从 {} 长到了 {}，又在跟着内容爬",
+                first.height(),
+                now.height()
+            );
+        }
     }
 
     /// 语句里认不出表名（选中一段跑的、或者压根不带表名的），那两个按钮就不该出现。
@@ -3306,7 +3637,7 @@ mod tests {
             Cell::Blob(vec![0x0d, 0xff]),
         ];
         assert_eq!(
-            insert_sql("users", &cols, &row),
+            insert_sql("users", &cols, &[row.as_slice()]),
             "INSERT INTO `users` (`id`, `name`, `note`, `pic`) VALUES (7, 'O\\'Brien', NULL, 0x0dff);\n",
             "数值裸写、文本带引号、NULL 就是 NULL、二进制走 0x…"
         );
@@ -3317,7 +3648,7 @@ mod tests {
         let cols = typed(&[("id", "LONGLONG"), ("note", "VAR_STRING")]);
         let row = vec![Cell::Text("7".into()), Cell::Null];
         assert_eq!(
-            update_sql("my.users", &cols, &row),
+            update_sql("my.users", &cols, &[row.as_slice()]),
             "UPDATE `my`.`users` SET `id` = 7, `note` = NULL \
              WHERE `id` = 7 AND `note` IS NULL LIMIT 1;\n",
             "结果里不带主键，WHERE 只能整行列值；NULL 那列必须写 IS NULL，\
