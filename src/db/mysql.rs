@@ -73,6 +73,9 @@ impl MysqlDriver {
             .map(|col| Column {
                 name: col.name_str().into_owned(),
                 type_name: format!("{:?}", col.column_type()),
+                auto_increment: col
+                    .flags()
+                    .contains(mysql::consts::ColumnFlags::AUTO_INCREMENT_FLAG),
             })
             .collect();
 

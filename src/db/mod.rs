@@ -161,11 +161,17 @@ impl ConnectionSpec {
     }
 }
 
-/// 一列的定义。`type_name` 只做表头提示，不参与渲染逻辑。
+/// 一列的定义。`type_name` 只做表头提示和导出时的取值依据，不参与网格渲染。
 #[derive(Clone, Debug, PartialEq)]
 pub struct Column {
     pub name: String,
     pub type_name: String,
+    /// 值由数据库自己填的列（`AUTO_INCREMENT`）。
+    ///
+    /// 文本协议的结果集元数据就带着这一位（列标志的第 10 位），不用另发
+    /// `SHOW COLUMNS`。生成列（`AS … VIRTUAL/STORED`）和 `DEFAULT CURRENT_TIMESTAMP`
+    /// 在元数据里没有对应的位，认不出来。
+    pub auto_increment: bool,
 }
 
 /// 一个单元格。
@@ -784,10 +790,13 @@ impl Driver for MockDriver {
                     Column {
                         name: "id".into(),
                         type_name: "LONGLONG".into(),
+                        // 假驱动照真表摆：自增主键在元数据里有标志位，导出时能挑掉
+                        auto_increment: true,
                     },
                     Column {
                         name: "name".into(),
                         type_name: "VARCHAR".into(),
+                        auto_increment: false,
                     },
                 ]
             } else {

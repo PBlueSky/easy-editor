@@ -80,9 +80,10 @@ pub struct Panel {
     /// 这条语句出自哪个文件的哪个字节，用来跳回去、跑完回写状态
     pub origin: Option<Origin>,
     pub slot: Slot,
-    /// 整行选中的哪几行（0 基，升序去重）。选中只是高亮 + 下面那排按钮，不动剪贴板。
+    /// 整行选中的哪几行（0 基，升序去重）。选中只是高亮，动剪贴板的是格子的右键菜单。
     ///
     /// 点行号单选、Ctrl+点 加减一行、Shift+点 连成一段，导 SQL 要的正是「这几行」。
+    /// 点表格以外的地方把它清空，见 [`grid`] 末尾那段。
     pub selected: Vec<usize>,
     /// Shift+点 的起点：最近一次不带 Shift 点下去的那一行。清空选中就跟着清空。
     pub anchor: Option<usize>,
@@ -169,6 +170,11 @@ pub struct ResultsDock {
     /// 报错语句在文件里的位置，攒着等 app 每帧取走标红。带上语句原文，
     /// app 拿它对一下区间——中间用户改过文本的话区间就不作数了。
     fails: Vec<(PathBuf, usize, usize, String)>,
+    /// 导出 SQL 时要不要跳过数据库自己填的那些列（`AUTO_INCREMENT`）。
+    ///
+    /// 记在结果区这一份、而不是每个面板一份：勾它是为了一段连着几次的走法
+    /// （把一批行倒出来喂回测试库），换一份结果就弹回默认等于每份重勾一次。
+    export_skip_auto: bool,
 }
 
 impl Default for ResultsDock {
@@ -190,6 +196,7 @@ impl ResultsDock {
             popup: None,
             pending_export: None,
             fails: Vec::new(),
+            export_skip_auto: false,
         }
     }
 
@@ -409,7 +416,7 @@ impl ResultsDock {
             };
             ui.label(RichText::new(head).small().strong());
             ui.label(weak(
-                "点页签换一份 · 右键页签一次关一批 · 双击格子看全文 · 点行号选整行 · 行首 ▸ 开详情",
+                "点页签换一份 · 右键页签一次关一批 · 双击格子看全文 · 点行号选整行 · 右键一格复制或导 SQL",
             ));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if crate::theme::chip(ui, "关闭")
@@ -472,7 +479,12 @@ impl ResultsDock {
                 };
                 // 页签只留一份在屏上，抬头那行说的就是这一份出自哪一批
                 batch_row(ui, &self.panels[index]);
-                open_panel(ui, &mut self.panels[index], &mut act);
+                open_panel(
+                    ui,
+                    &mut self.panels[index],
+                    &mut act,
+                    &mut self.export_skip_auto,
+                );
             });
         if let Some(task) = act.pick {
             self.active = Some(task);
@@ -529,14 +541,16 @@ impl ResultsDock {
             .open(&mut open)
             .show(ctx, |ui| {
                 let panel = &mut self.panels[index];
-                ui.label(weak(summary(panel)));
+                // 抬头那一行连选中一起报，和底部面板那条同一份文案
+                ui.label(weak(status_line(panel)));
                 ui.separator();
+                let skip_auto = &mut self.export_skip_auto;
                 if matches!(&panel.slot, Slot::Done(one) if one.is_query()) {
                     // 窗口给多少用多少，不像底部那样只留五来行
                     let height = ui.available_height() - 12.0;
-                    grid(ui, panel, height);
+                    grid(ui, panel, height, skip_auto);
                 } else {
-                    body(ui, panel);
+                    body(ui, panel, skip_auto);
                 }
             });
         if !open {
@@ -818,7 +832,7 @@ fn batch_row(ui: &mut Ui, panel: &Panel) {
     });
 }
 
-fn open_panel(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
+fn open_panel(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked, skip_auto: &mut bool) {
     let dark = ui.visuals().dark_mode;
     let line = if dark {
         Color32::from_rgb(70, 76, 86)
@@ -832,7 +846,7 @@ fn open_panel(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
         .show(ui, |ui| {
             header(ui, panel, act);
             ui.separator();
-            body(ui, panel);
+            body(ui, panel, skip_auto);
         });
     // 左边一条状态色。面板连着排的时候，标题和语句都长得差不多，
     // 扫一眼颜色才分得出哪几条成了、哪条砸了。
@@ -1125,7 +1139,7 @@ fn header(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
                     act.jump = Some((origin.path, origin.jump));
                 }
             }
-            ui.label(weak(summary(panel)));
+            ui.label(weak(status_line(panel)));
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                 ui.painter()
@@ -1147,14 +1161,14 @@ fn header(ui: &mut Ui, panel: &mut Panel, act: &mut Clicked) {
     );
 }
 
-fn body(ui: &mut Ui, panel: &mut Panel) {
+fn body(ui: &mut Ui, panel: &mut Panel, skip_auto: &mut bool) {
     if matches!(&panel.slot, Slot::Done(one) if one.is_query()) {
         // 列表高度跟着这一格剩下的空间走，不钉死在一个数上：底栏拖到多高就能一次看
         // 多少行。以前写死 120 pt，把底栏拉高一截，多出来的地方全空着，
         // 而那份结果明明还有十几行在滚动条后面。
         // 留 12 pt 是给这一格自己的横向滚动条的，不留就两个人抢最后一行高。
         let height = (ui.available_height() - 12.0).max(80.0);
-        grid(ui, panel, height);
+        grid(ui, panel, height, skip_auto);
         return;
     }
     match &panel.slot {
@@ -1196,8 +1210,11 @@ fn body(ui: &mut Ui, panel: &mut Panel) {
 /// 每格都是截断显示，装不下的那一截有两条路看全：双击格子把这一格单独弹出来
 /// （见 [`draw_cell_peek`]），行首 ▸ 在屏幕右边单独开一个窗口看整行
 /// （见 [`draw_row_detail`]）。点行号选行——裸点一行、Ctrl+点 加减一行、Shift+点 一段，
-/// 格子底下跟出一排按钮，把选中的那几行导出成 SQL 或制表符文本。
-fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
+/// 右键任意一格把这一行（或选中的那几行）复制成文本、导出成 SQL。
+/// 点表格以外的地方自动收掉选中，所以没有「取消选中」那一个按钮。
+///
+/// `skip_auto` 是结果区那一份「导出时跳过数据库自己填的列」，右键菜单里那个勾直接改它。
+fn grid(ui: &mut Ui, panel: &mut Panel, height: f32, skip_auto: &mut bool) {
     // 拆字段借：网格读 `slot` 里的结果，选中和详情要写回面板
     let Panel {
         task,
@@ -1223,9 +1240,16 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
     let ch = ui.fonts_mut(|f| f.glyph_width(&mono, '0')).max(1.0);
     let row_h = ui.text_style_height(&egui::TextStyle::Monospace) + 5.0;
 
+    // 导出 SQL 要的表名从这条语句里认，认出来菜单里才摆导出那几条。
+    // 结果里有没有数据库自己填的列（自增）也在这儿问一次，别一格一问。
+    // 叫 `table_name`：`table` 已经被下面那个 `TableBuilder` 占了。
+    let table_name = table_of(stmt.as_str());
+    let has_auto = one.columns.iter().any(|col| col.auto_increment);
+
     // 横向滚动条只能自己套：egui_extras 的表体内部写死 `ScrollArea::new([false, vscroll])`，
     // 压根没有横向这一维，列一多就只能看着被裁。表头和表体一起放进这个滚动区——
     // 表头是画在表体的滚动区外面的，分开包两半会列错位。
+    let before = ui.cursor();
     ScrollArea::horizontal()
         .id_salt(("db_grid_x", task))
         .auto_shrink([false, true])
@@ -1358,7 +1382,13 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                                         pinned: peek.is_some_and(|p| p.pinned),
                                     });
                                 }
-                                resp.context_menu(|ui| {
+                                // egui 的右键菜单默认「点一下就关」，那个「去掉自动生成列」的勾
+                                // 因此会把菜单抖掉，下一次导出得重新右键。改成只认菜单外的那一下：
+                                // 勾完接着点导出，动作项各自用 ui.close() 收。
+                                let menu = egui::Popup::context_menu(&resp).close_behavior(
+                                    egui::PopupCloseBehavior::CloseOnClickOutside,
+                                );
+                                menu.show(|ui| {
                                     if ui
                                         .button("查看完整内容")
                                         .on_hover_text(
@@ -1382,8 +1412,10 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                                         ui.ctx().copy_text(text.clone());
                                         ui.close();
                                     }
+                                    ui.separator();
                                     if ui
                                         .button("复制整行")
+                                        .on_hover_text("制表符分隔的一行，直接粘进表格软件")
                                         .on_hover_cursor(crate::theme::HAND)
                                         .clicked()
                                     {
@@ -1391,6 +1423,25 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                                             tsv_row(one.rows[index].iter().map(Cell::display));
                                         ui.ctx().copy_text(line);
                                         ui.close();
+                                    }
+                                    // 选中的不止这一行时，整批那一条和这一行那一条并排摆着：
+                                    // 导完这一行接着导整批，不用先回表格里把行重新点一遍
+                                    if selected.len() > 1 {
+                                        let rows = picked_rows(one, selected);
+                                        if ui
+                                            .button(format!("复制选中 {} 行", rows.len()))
+                                            .on_hover_text("选中的几行各占一行，还是制表符分隔")
+                                            .on_hover_cursor(crate::theme::HAND)
+                                            .clicked()
+                                        {
+                                            let body = rows
+                                                .iter()
+                                                .map(|row| tsv_row(row.iter().map(Cell::display)))
+                                                .collect::<Vec<_>>()
+                                                .join("\n");
+                                            ui.ctx().copy_text(body);
+                                            ui.close();
+                                        }
                                     }
                                     if ui
                                         .button("复制整表")
@@ -1400,6 +1451,45 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                                         ui.ctx().copy_text(to_tsv(one));
                                         ui.close();
                                     }
+                                    ui.separator();
+                                    match &table_name {
+                                        // 语句里认不出表名就只留一句说明——拼出
+                                        // `INSERT INTO (SELECT` 那种半截话，比不给这一条更难查
+                                        None => {
+                                            ui.label(weak("认不出表名，导不了 SQL"));
+                                        }
+                                        Some(name) => {
+                                            export_menu(
+                                                ui,
+                                                name,
+                                                &one.columns,
+                                                &[one.rows[index].as_slice()],
+                                                "这一行",
+                                                *skip_auto,
+                                            );
+                                            if selected.len() > 1 {
+                                                let rows = picked_rows(one, selected);
+                                                let head = format!("选中 {} 行", rows.len());
+                                                export_menu(
+                                                    ui, name, &one.columns, &rows, &head,
+                                                    *skip_auto,
+                                                );
+                                            }
+                                            if has_auto {
+                                                ui.separator();
+                                                ui.checkbox(skip_auto, "去掉自动生成列")
+                                                    .on_hover_text(
+                                                        "勾上后 INSERT 的列名和值、UPDATE 的 SET 里\
+                                                         不再带这些列——它们的值由数据库自己填，\
+                                                         写进语句里反而容易撞主键。\n\
+                                                         只认 AUTO_INCREMENT：生成列和 \
+                                                         DEFAULT CURRENT_TIMESTAMP 在结果元数据里\
+                                                         没有标志位，认不出来，那两种得自己从语句里删。\n\
+                                                         UPDATE 的 WHERE 照旧用整行的值去配，不受这个勾影响。",
+                                                    );
+                                            }
+                                        }
+                                    }
                                 });
                             });
                         }
@@ -1407,93 +1497,29 @@ fn grid(ui: &mut Ui, panel: &mut Panel, height: f32) {
                 });
         });
 
-    // 选中那几行的去处。快捷键留给编辑器，这里只给按钮——结果区抢一个 Ctrl+C
-    // 会把正在编辑器里拷贝的那只手抢走。
-    if !selected.is_empty() {
-        let rows: Vec<&[Cell]> = selected
-            .iter()
-            .filter_map(|i| one.rows.get(*i).map(Vec::as_slice))
-            .collect();
-        let many = rows.len();
-        ui.add_space(2.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(picked_label(selected)).small().strong());
-            if crate::theme::chip(ui, if many == 1 { "复制整行" } else { "复制选中行" })
-                .on_hover_text(if many == 1 {
-                    "制表符分隔的一行，直接粘进表格软件"
-                } else {
-                    "选中的几行各占一行，还是制表符分隔"
-                })
-                .clicked()
-            {
-                let text = rows
-                    .iter()
-                    .map(|row| tsv_row(row.iter().map(Cell::display)))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                ui.ctx().copy_text(text);
-            }
-            // 导出成 SQL：语句里认不出表名就只留一句说明——拼出 `INSERT INTO (SELECT`
-            // 那种半截话，比不给按钮更难查。
-            match table_of(stmt.as_str()) {
-                Some(table) => {
-                    if crate::theme::chip(ui, "导出 INSERT")
-                        .on_hover_text(format!(
-                            "把选中的 {many} 行拼成一条 INSERT INTO {table}（列名照结果里的顺序，一列不落），拷进剪贴板。\n\
-                             数值列裸写、文本列带引号、NULL 就是 NULL、二进制列走 0x…。\n\
-                             多行合成一条语句：VALUES 后面一行一组，一次提交。",
-                        ))
-                        .clicked()
-                    {
-                        let sql = insert_sql(&table, &one.columns, &rows);
-                        ui.ctx().copy_text(sql);
-                    }
-                    if crate::theme::chip(ui, "导出 UPDATE")
-                        .on_hover_text(
-                            "把选中的每一行各拼成一条 UPDATE，拷进剪贴板。\n\
-                             结果里不带主键信息，WHERE 只能拿整行的列值去配（NULL 那列写 IS NULL），\n\
-                             每条末尾再加 LIMIT 1 兜住多行。改过值的行导出来配不上原行，先回表格确认。",
-                        )
-                        .clicked()
-                    {
-                        let sql = update_sql(&table, &one.columns, &rows);
-                        ui.ctx().copy_text(sql);
-                    }
-                }
-                None => {
-                    ui.label(weak("认不出表名，导不了 SQL"));
-                }
-            }
-            let resp = crate::theme::chip(ui, "看详情").on_hover_text(
-                "在右边单独开一个窗口，逐列看完整值。一次只能放一行，看的是最后点的那一行。\n\
-                 点了别处它自己收；要一直看着就勾上窗口里的「钉住」。",
-            );
-            if resp.clicked() {
-                // 记的是这一下按在哪，不是按钮中心：详情窗口拿它挡「点外面就关」，
-                // 差着几个像素就会被当成外面，刚开就关。
-                let at = resp
-                    .interact_pointer_pos()
-                    .unwrap_or_else(|| resp.rect.center());
-                let pin = detail.is_some_and(|d| d.pinned);
-                let json = detail.is_some_and(|d| d.json);
-                // 一次只放得下一行：看最后点的那一行（anchor）；它已经被 Ctrl+点 摘掉
-                // 就退到选中里最后一行
-                let show = match anchor {
-                    Some(a) if selected.contains(a) => *a,
-                    _ => selected.last().copied().unwrap_or(0),
-                };
-                *detail = Some(Detail {
-                    row: show,
-                    at,
-                    pinned: pin,
-                    json,
-                });
-            }
-            if crate::theme::chip(ui, "取消选中").clicked() {
-                selected.clear();
-                *anchor = None;
-            }
-        });
+    // 点表格以外的地方就把选中收掉。以前那一排「取消选中」在格子底下，
+    // 数据一多它自己就滚出屏了——收一次选中比重选一遍还费劲。
+    // 落在弹出层上的那一下不算「点旁边」：右键菜单里点一条导出，顺手洗掉选中的话，
+    // 下一条导出的就不是这批了。整行详情、单格全文那两扇同理。
+    let strip = egui::Rect::from_min_max(
+        before.min,
+        egui::pos2(before.max.x, ui.cursor().min.y.max(before.min.y)),
+    );
+    let pressed = ui.ctx().input(|i| {
+        i.pointer
+            .button_pressed(egui::PointerButton::Primary)
+            .then(|| i.pointer.latest_pos())
+            .flatten()
+    });
+    if let Some(pos) = pressed {
+        let floating = ui
+            .ctx()
+            .layer_id_at(pos)
+            .is_some_and(|layer| layer.order != egui::Order::Background);
+        if !strip.contains(pos) && !floating {
+            selected.clear();
+            *anchor = None;
+        }
     }
     if one.truncated {
         ui.label(weak(
@@ -1539,11 +1565,65 @@ fn pick(
     }
 }
 
-/// 动作条开头那句：一行报行号，几行报数量。选了 40 行还挨个列出来，只会把那一排挤跑。
+/// 抬头那一行说选中的是什么：一行报行号，几行报数量。选了 40 行还挨个列出来，
+/// 只会把那一格挤跑。
 fn picked_label(selected: &[usize]) -> String {
     match selected {
         [only] => format!("已选中第 {} 行", only + 1),
         many => format!("已选中 {} 行", many.len()),
+    }
+}
+
+/// 选中的那几行，按行号从小到大。行号对不上号的跳过——换一份结果时旧行号可能还在。
+fn picked_rows<'a>(one: &'a StatementResult, selected: &[usize]) -> Vec<&'a [Cell]> {
+    selected
+        .iter()
+        .filter_map(|i| one.rows.get(*i).map(Vec::as_slice))
+        .collect()
+}
+
+/// 右键菜单里那组导出项。`head` 说的是对象是哪几行（「这一行」或「选中 5 行」），
+/// 文案和拼 SQL 都跟着它走；单行和批量两组共用这一条路。
+fn export_menu(
+    ui: &mut Ui,
+    table: &str,
+    columns: &[crate::db::Column],
+    rows: &[&[Cell]],
+    head: &str,
+    skip_auto: bool,
+) {
+    // 那句「按菜单里的勾去掉了」是必要的：同一格右键，勾与不勾导出来的列不一样，
+    // 不说清就像按钮坏了
+    let off = if skip_auto {
+        "\n自增列已按菜单下面那个勾去掉（列名和值一起少一列），WHERE 那一段不受影响。"
+    } else {
+        ""
+    };
+    if ui
+        .button(format!("导出{head} INSERT"))
+        .on_hover_cursor(crate::theme::HAND)
+        .on_hover_text(format!(
+            "把{head}拼成一条 INSERT INTO {table}（列名照结果里的顺序），拷进剪贴板。\n\
+             数值列裸写、文本列带引号、NULL 就是 NULL、二进制列走 0x…。\n\
+             多行合成一条语句：VALUES 后面一行一组，一次提交。{off}",
+        ))
+        .clicked()
+    {
+        ui.ctx().copy_text(insert_sql(table, columns, rows, skip_auto));
+        ui.close();
+    }
+    if ui
+        .button(format!("导出{head} UPDATE"))
+        .on_hover_cursor(crate::theme::HAND)
+        .on_hover_text(format!(
+            "把{head}每一行各拼成一条 UPDATE，拷进剪贴板。\n\
+             结果里不带主键信息，WHERE 只能拿整行的列值去配（NULL 那列写 IS NULL），\n\
+             每条末尾再加 LIMIT 1 兜住多行。改过值的行导出来配不上原行，先回表格确认。{off}",
+        ))
+        .clicked()
+    {
+        ui.ctx().copy_text(update_sql(table, columns, rows, skip_auto));
+        ui.close();
     }
 }
 
@@ -1750,19 +1830,28 @@ fn table_of(stmt: &str) -> Option<String> {
     None
 }
 
-/// 选中的几行拼成一条 INSERT：列名和值都按结果里的列顺序，一列不落。
+/// 选中的几行拼成一条 INSERT：列名和值都按结果里的列顺序。
 ///
 /// 多行合成一条语句（`VALUES` 后一行一组），不摆几条 `INSERT` 并排——一次提交，
 /// 单行时拼出来的和以前一个字不差。
-fn insert_sql(table: &str, columns: &[crate::db::Column], rows: &[&[Cell]]) -> String {
-    let names: Vec<String> = columns.iter().map(|c| sql_ident(&c.name)).collect();
+///
+/// `skip_auto` 是右键菜单里那个勾：数据库自己填的那些列（自增）不进列名表，
+/// 值那一组也跟着少一个。全都自增时无列可写，`INSERT INTO t () VALUES ()` 不是合法
+/// SQL，那就照旧全写。
+fn insert_sql(
+    table: &str,
+    columns: &[crate::db::Column],
+    rows: &[&[Cell]],
+    skip_auto: bool,
+) -> String {
+    let keep = kept_columns(columns, skip_auto);
+    let names: Vec<String> = keep.iter().map(|(_, col)| sql_ident(&col.name)).collect();
     let groups: Vec<String> = rows
         .iter()
         .map(|row| {
-            let values: Vec<String> = columns
+            let values: Vec<String> = keep
                 .iter()
-                .zip(*row)
-                .map(|(c, cell)| sql_literal(cell, &c.type_name))
+                .map(|(at, col)| sql_literal(&row[*at], &col.type_name))
                 .collect();
             format!("({})", values.join(", "))
         })
@@ -1781,13 +1870,27 @@ fn insert_sql(table: &str, columns: &[crate::db::Column], rows: &[&[Cell]]) -> S
 ///
 /// 结果里不带主键信息（文本协议不返回索引），WHERE 只能拿整行的列值去配，NULL 那列
 /// 写 `IS NULL`——`= NULL` 在 SQL 里永远不成立。整行值配不上第二行时 `LIMIT 1` 兜住。
-fn update_sql(table: &str, columns: &[crate::db::Column], rows: &[&[Cell]]) -> String {
+///
+/// `skip_auto` 只作用在 `SET` 那一段：那一列的值本来就由数据库填，写进去等于手动改主键。
+/// WHERE 照旧用整行的值，跳过它反倒配不准行。
+fn update_sql(
+    table: &str,
+    columns: &[crate::db::Column],
+    rows: &[&[Cell]],
+    skip_auto: bool,
+) -> String {
+    let keep = kept_columns(columns, skip_auto);
     rows.iter()
         .map(|row| {
-            let sets: Vec<String> = columns
+            let sets: Vec<String> = keep
                 .iter()
-                .zip(*row)
-                .map(|(c, cell)| format!("{} = {}", sql_ident(&c.name), sql_literal(cell, &c.type_name)))
+                .map(|(at, col)| {
+                    format!(
+                        "{} = {}",
+                        sql_ident(&col.name),
+                        sql_literal(&row[*at], &col.type_name)
+                    )
+                })
                 .collect();
             let wheres: Vec<String> = columns
                 .iter()
@@ -1812,6 +1915,26 @@ fn update_sql(table: &str, columns: &[crate::db::Column], rows: &[&[Cell]]) -> S
             )
         })
         .collect()
+}
+
+/// 导出时要写的列：`(结果里的下标, 列)`。
+///
+/// 按下标留着是因为值在行里按下摆放，挑掉几列以后得知道每列取行里第几个。
+fn kept_columns(
+    columns: &[crate::db::Column],
+    skip_auto: bool,
+) -> Vec<(usize, &crate::db::Column)> {
+    let keep: Vec<(usize, &crate::db::Column)> = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, col)| !(skip_auto && col.auto_increment))
+        .collect();
+    // 一列都不剩的话这个勾等于没勾：没有列名的 INSERT / 没有 SET 的 UPDATE 都跑不了
+    if keep.is_empty() {
+        columns.iter().enumerate().collect()
+    } else {
+        keep
+    }
 }
 
 /// 详情窗口里的一栏。
@@ -1952,6 +2075,20 @@ fn summary(panel: &Panel) -> String {
     format!("{} · {}", panel.conn, line)
 }
 
+/// 抬头那一行：结果本身，外加「现在选中的是哪几行」。
+///
+/// 格子底下那一排按钮撤了以后，选中只剩底色一个凭据，而右键批量导出的对象恰恰就是
+/// 这几行——看不见它，导完才发现少选了一行。
+fn status_line(panel: &Panel) -> String {
+    let line = summary(panel);
+    match &panel.slot {
+        Slot::Done(one) if one.is_query() && !panel.selected.is_empty() => {
+            format!("{line} · {}", picked_label(&panel.selected))
+        }
+        _ => line,
+    }
+}
+
 fn write_line(one: &StatementResult) -> String {
     let mut text = format!("影响 {} 行", one.affected_rows);
     if one.last_insert_id > 0 {
@@ -2013,10 +2150,12 @@ mod tests {
                 Column {
                     name: "name".into(),
                     type_name: "varchar(64)".into(),
+                    auto_increment: false,
                 },
                 Column {
                     name: "n".into(),
                     type_name: "int".into(),
+                    auto_increment: false,
                 },
             ],
             rows: cells,
@@ -2405,10 +2544,10 @@ mod tests {
         assert!(c8 < edge, "c8 落在了屏外：{c8:.0}");
     }
 
-    /// 点行号选中整行：底色铺满这一行，格子底下跟出一排按钮。
+    /// 点行号选中整行：底色铺满这一行，抬头跟着报「已选中第几行」。
     ///
-    /// 拷贝走按钮而不是 Ctrl+C——键盘那一下归编辑器，结果区抢过去会把用户
-    /// 正打算拷的那段文字换掉。
+    /// 拷贝走格子上的右键菜单而不是 Ctrl+C——键盘那一下归编辑器，结果区抢过去
+    /// 会把用户正打算拷的那段文字换掉。
     #[test]
     fn clicking_the_row_number_selects_the_whole_row() {
         let mut dock = ResultsDock::new();
@@ -2432,30 +2571,40 @@ mod tests {
         assert!(lit(&out, mark) >= 2, "整行没亮：两格至少该铺两块底色");
         let shown = texts(&out);
         assert!(
-            shown.iter().any(|t| t == "已选中第 2 行"),
-            "选中之后没跟出那一排按钮：{shown:?}"
+            shown.iter().any(|t| t.contains("已选中第 2 行")),
+            "选中了抬头却没报：{shown:?}"
         );
 
-        let pos = spot(&out, "复制整行").expect("那一排里没有「复制整行」");
-        let out = click(&mut dock, &ctx, pos, 2.0);
+        let cell = spot(&out, "乙").expect("第二行那格没画出来");
+        let out = right_click(&mut dock, &ctx, cell, 2.0);
+        let pos = spot(&out, "复制整行").expect("右键菜单里没有「复制整行」");
+        let out = click(&mut dock, &ctx, pos, 2.5);
         assert_eq!(
             copied(&out),
             vec!["乙".to_string()],
             "拷的该是选中那一行的原文"
         );
+        assert!(
+            lit(&out, mark) >= 2,
+            "点了菜单里的一条就把选中洗掉了，下一条复制的就不是这批"
+        );
 
-        // 再点一次行号取消：底色和按钮一起收
+        // 勾那种「记下选择」的条目不动菜单，动作条目还是点完就收
+        let out = show_pass(&mut dock, &ctx, vec![], 2.7);
+        assert_eq!(spot(&out, "复制整表"), None, "点完一条菜单还赖着不走");
+
+        // 再点一次行号取消：底色跟着收
         click(&mut dock, &ctx, row2, 3.0);
         let out = show_pass(&mut dock, &ctx, vec![], 3.2);
         assert_eq!(lit(&out, mark), 0, "取消选中了还亮着");
         let shown = texts(&out);
         assert!(
-            !shown.iter().any(|t| t == "已选中第 2 行"),
-            "取消选中了那一排还在：{shown:?}"
+            !shown.iter().any(|t| t.contains("已选中第 2 行")),
+            "取消选中了抬头还在报：{shown:?}"
         );
     }
 
-    /// 选中行那一排的两个导出按钮：表名从这条语句里认，认出来才摆按钮，
+    /// 右键一格里就有这两个导出：表名从这条语句里认，认出来才给那两条，
     /// 拼好的 SQL 直接进剪贴板——存盘框那一套得先把「拷一段」这条路挤掉，不值。
     #[test]
     fn a_selected_row_exports_itself_as_sql() {
@@ -2485,18 +2634,27 @@ mod tests {
         ctx.set_pixels_per_point(1.0);
         let out = show_pass(&mut dock, &ctx, vec![], 0.0);
         let row2 = spot(&out, "2").expect("第二行的行号没画出来");
-        let out = click(&mut dock, &ctx, row2, 1.0);
+        click(&mut dock, &ctx, row2, 1.0);
+        let out = show_pass(&mut dock, &ctx, vec![], 1.2);
+        let cell = spot(&out, "9").expect("第二行那格没画出来");
 
-        let at = spot(&out, "导出 INSERT").expect("那一排里没有「导出 INSERT」");
-        let out = click(&mut dock, &ctx, at, 2.0);
+        let out = right_click(&mut dock, &ctx, cell, 2.0);
+        let shown = texts(&out);
+        assert!(
+            !shown.iter().any(|t| t.starts_with("导出选中")),
+            "只选了一行，菜单里不该摆批量那两条：{shown:?}"
+        );
+        let at = spot(&out, "导出这一行 INSERT").expect("右键菜单里没有「导出这一行 INSERT」");
+        let out = click(&mut dock, &ctx, at, 2.5);
         assert_eq!(
             copied(&out),
             vec!["INSERT INTO `users` (`id`, `note`) VALUES (9, NULL);\n".to_string()],
-            "导的该是选中那一行，NULL 就是 NULL"
+            "导的该是右键那一行，NULL 就是 NULL"
         );
 
-        let at = spot(&out, "导出 UPDATE").expect("那一排里没有「导出 UPDATE」");
-        let out = click(&mut dock, &ctx, at, 3.0);
+        let out = right_click(&mut dock, &ctx, cell, 3.0);
+        let at = spot(&out, "导出这一行 UPDATE").expect("右键菜单里没有「导出这一行 UPDATE」");
+        let out = click(&mut dock, &ctx, at, 3.5);
         assert_eq!(
             copied(&out),
             vec![
@@ -2538,7 +2696,7 @@ mod tests {
         assert_eq!(sel, [6, 7, 8], "连着按 Shift 只换终点，起点还在 6");
     }
 
-    /// 多行选中那一排：报的是行数，导出的 INSERT 合成一条、UPDATE 一行一条。
+    /// 选中多行后右键：这一行和整批各摆一组导出。INSERT 合成一条、UPDATE 一行一条。
     #[test]
     fn several_selected_rows_export_together() {
         let mut dock = ResultsDock::new();
@@ -2577,7 +2735,7 @@ mod tests {
         let out = show_pass(&mut dock, &ctx, vec![], 2.0);
         let shown = texts(&out);
         assert!(
-            shown.iter().any(|t| t == "已选中 2 行"),
+            shown.iter().any(|t| t.contains("已选中 2 行")),
             "选了两行报的还是行号：{shown:?}"
         );
         assert!(
@@ -2585,7 +2743,23 @@ mod tests {
             "两行都该亮，每行两格"
         );
 
-        let at = spot(&out, "导出 INSERT").expect("那一排里没有「导出 INSERT」");
+        let cell = spot(&out, "乙").expect("第二行那格没画出来");
+        let out = right_click(&mut dock, &ctx, cell, 2.5);
+        let shown = texts(&out);
+        for want in [
+            "导出这一行 INSERT",
+            "导出这一行 UPDATE",
+            "导出选中 2 行 INSERT",
+            "导出选中 2 行 UPDATE",
+            "复制选中 2 行",
+        ] {
+            assert!(
+                shown.iter().any(|t| t == want),
+                "选了也右键了，菜单里却没有「{want}」：{shown:?}"
+            );
+        }
+
+        let at = spot(&out, "导出选中 2 行 INSERT").expect("菜单里没找到批量 INSERT");
         let out = click(&mut dock, &ctx, at, 3.0);
         assert_eq!(
             copied(&out),
@@ -2595,7 +2769,8 @@ mod tests {
             "两行合成一条语句，VALUES 一行一组"
         );
 
-        let at = spot(&out, "导出 UPDATE").expect("那一排里没有「导出 UPDATE」");
+        let out = right_click(&mut dock, &ctx, cell, 3.5);
+        let at = spot(&out, "导出选中 2 行 UPDATE").expect("菜单里没找到批量 UPDATE");
         let out = click(&mut dock, &ctx, at, 4.0);
         assert_eq!(
             copied(&out),
@@ -2607,7 +2782,8 @@ mod tests {
             "UPDATE 一套 SET 配一行，只能一行一条"
         );
 
-        let at = spot(&out, "复制选中行").expect("多行时那一排该换成「复制选中行」");
+        let out = right_click(&mut dock, &ctx, cell, 4.5);
+        let at = spot(&out, "复制选中 2 行").expect("菜单里该有「复制选中 2 行」");
         let out = click(&mut dock, &ctx, at, 5.0);
         assert_eq!(
             copied(&out),
@@ -2620,9 +2796,100 @@ mod tests {
         click_mod(&mut dock, &ctx, row2, 6.5, egui::Modifiers::SHIFT);
         let out = show_pass(&mut dock, &ctx, vec![], 7.0);
         assert!(
-            texts(&out).iter().any(|t| t == "已选中 3 行"),
+            texts(&out).iter().any(|t| t.contains("已选中 3 行")),
             "从第 4 行往回框到第 2 行，该是 3 行：{:?}",
             texts(&out)
+        );
+    }
+
+    /// 右键菜单里那个「去掉自动生成列」：INSERT 的列名和值、UPDATE 的 SET 都少一列。
+    /// WHERE 照旧用整行——那一截是拿去配行的，不是拿去改的，跟着少一列就配不准了。
+    #[test]
+    fn the_auto_column_switch_takes_it_out_of_the_sql() {
+        let mut dock = ResultsDock::new();
+        dock.start_run(
+            "本机",
+            "查用户",
+            &parts(&["SELECT id, note FROM users"]),
+            None,
+        );
+        let one = StatementResult {
+            columns: auto_incremented(&[("id", "LONGLONG"), ("note", "VAR_STRING")], &["id"]),
+            rows: vec![vec![Cell::Text("7".into()), Cell::Text("甲".into())]],
+            affected_rows: 1,
+            last_insert_id: 0,
+            warnings: 0,
+            truncated: false,
+            elapsed_ms: 1,
+            preview: "SELECT".into(),
+        };
+        dock.on_event(&event(1, Ok(DbOutcome::Statement(one))));
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let out = show_pass(&mut dock, &ctx, vec![], 0.0);
+        let cell = spot(&out, "甲").expect("那一格没画出来");
+
+        let out = right_click(&mut dock, &ctx, cell, 1.0);
+        let shown = texts(&out);
+        assert!(
+            shown.iter().any(|t| t == "去掉自动生成列"),
+            "列里有自增的，菜单就该给这个勾：{shown:?}"
+        );
+        let at = spot(&out, "去掉自动生成列").expect("菜单里没有那个勾");
+        let out = click(&mut dock, &ctx, at, 1.5);
+        // 勾一条不关菜单，接着在同一份菜单里点导出——不用重开一次
+        let at = spot(&out, "导出这一行 INSERT")
+            .unwrap_or_else(|| panic!("点了勾菜单就没了：{:?}", texts(&out)));
+        let out = click(&mut dock, &ctx, at, 2.0);
+        assert_eq!(
+            copied(&out),
+            vec!["INSERT INTO `users` (`note`) VALUES ('甲');\n".to_string()],
+            "自增那列的列名和值都该跟着去掉：{:?}",
+            texts(&out)
+        );
+
+        let out = right_click(&mut dock, &ctx, cell, 2.5);
+        let at = spot(&out, "导出这一行 UPDATE").expect("菜单里没找到 UPDATE");
+        let out = click(&mut dock, &ctx, at, 3.0);
+        assert_eq!(
+            copied(&out),
+            vec![
+                "UPDATE `users` SET `note` = '甲' WHERE `id` = 7 AND `note` = '甲' LIMIT 1;\n"
+                    .to_string()
+            ],
+            "SET 里少一列，WHERE 照旧用整行"
+        );
+    }
+
+    /// 表格以外那一截空白点一下就收选中。以前「取消选中」那一排在格子底下，
+    /// 数据一多它自己先滚出屏，收一次选中比重选一遍还费劲。
+    #[test]
+    fn clicking_on_the_blank_clears_the_selection() {
+        let mut dock = ResultsDock::new();
+        dock.start_run("本机", "查用户", &parts(&["SELECT note FROM t"]), None);
+        let one = table(
+            &["note"],
+            vec![vec![Cell::Text("甲".into())], vec![Cell::Text("乙".into())]],
+        );
+        dock.on_event(&event(1, Ok(DbOutcome::Statement(one))));
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let mark = egui::Style::default().visuals.selection.bg_fill;
+        let out = show_pass(&mut dock, &ctx, vec![], 0.0);
+        let row2 = spot(&out, "2").expect("第二行的行号没画出来");
+        click(&mut dock, &ctx, row2, 1.0);
+        let out = show_pass(&mut dock, &ctx, vec![], 1.2);
+        assert!(lit(&out, mark) >= 2, "这一下先选中一行");
+
+        // 表格底下那一截空白：两行结果，620 高的屏上剩下的都是它
+        let out = click(&mut dock, &ctx, egui::pos2(300.0, 560.0), 2.0);
+        assert_eq!(lit(&out, mark), 0, "点了旁边的空白却还亮着");
+        let shown = texts(&out);
+        assert!(
+            !shown.iter().any(|t| t.contains("已选中第 2 行")),
+            "选中收掉了抬头还在报：{shown:?}"
         );
     }
 
@@ -2727,7 +2994,7 @@ mod tests {
         }
     }
 
-    /// 语句里认不出表名（选中一段跑的、或者压根不带表名的），那两个按钮就不该出现。
+    /// 语句里认不出表名（选中一段跑的、或者压根不带表名的），那两条导出就不该出现。
     #[test]
     fn no_table_name_means_no_sql_export() {
         let mut dock = ResultsDock::new();
@@ -2738,19 +3005,19 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.set_pixels_per_point(1.0);
         let out = show_pass(&mut dock, &ctx, vec![], 0.0);
-        let row = spot(&out, "1").expect("行号没画出来");
-        let out = click(&mut dock, &ctx, row, 1.0);
+        let cell = spot(&out, "2").expect("那一格没画出来");
+        let out = right_click(&mut dock, &ctx, cell, 1.0);
         let shown = texts(&out);
         assert!(
-            shown.iter().any(|t| t == "已选中第 1 行"),
-            "没选中上：{shown:?}"
+            shown.iter().any(|t| t == "复制整行"),
+            "认不出表名不影响复制，那几条照旧：{shown:?}"
         );
         assert!(
             shown.iter().any(|t| t == "认不出表名，导不了 SQL"),
-            "认不出表名时该说一句，而不是闷着不给按钮：{shown:?}"
+            "认不出表名时该说一句，而不是闷着不给这一条：{shown:?}"
         );
-        assert_eq!(spot(&out, "导出 INSERT"), None);
-        assert_eq!(spot(&out, "导出 UPDATE"), None);
+        assert_eq!(spot(&out, "导出这一行 INSERT"), None);
+        assert_eq!(spot(&out, "导出这一行 UPDATE"), None);
     }
 
     /// 行首的 ▸ 开的是右边那个独立窗口，不往表格里塞块——塞进去那块收不回去。
@@ -3353,10 +3620,15 @@ mod tests {
             value.height()
         );
 
-        // 辅助那一档：抬头那行提示
-        let hint = rect_of(
-            "点页签换一份 · 右键页签一次关一批 · 双击格子看全文 · 点行号选整行 · 行首 ▸ 开详情",
-        );
+        // 辅助那一档：抬头那行提示（按开头认，省得改一个字就得同步一遍测试）
+        let hint = marks
+            .iter()
+            .find(|(t, _)| t.starts_with("点页签换一份"))
+            .map(|(_, r)| *r)
+            .unwrap_or_else(|| {
+                let all: Vec<&String> = marks.iter().map(|(t, _)| t).collect();
+                panic!("提示行没画出来：{all:?}")
+            });
         assert!(
             (hint.height() - line(&small_font)).abs() < 1.0,
             "提示行按 {} 排，样式表要的是 {}",
@@ -3492,6 +3764,7 @@ mod tests {
                 .map(|name| Column {
                     name: (*name).to_string(),
                     type_name: String::new(),
+                    auto_increment: false,
                 })
                 .collect(),
             affected_rows: rows.len() as u64,
@@ -3612,12 +3885,26 @@ mod tests {
 
     /// 带类型名的列。上面那个 `table()` 把类型名留空了，而导出 SQL、排 JSON 全靠
     /// 类型名判断这格该裸写还是该加引号，所以这儿单开一个。
+    ///
+    /// 自增标志一律给 false——要测「去掉自动生成列」那条走 `auto_incremented`。
     fn typed(names: &[(&str, &str)]) -> Vec<Column> {
         names
             .iter()
             .map(|(name, ty)| Column {
                 name: (*name).to_string(),
                 type_name: (*ty).to_string(),
+                auto_increment: false,
+            })
+            .collect()
+    }
+
+    /// 同上，另外点名哪几列是数据库自己填的（`AUTO_INCREMENT`）。
+    fn auto_incremented(names: &[(&str, &str)], auto: &[&str]) -> Vec<Column> {
+        typed(names)
+            .into_iter()
+            .map(|mut col| {
+                col.auto_increment = auto.contains(&col.name.as_str());
+                col
             })
             .collect()
     }
@@ -3637,7 +3924,7 @@ mod tests {
             Cell::Blob(vec![0x0d, 0xff]),
         ];
         assert_eq!(
-            insert_sql("users", &cols, &[row.as_slice()]),
+            insert_sql("users", &cols, &[row.as_slice()], false),
             "INSERT INTO `users` (`id`, `name`, `note`, `pic`) VALUES (7, 'O\\'Brien', NULL, 0x0dff);\n",
             "数值裸写、文本带引号、NULL 就是 NULL、二进制走 0x…"
         );
@@ -3648,7 +3935,7 @@ mod tests {
         let cols = typed(&[("id", "LONGLONG"), ("note", "VAR_STRING")]);
         let row = vec![Cell::Text("7".into()), Cell::Null];
         assert_eq!(
-            update_sql("my.users", &cols, &[row.as_slice()]),
+            update_sql("my.users", &cols, &[row.as_slice()], false),
             "UPDATE `my`.`users` SET `id` = 7, `note` = NULL \
              WHERE `id` = 7 AND `note` IS NULL LIMIT 1;\n",
             "结果里不带主键，WHERE 只能整行列值；NULL 那列必须写 IS NULL，\
