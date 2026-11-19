@@ -4,7 +4,7 @@
 
 A Windows desktop editor written in **Rust + egui**. It does not have many features — it has the ones you use every day: file tree, terminal tabs that sit in the same strip as your file tabs, recursive split panes, journal blocks inside plain text files, SQL blocks that run against MySQL with the results sitting right under the text, cursor position back/forward, project-wide search, find and replace, syntax highlighting, and every keybinding is yours to change.
 
-**Current version** v0.4.0 | **Platform** Windows 10 / 11 x64 | **License** MIT
+**Current version** v0.5.0 | **Platform** Windows 10 / 11 x64 | **License** MIT
 
 The release package is a **single exe** (about 12 MB, 5.2 MB zipped). No .NET, no Electron, no runtime of any kind.
 
@@ -64,7 +64,7 @@ Grab one of the packages from the [Releases](https://github.com/PBlueSky/easy-ed
 Both packages work: without `rg.exe`, project-wide search silently falls back to the built-in scanner — a bit slower on large repos. Each package ships with a matching `.sha256.txt`; verify it:
 
 ```powershell
-Get-FileHash .\EasyEditor-0.4.0-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\EasyEditor-0.5.0-windows-x64.zip -Algorithm SHA256
 ```
 
 ### Run from source
@@ -95,7 +95,7 @@ With no arguments, the startup folder is chosen by: **command-line argument > cu
 ```
 ┌──────────────── Top toolbar (wraps to a second row when it runs out of room) ─────────┐
 ├──────────┬─────── Centre: tab strip + pane tree — whichever tab is up owns it ────────┤
-│ Sidebar  │  main.rs ×  data.json ×  ⌨ cmd ×2  ← click it: a terminal grid             │
+│ Sidebar  │  main.rs ×  data.json ×  >_ cmd ×2  ← click it: a terminal grid            │
 │ Files    │  the tab you pick decides what that whole block draws                      │
 │ Search   ├──────────────────── Bottom: results dock (SQL) ────────────────────────────┤
 │ Journal  ├──────────────────── Bottom: status bar + find/replace bar ─────────────────┤
@@ -103,7 +103,7 @@ With no arguments, the startup folder is chosen by: **command-line argument > cu
 └──────────┴───────────────────────────────────────────────────────────────────────────┘
 ```
 
-A terminal does not open another OS window and it does not squeeze in beside the code: `+Terminal` adds one more tab to that same strip, and clicking the `⌨ …` one swaps the whole centre area for that group's grid. Click back to a file tab and the editor comes back exactly as you left it — one of the two is on screen at a time.
+A terminal does not open another OS window and it does not squeeze in beside the code: `+Terminal` adds one more tab to that same strip, and clicking the `>_ …` one swaps the whole centre area for that group's grid. Click back to a file tab and the editor comes back exactly as you left it — one of the two is on screen at a time.
 
 - **Top toolbar**, left to right: `Open folder` `Open file` `Save` `←` `→` (cursor history back / forward) `New file` `New folder` `Sidebar` `Wrap` `Terminal` (switches between the editor and the terminal tabs — the last group comes back to the front, or a new tab opens when there is none) `+Terminal` (a new terminal tab) `‖ Split` `═ Split` `Quick open` `Project search` `Find` `Journal block` `Database`. The `Database` entry is a dropdown (default connection line / `new query` / `insert SQL block` / `run SQL` / `results dock` / `connection manager…` / `sidebar database tree` / `this file is SQL`) — that is the only new button the whole database feature costs. The right-hand group, right to left, is `?` (jumps to the Keybindings section), `Dark` / `Light` (theme), the `shell:` dropdown, `⚙` (the settings window), the editor font size `- 14 +`, and the workspace name.
 - **Sidebar** has four tabs: `Files` (the tree), `Search` (project-wide results), `Journal` (blocks in the current file), `Database` (connections → databases → tables → columns). `Ctrl+B` shows or hides it.
@@ -396,7 +396,7 @@ Default keys **match Windows Terminal**:
 
 The split applies to **the currently focused pane** — and to whichever tree was in front when you pressed the key. Splitting an editor pane shows the same file in both, which is what you want for side-by-side comparison; splitting a cell in a terminal tab gives you a fresh shell in the same directory.
 
-- Each pane has its own title bar (file name + unsaved marker, or `⌨ shell title` in a terminal tab) with three small buttons on the right: split left/right, split up/down, and `×` to close
+- Each pane has its own title bar (file name + unsaved marker, or `>_ shell title` in a terminal tab) with three small buttons on the right: split left/right, split up/down, and `×` to close
 - Right-click a pane's title bar to move it to the **far right / far left / top / bottom** of the workspace
 - Dividers are draggable; the ratio is computed from live pixel geometry and clamped to 5%–95%
 - Clicking a pane focuses it
@@ -618,7 +618,7 @@ cargo test -- --ignored --nocapture     # two tests that really spawn processes:
 mkdir -p dist/EasyEditor
 cp target/release/easy-editor.exe dist/EasyEditor/EasyEditor.exe   # keep it identical to the window title
 cp README.md README.zh-CN.md LICENSE dist/EasyEditor/
-powershell -NoProfile -Command "Compress-Archive -Path dist\EasyEditor -DestinationPath dist\EasyEditor-0.4.0-windows-x64.zip -Force"
+powershell -NoProfile -Command "Compress-Archive -Path dist\EasyEditor -DestinationPath dist\EasyEditor-0.5.0-windows-x64.zip -Force"
 ```
 
 For the `-with-rg` variant, drop `rg.exe` and `THIRD-PARTY-NOTICES.txt` into `dist\EasyEditor\` and compress again. Each package gets its own `.sha256.txt`.

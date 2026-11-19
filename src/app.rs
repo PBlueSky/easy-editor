@@ -3950,7 +3950,7 @@ impl EasyEditorApp {
                                     .terminal
                                     .pane_title(t)
                                     .unwrap_or_else(|| "终端已退出".to_string());
-                                format!("⌨ {name}")
+                                format!(">_ {name}")
                             }
                         };
                         ui.horizontal(|ui| {
@@ -4163,7 +4163,7 @@ impl EasyEditorApp {
                     for tab in self.term_tabs.iter() {
                         let name = tab.title(&self.terminal);
                         let cells = tab.tree.count();
-                        let mut label = format!("⌨ {name}");
+                        let mut label = format!(">_ {name}");
                         if cells > 1 {
                             label.push_str(&format!(" ×{cells}"));
                         }
@@ -5725,7 +5725,7 @@ mod tests {
             .any(|kind| kind.terminal_id().is_some())
     }
 
-    /// 页签条上那一排「⌨ ××」画了几处：每格页签一处，加上正在显示的那组里每格面板一处。
+    /// 页签条上那一排「>_ ××」画了几处：每格页签一处，加上正在显示的那组里每格面板一处。
     fn painted_term_labels(out: &egui::FullOutput, label: &str) -> usize {
         all_texts(out)
             .into_iter()
@@ -5813,9 +5813,9 @@ mod tests {
         assert_ne!(terms[0], terms[1], "两个页签里挂的是同一条 shell");
         assert_eq!(app.panes.count(), main_panes, "编辑树跟着长了格子");
 
-        // 「⌨ ××」出现三处 = 两个页签 + 在前那组的一格面板。第四处就说明没在前的
+        // 「>_ ××」出现三处 = 两个页签 + 在前那组的一格面板。第四处就说明没在前的
         // 那组也被画进了中央区
-        let label = format!("⌨ {}", app.term_tabs[1].title(&app.terminal));
+        let label = format!(">_ {}", app.term_tabs[1].title(&app.terminal));
         assert_eq!(
             painted_term_labels(&out, &label),
             3,
@@ -5859,7 +5859,7 @@ mod tests {
             first_cwd,
             "新的一格没有跟着上一格的目录走"
         );
-        let label = format!("⌨ {} ×2", app.term_tabs[0].title(&app.terminal));
+        let label = format!(">_ {} ×2", app.term_tabs[0].title(&app.terminal));
         assert!(
             find_text(&out, &label).is_some(),
             "页签上没标出这组有两格"
@@ -5882,7 +5882,7 @@ mod tests {
 
         let tab_id = app.term_tabs[0].id;
         let term_id = app.term_tabs[0].term_ids()[0];
-        let label = format!("⌨ {}", app.terminal.pane_title(term_id).unwrap_or_default());
+        let label = format!(">_ {}", app.terminal.pane_title(term_id).unwrap_or_default());
 
         // 在前：页签一处 + 格子的标题条一处
         let out = frame(&mut app, &ctx, vec![]);
