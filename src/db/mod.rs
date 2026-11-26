@@ -639,17 +639,13 @@ fn run_job(
             }
         }
     }
-    let target = match driver.as_mut() {
-        Some(d) => d,
-        None => return,
-    };
-    // 会话是否废了。逐条执行时先记下来，跑完再丢驱动：
-    // `target` 还借在 `driver` 上，同一段作用域里直接赋值过不了借用检查。
+    // 会话是否废了。逐条执行时先记下来，跑完再丢驱动：`run_one` 里可能要换掉整个
+    // 驱动（重连），所以不能像以前那样先把 `driver` 借出去用到 match 结束。
     let mut session_dead = false;
     match job {
         Job::Run { parts, max_rows } => {
             for (id, stmt) in parts {
-                let (sent, failed) = match target.execute(&stmt, max_rows) {
+                let (sent, failed) = match run_one(driver, spec, connect, &stmt, max_rows) {
                     Ok(one) => (
                         Msg::Done {
                             id,
@@ -680,6 +676,10 @@ fn run_job(
             }
         }
         Job::Call { id, call } => {
+            // 库表列表这类元数据没有「重跑一遍」的必要：连不上就报出去，下个任务再连
+            let Some(target) = driver.as_mut() else {
+                return;
+            };
             let outcome = match call {
                 Call::Databases => target.list_databases().map(DbOutcome::Names),
                 Call::Tables { database } => target.list_tables(&database).map(DbOutcome::Names),
@@ -708,6 +708,49 @@ fn run_job(
     }
     if session_dead {
         *driver = None;
+    }
+}
+
+/// 跑一条语句。会话被服务器掐了（闲置超时、网络断、`wait_timeout`）而且这一句**只读**时，
+/// 重开一条连接把同一句再试一次——用户那一下 Ctrl+Enter 该拿到结果，而不是一句「连接已断开」。
+///
+/// 写语句刻意不补跑：连接断了不等于没落库，补一次 `INSERT` 就可能插进两遍。那种失败原样
+/// 报出去，驱动丢掉，下一条语句自然重连（并按当前库连，见 `DatabasePanel::effective_spec`）。
+fn run_one(
+    driver: &mut Option<Box<dyn Driver>>,
+    spec: &ConnectionSpec,
+    connect: ConnectFn,
+    stmt: &str,
+    max_rows: usize,
+) -> Result<StatementResult, DbError> {
+    let failed = match driver.as_mut() {
+        Some(target) => match target.execute(stmt, max_rows) {
+            Ok(one) => return Ok(one),
+            Err(err) => err,
+        },
+        None => DbError::new("这条连接还没有会话"),
+    };
+    // SQL 自己的错（语法、表不存在）重跑一遍还是错，白折腾；写语句更不能重跑
+    if !failed.needs_reconnect || !crate::sql::classify(stmt).is_read_only() {
+        return Err(failed);
+    }
+    *driver = None;
+    let mut fresh = match connect(spec) {
+        // 重连都没成：报原来那一句，它才是用户看到的故障
+        Err(_) => return Err(failed),
+        Ok(fresh) => Some(fresh),
+    };
+    let again = match fresh.as_mut() {
+        Some(target) => target.execute(stmt, max_rows),
+        None => return Err(failed),
+    };
+    match again {
+        // 跑通了就把这条新会话留下，同一批里后面几条接着用它
+        Ok(one) => {
+            *driver = fresh;
+            Ok(one)
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -1142,17 +1185,18 @@ mod tests {
         assert_eq!(hub.connections().len(), 2);
     }
 
+    /// 会话被服务器掐了：只读那一句当场重连补跑一次，用户不必再按一次 Ctrl+Enter。
+    /// 补跑以后新会话要留在 `driver` 里——不然同一批的下一条又要重连一遍。
     #[test]
-    fn reconnect_error_drops_the_session() {
-        // 失败带 needs_reconnect 时，hub 应该丢驱动，下个任务重新建
+    fn a_dead_session_reconnects_and_reruns_a_read_only_statement() {
         static BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         fn build(_: &ConnectionSpec) -> Result<Box<dyn Driver>, DbError> {
             BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(Box::new(FlakyDriver))
+            Ok(Box::new(OnceFlaky))
         }
-        struct FlakyDriver;
-        impl Driver for FlakyDriver {
+        struct OnceFlaky;
+        impl Driver for OnceFlaky {
             fn execute(&mut self, _: &str, _: usize) -> Result<StatementResult, DbError> {
                 let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if n == 0 {
@@ -1179,7 +1223,80 @@ mod tests {
         let mut hub = DbHub::with_driver(build);
         hub.run(&spec("demo"), "SELECT 1", 10).unwrap();
         let events = wait(&mut hub);
-        assert!(events[0].outcome.is_err());
+        assert!(
+            matches!(&events[0].outcome, Ok(DbOutcome::Statement(_))),
+            "只读语句断了以后应当场补跑：{:?}",
+            events[0].outcome
+        );
+        assert_eq!(
+            BUILDS.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "断线重连该建一条新会话"
+        );
+
+        // 补跑用的那条新会话留在了原地：再跑一条不该又重连一次
+        hub.run(&spec("demo"), "SELECT 1", 10).unwrap();
+        let events = wait(&mut hub);
+        assert!(
+            matches!(&events[0].outcome, Ok(DbOutcome::Statement(_))),
+            "第二条语句该接在补跑那条的会话上：{:?}",
+            events[0].outcome
+        );
+        assert_eq!(
+            BUILDS.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "会话已经续上了，不该再重连"
+        );
+    }
+
+    /// 写语句就算断了也**不补跑**：连接断了不等于没落库，补一次 `INSERT` 就是插两遍。
+    /// 报错原样交出去，驱动丢掉，下一条语句才重连。
+    #[test]
+    fn a_write_statement_is_never_rerun_after_a_dead_session() {
+        static BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn build(_: &ConnectionSpec) -> Result<Box<dyn Driver>, DbError> {
+            BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(WriteFlaky))
+        }
+        struct WriteFlaky;
+        impl Driver for WriteFlaky {
+            fn execute(&mut self, _: &str, _: usize) -> Result<StatementResult, DbError> {
+                let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    Err(DbError {
+                        message: "Lost connection".into(),
+                        code: Some(2013),
+                        needs_reconnect: true,
+                    })
+                } else {
+                    Ok(StatementResult::empty("ok"))
+                }
+            }
+            fn list_databases(&mut self) -> Result<Vec<String>, DbError> {
+                Ok(vec![])
+            }
+            fn list_tables(&mut self, _: &str) -> Result<Vec<String>, DbError> {
+                Ok(vec![])
+            }
+            fn probe(&mut self) -> Result<String, DbError> {
+                Ok("ok".into())
+            }
+        }
+
+        let mut hub = DbHub::with_driver(build);
+        hub.run(&spec("demo"), "DELETE FROM t", 10).unwrap();
+        let events = wait(&mut hub);
+        assert!(events[0].outcome.is_err(), "写语句断了就该把错报出去");
+        assert!(events[0].dead, "会话废了要标出来，牌子才翻得动");
+        assert_eq!(
+            CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "写语句不能补跑，可能已经落库了"
+        );
+        assert_eq!(BUILDS.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 驱动已经丢掉：下一条语句重开一条会话再跑
         hub.run(&spec("demo"), "SELECT 1", 10).unwrap();
         let events = wait(&mut hub);
         assert!(

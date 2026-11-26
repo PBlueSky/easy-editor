@@ -306,6 +306,9 @@ pub struct DatabasePanel {
     /// 侧栏里选中的连接。SQL 块头部没写 `conn=` 时发到这里。
     active: Option<String>,
     pending: HashMap<u64, Pending>,
+    /// 派出去、等着认领「当前库」的 `USE` 语句：任务 id -> (连接名, 库名)。
+    /// 只有回执成功才认——切个不存在的库不该把牌子挪过去。
+    use_of: HashMap<u64, (String, String)>,
     /// 连接名 -> 会话状态。没有这条记录 = 没连。改了配置要跟着过期，见 [`LinkRecord`]。
     links: HashMap<String, LinkRecord>,
     /// 不属于这层的回执（SQL 块的结果），底部结果区每帧来取。
@@ -335,6 +338,7 @@ impl DatabasePanel {
             trees: HashMap::new(),
             active,
             pending: HashMap::new(),
+            use_of: HashMap::new(),
             links: HashMap::new(),
             stray: Vec::new(),
             draft: None,
@@ -443,6 +447,13 @@ impl DatabasePanel {
             .hub
             .run(&spec, block, MAX_ROWS)
             .map_err(|err| err.to_string())?;
+        // 块里切了库就先记着，等那条 `USE` 真跑成了再认作这条连接的当前库。
+        // 语句文本用 hub 返回的那份——它就是实际送进服务器的那句。
+        for (task, stmt) in &parts {
+            if let Some(db) = crate::sql::use_target(stmt) {
+                self.use_of.insert(*task, (conn.to_string(), db));
+            }
+        }
         if !parts.is_empty() {
             self.note_submit(conn);
             self.status = format!("{} · 已提交 {} 条语句", conn, parts.len());
@@ -542,6 +553,16 @@ impl DatabasePanel {
     /// 每帧调用：把后台回来的库表列表和握手回执归位。
     pub fn poll(&mut self) {
         for event in self.hub.poll() {
+            // 块里那句 `USE` 到家了：跑成以后把这条连接的当前库挪过去。
+            // 这样连接被闲置回收、或者被服务器掐掉，下次执行重开的那条会话仍然在
+            // 同一个库上（`effective_spec` 带着库名去连），不用用户再补一句 `USE`。
+            if let Some((conn, db)) = self.use_of.remove(&event.id) {
+                // 跑成了才算数，而且这条连接得还在：删都删了还替它认领一个当前库，
+                // 树上就凭空长出一行没人要的记录。和 `note_round_trip` 同一个规矩。
+                if event.outcome.is_ok() && self.spec_of(&conn).is_some() {
+                    self.set_current_db(&conn, &db);
+                }
+            }
             let Some(pending) = self.pending.remove(&event.id) else {
                 // 不是这层发出去的（SQL 块的结果），或者是连接在这帧之前被改过、
                 // 删掉了 —— 都原样搁下，让上层取走认领得了的那部分。
@@ -2367,6 +2388,111 @@ mod tests {
             1,
             "行尾的「当前」牌子只能有一块：{texts:?}"
         );
+    }
+
+    /// 等 SQL 块的回执跑完。`settle` 盯的是库表请求那张 `pending`，块里的语句
+    /// 是转手给结果区的，那本账上根本没有 —— 拿它当条件会立刻返回，什么都没等到。
+    fn settle_run(panel: &mut DatabasePanel, want: usize) -> Vec<DbEvent> {
+        let mut got = Vec::new();
+        for _ in 0..2000 {
+            panel.poll();
+            got.extend(panel.take_stray());
+            if got.len() >= want {
+                return got;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("SQL 块的回执没收够：要 {want} 条，只等到 {}", got.len());
+    }
+
+    /// 块里那句 `USE` 跑成了，这条连接的当前库就跟着走。
+    ///
+    /// 认的是「执行成功」而不是「语句写了」，所以断言分两段：回执到家前不许改口。
+    #[test]
+    fn a_use_in_a_block_moves_the_current_database_once_it_runs() {
+        let mut panel = panel(&["块里切库"]);
+        let parts = panel
+            .run("块里切库", "USE information_schema; SELECT 1;")
+            .expect("派活");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            panel.current_db("块里切库"),
+            "demo",
+            "USE 还没跑成，当前库不能提前换"
+        );
+        settle_run(&mut panel, 2);
+        assert_eq!(panel.current_db("块里切库"), "information_schema");
+        assert_eq!(
+            panel
+                .effective_spec("块里切库")
+                .expect("连接在")
+                .database,
+            "information_schema",
+            "当前库没进到真正发出去的配置，闲置回收后重连就回到 demo 了"
+        );
+        assert_eq!(
+            panel.spec_of("块里切库").expect("连接在").database,
+            "demo",
+            "块里跑一句就改了 config.json 的默认库，比不改更糟"
+        );
+    }
+
+    /// 当前库记在树上，不是记在会话上：闲置回收把线程收走了，库名得留下。
+    ///
+    /// 回收判的是真实流逝的时间（`last_used`），测试里没法把表针拨快，
+    /// 所以这里用 `reap(ZERO)` 直接踩到那条线上 —— 收完之后剩下的事实是一样的。
+    #[test]
+    fn the_remembered_database_outlives_the_session() {
+        let mut panel = panel(&["回收后"]);
+        panel
+            .run("回收后", "USE information_schema;")
+            .expect("派活");
+        settle_run(&mut panel, 1);
+        assert!(panel.hub.has_connection("回收后"), "刚派完活，线程该在");
+        for _ in 0..500 {
+            if !panel.hub.reap(std::time::Duration::ZERO).is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            !panel.hub.has_connection("回收后"),
+            "测试本身就是把会话收掉，没收掉后面白测"
+        );
+        assert_eq!(
+            panel
+                .effective_spec("回收后")
+                .expect("连接在")
+                .database,
+            "information_schema",
+            "重开的会话得回到用户切过去的那个库，不然又得补一句 USE"
+        );
+        // 下一条语句照旧派得出去，hub 会按这份配置重开线程
+        panel.run("回收后", "SELECT 2;").expect("重开");
+        settle_run(&mut panel, 1);
+        assert_eq!(
+            panel.current_db("回收后"),
+            "information_schema",
+            "重开一趟就把当前库洗回配置默认，牌子会和实际发往的库对不上"
+        );
+    }
+
+    /// `USE` 跑砸了不许改当前库：服务器没答应，下一句仍然发往原来的库。
+    #[test]
+    fn a_use_that_failed_leaves_the_current_database_alone() {
+        let mut panel = panel(&[]);
+        panel.connections.push(ConnectionSpec {
+            host: "bad-host".into(),
+            ..spec("切库失败")
+        });
+        panel.run("切库失败", "USE nope;").expect("派活");
+        let events = settle_run(&mut panel, 1);
+        assert!(events[0].outcome.is_err(), "假驱动本来就设成全盘失败");
+        assert!(
+            panel.use_of.is_empty(),
+            "回执到家就得销账，留着会把下一次误当成切库"
+        );
+        assert_eq!(panel.current_db("切库失败"), "demo");
     }
 
     /// 箭头那一列只管展开收起，不该顺手把当前库换掉。

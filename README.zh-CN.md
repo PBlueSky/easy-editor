@@ -4,7 +4,7 @@
 
 一个用 **Rust + egui** 写的 Windows 桌面编辑器。功能不多，但每一样都能天天用：文件树、和文件页签排在同一条上的终端页签、递归分屏、文本内工作日志块、能连 MySQL 的 SQL 块（结果就摆在正文下面）、光标位置前后跳转、全局搜索、查找替换、语法高亮，快捷键全部可改。
 
-**当前版本** v0.7.0 ｜ **平台** Windows 10 / 11 x64 ｜ **许可** MIT
+**当前版本** v0.8.0 ｜ **平台** Windows 10 / 11 x64 ｜ **许可** MIT
 
 发布包是**单文件 exe**（约 12 MB，压缩后 5.2 MB），不需要 .NET、Electron 或任何运行时。
 
@@ -64,7 +64,7 @@
 两个包都能用：没带 `rg.exe` 时全局搜索自动回退到内置扫描，只是大仓里慢一些。每个包旁边有同名 `.sha256.txt`，校验一下：
 
 ```powershell
-Get-FileHash .\EasyEditor-0.7.0-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\EasyEditor-0.8.0-windows-x64.zip -Algorithm SHA256
 ```
 
 ### 从源码跑
@@ -165,6 +165,8 @@ cargo run -- src\app.rs                 # 启动并打开某个文件
 | `Esc` | 关闭查找栏 | 关闭查找栏 |
 
 支持区分大小写、正则（替换串可用 `$1` `$2`）、上下跳转、单个替换、全部替换；所有匹配都高亮，当前项用橙色区分。
+
+**回车只归查找栏自己。** 栏开着、关键词有命中时，在正文里按 `Enter` 就只是敲进去一个换行：光标不动、屏幕不跳。跳匹配只有三种触发——打开查找栏那一下（揭示首个匹配）、在查找框或替换框里按 `Enter` / `Shift+Enter`、以及在栏里改关键词。正文自己变了时匹配数和底色照常重算，只是**不揭示**，否则每敲一个字都被拽到首个匹配那里去。
 
 **选词高亮**：鼠标选中一个词，全文所有相同词立刻用淡蓝底标出来（双击一次取整个词）。规则和查找栏一致——选中的词全小写就忽略大小写，含大写就精确匹配；选区正好覆盖一个完整单词时按词边界匹配，选 `id` 不会误标 `width` 里的 `id`；只圈到半截词（比如从 `foo_bar` 里选 `foo`）退回子串匹配。跨行、纯空白、超过 64 字符的选区不参与；命中封顶 2000 处，免得为一个单字母把全文扫穿。选词高亮和查找高亮是两套底色，叠在一起时查找优先。
 
@@ -301,6 +303,8 @@ LIMIT 50;
 
 会话也不会一直挂着：一条连接闲够 5 分钟（`IDLE_LINK`），回收把它的线程收掉，记号回 `○ 未连接`；正在跑语句的那条不动。手工 `断开连接` 立刻收线程和缓存树，状态栏说一句「下次执行会自动重连」。服务器把会话掐了（`2006` / `2013` / `2055`）标记跟着翻成 `✗`，下一次执行重连；纯 SQL 语法错不算断线——服务器答了话，会话照旧能用。
 
+断线那一瞬间手里正押着的那条语句也一并救回来：会话废了（`needs_reconnect`）**而且是只读语句**时，工作线程就地重开一条会话把这句再跑一遍，用户看到的是正常结果而不是「先失败、下次记得重跑」（`run_one`）。写操作**绝不重跑**——连接断了并不证明那句 `DELETE` 没提交，重跑一遍就是删两次；它老实报失败，`dead` 一起带回去，牌子翻 `✗`，下一句自然走新会话。
+
 「连接」和「已连接」是两件事：记号只按配置指纹认领（`ConnectionSpec::stamp()`），改一个字段那个 `✓` 当场变 `⚠`，因为从那以后根本没跟服务器说过话；改名会把线程一起换掉，所以牌子退回 `○ 未连接`，重新连上才重新亮起。删掉的连接留下的结论直接丢掉，不会换个人接着戴。
 
 **多连接同时查询是真的同时。** 每条连接一个自己的后台线程，`Ctrl+Enter` 发出去的语句按 `(连接, 语句 id)` 回来，所以甲连接在跑一条三分钟的报表，不挡乙连接立刻回你一句 `SELECT 1`。侧栏连接行右侧的 `⏳N` 是这条连接现在排了几条没回。自动执行也跟着按连接分闸：只有**同一条连接**上还挂着没回的回执时才憋住下一批，别的连接慢不慢跟这块无关。
@@ -313,6 +317,7 @@ LIMIT 50;
 
 - **连接**——点它的名字就把它设成默认，块头没写 `conn=` 的都往它去
 - **库**——点它的名字就把它认作**这条连接的当前库**，覆盖 `config.json` 里那个 `database` 字段。不写盘：这是本次会话的选择，发出去的 spec 由 `effective_spec()` 现拼，树上的灯、状态栏的尾巴和真正连上去的库因此只能是同一件事
+- **脚本里切的库也算数**——块里写了 `USE shop;`，这句**跑成之后**当前库就跟着换成 `shop`（跑砸了不改口，`use_of` 那张账当场销掉）。用户不用再回树上点一次，也不会出现「屏上写着 `当前库 shop`、语句实际发往 demo」的两套话。当前库记在树上而不是记在会话上：闲够 5 分钟被回收、或者被服务器掐掉，下次执行重开的那条连接仍然带着 `shop`，不用补一句 `USE`
 
 两件事都写在页签最上面那个框里——`默认连接 demo · root@127.0.0.1:3306` 和 `当前库 shop`。只写连接不写库的树，等于把半个答案藏起来。
 
@@ -603,7 +608,7 @@ Windows 上启动时会把自己登记成能打开 `.txt` 的程序，于是两�
 
 ```bash
 cargo check                             # 只做类型检查，最快
-cargo test                              # 345 个单元测试
+cargo test                              # 351 个单元测试
 cargo build                             # 调试构建 → target/debug/easy-editor.exe
 cargo build --release                   # 发布构建 → target/release/easy-editor.exe
 cargo clippy --all-targets              # 需要 rustup component add clippy
@@ -625,7 +630,7 @@ cargo test -- --ignored --nocapture     # 两条会真起进程：PTY 端到端 
 mkdir -p dist/EasyEditor
 cp target/release/easy-editor.exe dist/EasyEditor/EasyEditor.exe   # 和窗口标题保持一致
 cp README.md README.zh-CN.md LICENSE dist/EasyEditor/
-powershell -NoProfile -Command "Compress-Archive -Path dist\EasyEditor -DestinationPath dist\EasyEditor-0.7.0-windows-x64.zip -Force"
+powershell -NoProfile -Command "Compress-Archive -Path dist\EasyEditor -DestinationPath dist\EasyEditor-0.8.0-windows-x64.zip -Force"
 ```
 
 带 `rg.exe` 的那档把 `rg.exe` 和 `THIRD-PARTY-NOTICES.txt` 也放进 `dist\EasyEditor\` 再压一次，后缀写 `-with-rg`；两个包各配一份 `.sha256.txt`。
@@ -685,6 +690,8 @@ egui 那个矩形是按「基线 − 主字体 ascent」往下数一个行高画
 所以等控件返回后再判断 `has_focus()` 永远是 `false`，查找栏的快捷键会静默失效。做法是在 `TextEdit` **之前**把按键从事件队列里 `consume` 掉，焦点就不会丢。
 
 同一个事实还有第二层后果，这一层关系到回车到底归谁。侧栏搜索框以前判的是「`lost_focus()` 且队列里有个 `Enter`」，当成「按回车再搜一次」。可正文里的回车是换行，队列里躺着一个按键也不等于有人在请求搜索——用户接着在文档里敲的那个回车，会把全局搜索又跑一遍（`generation` 当场 +1，上一批结果被清空）。现在两个输入框都在 `add` **之前**读焦点（`ui.memory(|m| m.has_focus(query_id))`），输入法组字那一帧整个跳过（`ime::composing`，那一下回车是候选词在确认），然后才 `consume_key`。id 用 `egui::Id::unique` 而不是 `ui.id()`：后者在 0.37 改名成了 `Ui::scope_id`，语义跟着布局走，不是我们要的「跨帧稳定的那一个框」。
+
+第三层坑不在输入框上，在 `stale` 这个标记上。正文每次改动都把 `find.stale` 立起来，`draw()` 下一帧重算匹配——而重算顺带把 `current` 归零并**揭示**它（写 `pending_jump`，`editor.rs` 收到就把光标挪过去再 `scroll_to_rect(... Align::Center)`）。于是查找栏开着、文里有命中时，用户在正文任何位置按 `Enter`：那一下先真的插进一个换行，`stale` 立起，下一帧就把光标从用户手底下拽到首个匹配、屏幕跟着甩过去。查的关键词根本没变，用户感受到的却是「回车 = 跳到搜索位置」。修法是把这个动作拆成两半：`find_rescan()` 只重算匹配和底色，`find_recompute()` 才额外揭示——`stale` 走前者，栏里的按键和改关键词走后者。**「数清了」和「跳过去」从来是两件事**，之前被一个函数顺手全包了。测试 `a_newline_in_the_editor_does_not_yank_the_caret_to_a_match` 把光标先泊到远处，按回车后断言正文多了一个 `\n`、光标还在原地、`pending_jump` 是空的。
 
 ### `.txt` 登记放在 `new`，不放在 `bootstrap`
 

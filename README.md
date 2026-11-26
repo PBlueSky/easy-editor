@@ -4,7 +4,7 @@
 
 A Windows desktop editor written in **Rust + egui**. It does not have many features — it has the ones you use every day: file tree, terminal tabs that sit in the same strip as your file tabs, recursive split panes, journal blocks inside plain text files, SQL blocks that run against MySQL with the results sitting right under the text, cursor position back/forward, project-wide search, find and replace, syntax highlighting, and every keybinding is yours to change.
 
-**Current version** v0.7.0 | **Platform** Windows 10 / 11 x64 | **License** MIT
+**Current version** v0.8.0 | **Platform** Windows 10 / 11 x64 | **License** MIT
 
 The release package is a **single exe** (about 12 MB, 5.2 MB zipped). No .NET, no Electron, no runtime of any kind.
 
@@ -64,7 +64,7 @@ Grab one of the packages from the [Releases](https://github.com/PBlueSky/easy-ed
 Both packages work: without `rg.exe`, project-wide search silently falls back to the built-in scanner — a bit slower on large repos. Each package ships with a matching `.sha256.txt`; verify it:
 
 ```powershell
-Get-FileHash .\EasyEditor-0.7.0-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\EasyEditor-0.8.0-windows-x64.zip -Algorithm SHA256
 ```
 
 ### Run from source
@@ -165,6 +165,8 @@ Font size uses `Ctrl` + `+` / `-` and changes only the editor and terminal text 
 | `Esc` | Close the find bar | Close the find bar |
 
 Case sensitivity, regex (replacements may use `$1` `$2`), next/previous navigation, replace one, replace all. Every match is highlighted and the current one is marked in orange.
+
+**Enter belongs to the find bar only.** With the bar open and the query matching, pressing `Enter` in the editor body inserts a newline and nothing else: the caret stays where you put it, the view does not jump. A match is revealed by exactly three things — opening the bar (which jumps to the first match), `Enter` / `Shift+Enter` inside the find or replace box, and editing the query there. When the buffer itself changes, match count and backgrounds are recomputed as usual but **nothing is revealed**, otherwise every keystroke would yank you to match #1.
 
 **Word occurrence highlight**: select a word with the mouse and every identical word in the file is immediately marked with a pale blue background (a double-click grabs the whole word). The rules match the find bar — an all-lowercase selection ignores case, a selection containing a capital matches exactly; when the selection covers a complete word, matching is word-bounded, so selecting `id` does not mark the `id` inside `width`; a partial selection (`foo` inside `foo_bar`) falls back to substring matching. Multi-line selections, whitespace-only selections and selections longer than 64 characters are ignored, and hits are capped at 2000 so a single letter does not scan the whole file. Occurrence highlighting and find highlighting use different backgrounds; where they overlap, find wins.
 
@@ -303,6 +305,8 @@ Everything database-related hangs off the single `Database` dropdown in the tool
 
 Sessions do not linger either: a connection idle for 5 minutes (`IDLE_LINK`) has its worker thread reaped and its mark back to `○` — one that is mid-statement is left alone. `断开连接` drops the thread and the cached tree right away, and says so in the status line ("the next run reconnects by itself"). When the server kills a session (`2006` / `2013` / `2055`) the mark flips to `✗` and the next run reconnects; a plain SQL error does not count as a break — the server answered, so the session is still good.
 
+The statement that was in flight when the session died gets rescued too. When a driver reports "this session is gone" (`needs_reconnect`) **and** the statement is read-only, the worker opens a fresh session and runs that one statement again (`run_one`), so what you see is a normal result rather than "it failed, run it once more yourself". Write statements are **never** replayed: a dropped connection does not prove the `DELETE` did not commit, and running it twice deletes twice. It reports the failure with `dead` set, the mark turns `✗`, and the next statement finds a new session on its own.
+
 The mark is claimed by a hash of the connection's fields (`ConnectionSpec::stamp()`), so editing a field turns `✓` into `⚠` on that frame instead of continuing to vouch for a server you have never contacted since. Renaming *does* reset the mark to `○`: the name is the worker thread's key, and a verdict may not survive onto a session that never shook hands. Verdicts belonging to a connection you deleted are dropped, not replayed onto someone else.
 
 **Several connections run at the same time, really.** Each connection has its own background thread and replies are matched by (connection, statement id), so a three-minute report on one connection never stops another from answering `SELECT 1`. A `⏳N` badge on a sidebar row is how many statements that connection still owes. The auto-run gate follows the same split: it only holds when *this* connection still has outstanding replies.
@@ -315,6 +319,7 @@ Two rows answer "where does my SQL go", and they answer it separately:
 
 - **connection** — click the name and it becomes the default; a block without `conn=` is sent there
 - **database** — click the name and it becomes *that connection's* current database, overriding the `database` field in `config.json` for everything sent to it. Nothing is written to disk: it is a session choice, and it is what `effective_spec()` builds the outgoing connection from, so the tree, the status chip and the wire cannot disagree
+- **a `USE` inside the script counts as well** — when a block runs `USE shop;` and that statement *succeeds*, `shop` becomes the connection's current database (a failed one changes nothing; the pending entry in `use_of` is dropped either way). No click back in the tree, and never a tree saying `当前库 shop` while statements still go to `demo`. The database lives on the tree, not on the session: after an idle reap or a server-side kill the next run reconnects already sitting in `shop`, so you do not have to repeat `USE` every few minutes
 
 Both are restated at the head of the tab — `默认连接 demo · root@127.0.0.1:3306` and `当前库 shop` — because a tree that only shows the connection is a tree that hides half the answer.
 
@@ -603,7 +608,7 @@ About 26,900 lines of Rust in a single binary crate, 24 source files:
 
 ```bash
 cargo check                             # type checking only, fastest
-cargo test                              # 345 unit tests
+cargo test                              # 351 unit tests
 cargo build                             # debug build → target/debug/easy-editor.exe
 cargo build --release                   # release build → target/release/easy-editor.exe
 cargo clippy --all-targets              # requires rustup component add clippy
@@ -625,7 +630,7 @@ cargo test -- --ignored --nocapture     # two tests that really spawn processes:
 mkdir -p dist/EasyEditor
 cp target/release/easy-editor.exe dist/EasyEditor/EasyEditor.exe   # keep it identical to the window title
 cp README.md README.zh-CN.md LICENSE dist/EasyEditor/
-powershell -NoProfile -Command "Compress-Archive -Path dist\EasyEditor -DestinationPath dist\EasyEditor-0.7.0-windows-x64.zip -Force"
+powershell -NoProfile -Command "Compress-Archive -Path dist\EasyEditor -DestinationPath dist\EasyEditor-0.8.0-windows-x64.zip -Force"
 ```
 
 For the `-with-rg` variant, drop `rg.exe` and `THIRD-PARTY-NOTICES.txt` into `dist\EasyEditor\` and compress again. Each package gets its own `.sha256.txt`.
@@ -685,6 +690,8 @@ egui draws that rectangle one line-height below "baseline minus the primary font
 So checking `has_focus()` after the widget returns is always `false`, and the find bar's shortcuts fail silently. The fix is to `consume` the key from the event queue **before** the `TextEdit`, which keeps focus intact.
 
 The same fact has a second consequence, and this one is about who owns the key at all. The sidebar's search box used to treat "`lost_focus()` and an `Enter` in the queue" as "press Enter to search again". But `Enter` in the editor is a newline, and a key press still sitting in the queue is not evidence that anyone asked for a search — the very next `Enter` you type into a document re-ran the project search instead of breaking the line. Both input boxes now read focus **before** adding the widget (`ui.memory(|m| m.has_focus(query_id))`), skip the frame entirely while the IME is composing (`ime::composing`, because that `Enter` confirms a candidate word), and only then `consume_key`. The id comes from `egui::Id::unique`, not `ui.id()`, which in 0.37 is `Ui::scope_id` and would change with the layout.
+
+A third trap hides behind the same symptom, and it is not in an input box at all — it is in the `stale` flag. Every edit to the buffer sets `find.stale`, and `draw()` recomputes matches on the next frame. That recompute also reset `current` to 0 and **revealed** it: it wrote `pending_jump`, which `editor.rs` turns into a caret move plus `scroll_to_rect(... Align::Center)`. So with the find bar open and something matching, an `Enter` typed in the body really did insert the newline, then the following frame dragged the caret out from under the user to match #1 and scrolled there. The query never changed; all the user felt was "Enter = jump to the search result". The fix splits the two jobs that one function was doing: `find_rescan()` recounts matches and repaints backgrounds only, `find_recompute()` additionally reveals. `stale` takes the first path, keystrokes in the bar and query edits take the second. **Counting matches and jumping to one have never been the same operation.** `a_newline_in_the_editor_does_not_yank_the_caret_to_a_match` parks the caret far from the match, presses `Enter` and asserts the buffer grew by exactly one `\n`, the caret stayed there, and `pending_jump` is empty.
 
 ### Registering `.txt` happens in `new`, not in `bootstrap`
 

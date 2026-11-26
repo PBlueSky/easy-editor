@@ -293,6 +293,20 @@ fn is_line_dash(bytes: &[u8], i: usize) -> bool {
 /// 跳过前导空白和注释，取第一个关键字（小写）。整段没有代码就返回 None。
 pub fn first_keyword(sql: &str) -> Option<String> {
     let bytes = sql.as_bytes();
+    let start = code_start(bytes);
+    let mut i = start;
+    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    if start == i {
+        return None;
+    }
+    Some(sql[start..i].to_lowercase())
+}
+
+/// 正文从哪儿开始：跳过前导空白、`#` / `--` / `/* */` 注释和打头的括号。
+/// 整段都是空白和注释时给 `len`。
+fn code_start(bytes: &[u8]) -> usize {
     let mut i = 0usize;
     while i < bytes.len() {
         let c = bytes[i];
@@ -316,14 +330,52 @@ pub fn first_keyword(sql: &str) -> Option<String> {
             i += 1;
             continue;
         }
-        let start = i;
-        while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+        return i;
+    }
+    i
+}
+
+/// 这条语句是不是在切库（`USE db`）。是的话给出库名，反引号里那串原样留下。
+///
+/// 上层用它把「块里切到的库」记成这条连接的当前库：连接被闲置回收、或者被服务器
+/// 掐掉以后，下次执行是按当前库重连的，用户不必回头再补一句 `USE`。
+pub fn use_target(stmt: &str) -> Option<String> {
+    if first_keyword(stmt)?.as_str() != "use" {
+        return None;
+    }
+    let bytes = stmt.as_bytes();
+    // 名字紧跟在关键字后面（中间可能有空白或注释），从关键字末尾接着往下找
+    let mut i = code_start(bytes);
+    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    let tail = &stmt[i..];
+    let name = &tail[code_start(tail.as_bytes())..];
+    if let Some(quoted) = name.strip_prefix('`') {
+        // 反引号里什么都能写，连闭合反引号本身靠翻倍表示
+        let end = find_quote_end(quoted)?;
+        return Some(quoted[..end].replace("``", "`"));
+    }
+    let cut = name
+        .find(|c: char| c.is_whitespace() || c == ';' || c == '-' || c == '#' || c == '`')
+        .unwrap_or(name.len());
+    (!name[..cut].is_empty()).then(|| name[..cut].to_string())
+}
+
+/// 反引号名字的结束位置：跳过成对出现的 `` 那种转义。没闭合给 None。
+fn find_quote_end(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'`' {
             i += 1;
+            continue;
         }
-        if start == i {
-            return None;
+        if bytes.get(i + 1) == Some(&b'`') {
+            i += 2;
+            continue;
         }
-        return Some(sql[start..i].to_lowercase());
+        return Some(i);
     }
     None
 }
@@ -848,6 +900,25 @@ SELECT 2;
         let mixed = vec!["SELECT 1".to_string(), "DELETE FROM t".to_string()];
         assert!(!all_read_only(&mixed));
         assert!(all_read_only(&[]));
+    }
+
+    #[test]
+    fn use_names_the_database_it_switches_to() {
+        assert_eq!(use_target("USE mydb").as_deref(), Some("mydb"));
+        assert_eq!(use_target("use mydb;").as_deref(), Some("mydb"));
+        assert_eq!(use_target("  USE  mydb ;").as_deref(), Some("mydb"));
+        // 大小写随便写
+        assert_eq!(use_target("UsE MyDb").as_deref(), Some("MyDb"));
+        // 前面的注释和括号一样跳过去，那正是块里最常见的写法
+        assert_eq!(use_target("-- 换库\nUSE mydb").as_deref(), Some("mydb"));
+        // 反引号里的名字照原样，翻倍的那个反引号是转义而不是结束
+        assert_eq!(use_target("USE `my db`").as_deref(), Some("my db"));
+        assert_eq!(use_target("USE `we``ird`").as_deref(), Some("we`ird"));
+        // 不是 USE 的、USE 了个空气的、反引号没关上的
+        assert_eq!(use_target("SELECT 1"), None);
+        assert_eq!(use_target("USE"), None);
+        assert_eq!(use_target("USE `oops"), None);
+        assert_eq!(use_target("-- 全是注释"), None);
     }
 
     #[test]

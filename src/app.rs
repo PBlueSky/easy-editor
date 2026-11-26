@@ -1582,6 +1582,17 @@ impl EasyEditorApp {
         }
     }
 
+    /// 正文自己变了以后重算一遍匹配，但**不揭示**：这一条每敲一个字都会走到，
+    /// 一揭示就是把光标从用户手底下挪到首个匹配、屏幕跟着甩过去。底色和计数照常更新，
+    /// 用户在查找栏里按 Enter 才走 [`find_recompute`] 那条会跳的路。
+    fn find_rescan(&mut self) {
+        let Some(idx) = self.focused_tab() else {
+            return;
+        };
+        self.find.recompute(&self.tabs[idx].text);
+        self.sync_find_to_file();
+    }
+
     fn find_step(&mut self, forward: bool) {
         if self.find.matches.is_empty() {
             return;
@@ -5127,7 +5138,7 @@ impl EasyEditorApp {
         // 后台面板的输出也要每帧读进屏幕模型，否则 PTY 的 channel 会一直堆
         self.terminal.pump();
         if self.find.open && self.find.stale {
-            self.find_recompute();
+            self.find_rescan();
         }
         // 脚本要往事件队列里塞按键，而 egui 每帧开头会重建 events，
         // 上一帧塞的到下一帧就没了——所以脚本必须排在快捷键分发之前
@@ -6635,6 +6646,67 @@ mod tests {
             app.tabs[app.active.unwrap()].text.len() > before.len(),
             "正文里那一下回车没换成行"
         );
+    }
+
+    /// 查找栏开着时在正文里敲回车：那一下只管换行。以前正文每变一次字都重算匹配，
+    /// 顺手把光标甩到第一个匹配并滚过去——回车敲完光标就跑到了别处，下一个字符就打在
+    /// 匹配那一行上了。打开查找栏那一下照旧要跳，那是用户主动查。
+    #[test]
+    fn a_newline_in_the_editor_does_not_yank_the_caret_to_a_match() {
+        let body = format!(
+            "needle up here\n{}",
+            (0..40)
+                .map(|i| format!("filler line {i}\n"))
+                .collect::<String>()
+        );
+        let (ctx, mut app, dir) = app_in_folder("easy-editor-app-find-enter", &body);
+        app.open_file(dir.join("a.txt"), None);
+        frame(&mut app, &ctx, vec![]);
+        let idx = app.active.unwrap();
+        app.find.query = "needle".into();
+
+        frame(&mut app, &ctx, vec![key_press(Key::F, Modifiers::CTRL)]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.find.matches.len(), 1, "查找栏没算出匹配");
+        assert_eq!(app.tabs[idx].caret_byte, 0, "打开查找栏没跳到首个匹配");
+
+        // 点回正文里那一行，光标重新落回用户手底下
+        let pane = app
+            .pane_layout
+            .pane_rect(app.panes.focus().unwrap())
+            .unwrap();
+        let over = egui::pos2(pane.left() + 80.0, pane.top() + 120.0);
+        frame(&mut app, &ctx, pointer(over, egui::PointerButton::Primary, true));
+        frame(&mut app, &ctx, pointer(over, egui::PointerButton::Primary, false));
+        frame(&mut app, &ctx, vec![]);
+        let here = app.tabs[idx].caret_byte;
+        assert!(here > 0, "那一下没把光标点进正文（caret_byte={here}）");
+        let before = app.tabs[idx].text.clone();
+
+        frame(&mut app, &ctx, vec![key_press(Key::Enter, Modifiers::NONE)]);
+        frame(&mut app, &ctx, vec![]);
+
+        assert_eq!(
+            app.tabs[idx].text.len(),
+            before.len() + 1,
+            "那一下回车没换成行"
+        );
+        assert_eq!(
+            &app.tabs[idx].text[here..here + 1],
+            "\n",
+            "换行没插在光标那一处"
+        );
+        assert!(
+            app.tabs[idx].pending_jump.is_none(),
+            "敲个回车又把跳转排上了"
+        );
+        assert_eq!(
+            app.tabs[idx].caret_byte,
+            here + 1,
+            "光标被刚插的那行挤走，却没留在原处"
+        );
+        assert_eq!(app.find.matches.len(), 1, "重算以后匹配数变了");
+        assert!(!app.find.stale, "匹配没跟着正文重算");
     }
 
     /// 「移到最右侧」：原先上下堆叠的面板要变成左右并排，并且贴到工作区右缘。
